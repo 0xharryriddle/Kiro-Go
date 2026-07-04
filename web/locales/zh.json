@@ -40,6 +40,7 @@
   "diag.reason.disabled": "已禁用",
   "diag.reason.cooldown": "冷却中",
   "diag.reason.token_expiring": "Token 即将过期",
+  "diag.reason.token_refresh_due": "将在下次请求时刷新",
   "diag.reason.quota_exhausted": "额度耗尽",
   "diag.reason.not_in_pool": "不可路由",
   "diag.reason.unknown": "未知",

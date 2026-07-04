@@ -62,19 +62,39 @@ func TestOverLimitAccountsRemainSkippedWhenUpstreamOverageDisabled(t *testing.T)
 	}
 }
 
-func TestGetNextKeepsFiveMinuteTokenAvailable(t *testing.T) {
+func TestGetNextKeepsExpiringTokenAvailableForRequestRefresh(t *testing.T) {
 	p := &AccountPool{}
 	account := config.Account{
 		ID:          "acct-1",
 		AccessToken: "access-token",
-		ExpiresAt:   time.Now().Unix() + 300,
+		ExpiresAt:   time.Now().Unix() + 30,
 	}
 
 	p.accounts = []config.Account{account}
 
 	got := p.GetNext()
 	if got == nil {
-		t.Fatalf("expected five-minute token to be available")
+		t.Fatalf("expected expiring token to be selectable so handler can refresh it")
+	}
+	if got.ID != account.ID {
+		t.Fatalf("expected account %q, got %q", account.ID, got.ID)
+	}
+}
+
+func TestGetNextForModelKeepsExpiringTokenAvailableForRequestRefresh(t *testing.T) {
+	p := &AccountPool{}
+	account := config.Account{
+		ID:          "acct-1",
+		AccessToken: "access-token",
+		ExpiresAt:   time.Now().Unix() + 30,
+	}
+
+	p.accounts = []config.Account{account}
+	p.SetModelList(account.ID, []string{"claude-sonnet-4.5"})
+
+	got := p.GetNextForModel("claude-sonnet-4.5")
+	if got == nil {
+		t.Fatalf("expected expiring token to be selectable for model routing refresh")
 	}
 	if got.ID != account.ID {
 		t.Fatalf("expected account %q, got %q", account.ID, got.ID)

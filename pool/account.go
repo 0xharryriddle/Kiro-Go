@@ -130,11 +130,8 @@ func (p *AccountPool) GetNextExcluding(excluded map[string]bool) *config.Account
 			continue
 		}
 
-		// 跳过即将过期的 Token
-		if acc.ExpiresAt > 0 && time.Now().Unix() > acc.ExpiresAt-tokenRefreshSkewSeconds {
-			seen[acc.ID] = true
-			continue
-		}
+		// Do not skip expiring tokens here. The request handler refreshes the
+		// selected account before use; skipping it would prevent auto-refresh.
 
 		// Skip accounts whose quota is exhausted, unless overrides apply.
 		if isQuotaBlocked(*acc, allowOverUsage) {
@@ -157,6 +154,9 @@ func (p *AccountPool) SetModelList(accountID string, modelIDs []string) {
 		set[strings.ToLower(strings.TrimSpace(id))] = true
 	}
 	p.mu.Lock()
+	if p.modelLists == nil {
+		p.modelLists = make(map[string]map[string]bool)
+	}
 	p.modelLists[accountID] = set
 	p.mu.Unlock()
 }
@@ -227,10 +227,8 @@ func (p *AccountPool) GetNextForModelExcluding(model string, excluded map[string
 			seen[acc.ID] = true
 			continue
 		}
-		if acc.ExpiresAt > 0 && time.Now().Unix() > acc.ExpiresAt-tokenRefreshSkewSeconds {
-			seen[acc.ID] = true
-			continue
-		}
+		// Do not skip expiring tokens here. The request handler refreshes the
+		// selected account before use; skipping it would prevent auto-refresh.
 		if isQuotaBlocked(*acc, allowOverUsage) {
 			seen[acc.ID] = true
 			continue
@@ -518,8 +516,8 @@ func (p *AccountPool) diagnosticsForLocked(accounts []config.Account, model stri
 			reason = "cooldown"
 			cooldownUntil = cooldown.Unix()
 		} else if acc.ExpiresAt > 0 && now.Unix() > acc.ExpiresAt-tokenRefreshSkewSeconds {
-			available = false
-			reason = "token_expiring"
+			available = true
+			reason = "token_refresh_due"
 		} else if isQuotaBlocked(acc, allowOverUsage) {
 			available = false
 			reason = "quota_exhausted"
