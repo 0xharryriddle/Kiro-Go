@@ -12,6 +12,33 @@ import (
 
 const tokenRefreshSkewSeconds int64 = 120
 
+// AccountDiagnostics describes route-availability state without exposing secrets.
+type AccountDiagnostics struct {
+	ID               string  `json:"id"`
+	Enabled          bool    `json:"enabled"`
+	InPool           bool    `json:"inPool"`
+	Available        bool    `json:"available"`
+	Reason           string  `json:"reason"`
+	ErrorCount       int     `json:"errorCount"`
+	CooldownUntil    int64   `json:"cooldownUntil,omitempty"`
+	TokenExpiresAt   int64   `json:"tokenExpiresAt,omitempty"`
+	UsageCurrent     float64 `json:"usageCurrent"`
+	UsageLimit       float64 `json:"usageLimit"`
+	UsagePercent     float64 `json:"usagePercent"`
+	OverageStatus    string  `json:"overageStatus,omitempty"`
+	OverageAllowed   bool    `json:"overageAllowed"`
+	CachedModelCount int     `json:"cachedModelCount"`
+}
+
+// ModelRoutingDiagnostics explains which accounts can route a specific model.
+type ModelRoutingDiagnostics struct {
+	Model              string               `json:"model"`
+	HasAnyModelCache   bool                 `json:"hasAnyModelCache"`
+	OptimisticFallback bool                 `json:"optimisticFallback"`
+	RouteableCount     int                  `json:"routeableCount"`
+	Accounts           []AccountDiagnostics `json:"accounts"`
+}
+
 // AccountPool 账号池
 type AccountPool struct {
 	mu            sync.RWMutex
@@ -118,27 +145,9 @@ func (p *AccountPool) GetNextExcluding(excluded map[string]bool) *config.Account
 		return acc
 	}
 
-		// 无可用账号，返回冷却时间最短的（排除额度用尽的，除非允许超额）
-	var best *config.Account
-	var earliest time.Time
-	for i := range p.accounts {
-		acc := &p.accounts[i]
-		if excluded != nil && excluded[acc.ID] {
-			continue
-		}
-		if isQuotaBlocked(*acc, allowOverUsage) {
-			continue
-		}
-		if cooldown, ok := p.cooldowns[acc.ID]; ok {
-			if best == nil || cooldown.Before(earliest) {
-				best = acc
-				earliest = cooldown
-			}
-		} else {
-			return acc
-		}
-	}
-	return best
+	// No currently available account. Do not break cooldown here; returning a
+	// cooled-down account causes client retries to hammer the same throttled quota.
+	return nil
 }
 
 // SetModelList 缓存账号支持的模型集合（由 handler 在刷新后调用）
@@ -229,30 +238,9 @@ func (p *AccountPool) GetNextForModelExcluding(model string, excluded map[string
 		return acc
 	}
 
-	// fallback：找冷却时间最短且支持该模型的账号
-	var best *config.Account
-	var earliest time.Time
-	for i := range p.accounts {
-		acc := &p.accounts[i]
-		if excluded != nil && excluded[acc.ID] {
-			continue
-		}
-		if !p.accountHasModel(acc.ID, model) {
-			continue
-		}
-		if isQuotaBlocked(*acc, allowOverUsage) {
-			continue
-		}
-		if cooldown, ok := p.cooldowns[acc.ID]; ok {
-			if best == nil || cooldown.Before(earliest) {
-				best = acc
-				earliest = cooldown
-			}
-		} else {
-			return acc
-		}
-	}
-	return best
+	// No currently available account for this model. Do not break cooldown here;
+	// returning a cooled-down account causes client retries to hammer throttled quota.
+	return nil
 }
 
 // GetByID 根据 ID 获取账号
@@ -275,20 +263,12 @@ func (p *AccountPool) RecordSuccess(id string) {
 	p.errorCounts[id] = 0
 }
 
-// RecordError 记录请求错误，设置冷却
+// RecordError records request errors without applying local cooldowns.
 func (p *AccountPool) RecordError(id string, isQuotaError bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
 	p.errorCounts[id]++
-
-	if isQuotaError {
-		// 配额错误，冷却 1 小时
-		p.cooldowns[id] = time.Now().Add(time.Hour)
-	} else if p.errorCounts[id] >= 3 {
-		// 连续 3 次错误，冷却 1 分钟
-		p.cooldowns[id] = time.Now().Add(time.Minute)
-	}
 }
 
 // IsAuthFailure reports whether an error indicates the refresh token / credentials
@@ -465,6 +445,107 @@ func (p *AccountPool) UpdateStats(id string, tokens int, credits float64) {
 	if updated {
 		go config.UpdateAccountStats(id, requestCount, errorCount, totalTokens, totalCredits, lastUsed)
 	}
+}
+
+// Diagnostics returns per-account routing state for all persisted accounts.
+func (p *AccountPool) Diagnostics() []AccountDiagnostics {
+	accounts := config.GetAccounts()
+	return p.DiagnosticsFor(accounts)
+}
+
+// DiagnosticsFor returns per-account routing state for the supplied account set.
+func (p *AccountPool) DiagnosticsFor(accounts []config.Account) []AccountDiagnostics {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.diagnosticsForLocked(accounts, "")
+}
+
+// ModelRouting returns diagnostics scoped to one requested model.
+func (p *AccountPool) ModelRouting(model string) ModelRoutingDiagnostics {
+	return p.ModelRoutingFor(config.GetAccounts(), model)
+}
+
+// ModelRoutingFor returns model routing diagnostics for the supplied account set.
+func (p *AccountPool) ModelRoutingFor(accounts []config.Account, model string) ModelRoutingDiagnostics {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	model = strings.ToLower(strings.TrimSpace(model))
+	hasAnyModelCache := false
+	for _, set := range p.modelLists {
+		if len(set) > 0 {
+			hasAnyModelCache = true
+			break
+		}
+	}
+	items := p.diagnosticsForLocked(accounts, model)
+	routeable := 0
+	for _, item := range items {
+		if item.Available {
+			routeable++
+		}
+	}
+	return ModelRoutingDiagnostics{
+		Model:              model,
+		HasAnyModelCache:   hasAnyModelCache,
+		OptimisticFallback: !hasAnyModelCache,
+		RouteableCount:     routeable,
+		Accounts:           items,
+	}
+}
+
+func (p *AccountPool) diagnosticsForLocked(accounts []config.Account, model string) []AccountDiagnostics {
+	now := time.Now()
+	allowOverUsage := config.GetAllowOverUsage()
+	inPool := make(map[string]bool)
+	for _, acc := range p.accounts {
+		inPool[acc.ID] = true
+	}
+
+	out := make([]AccountDiagnostics, 0, len(accounts))
+	for _, acc := range accounts {
+		reason := "available"
+		available := true
+		cooldownUntil := int64(0)
+
+		if !acc.Enabled {
+			available = false
+			reason = "disabled"
+		} else if model != "" && !p.accountHasModel(acc.ID, model) {
+			available = false
+			reason = "unsupported_model"
+		} else if cooldown, ok := p.cooldowns[acc.ID]; ok && now.Before(cooldown) {
+			available = false
+			reason = "cooldown"
+			cooldownUntil = cooldown.Unix()
+		} else if acc.ExpiresAt > 0 && now.Unix() > acc.ExpiresAt-tokenRefreshSkewSeconds {
+			available = false
+			reason = "token_expiring"
+		} else if isQuotaBlocked(acc, allowOverUsage) {
+			available = false
+			reason = "quota_exhausted"
+		} else if !inPool[acc.ID] {
+			available = false
+			reason = "not_in_pool"
+		}
+
+		out = append(out, AccountDiagnostics{
+			ID:               acc.ID,
+			Enabled:          acc.Enabled,
+			InPool:           inPool[acc.ID],
+			Available:        available,
+			Reason:           reason,
+			ErrorCount:       p.errorCounts[acc.ID],
+			CooldownUntil:    cooldownUntil,
+			TokenExpiresAt:   acc.ExpiresAt,
+			UsageCurrent:     acc.UsageCurrent,
+			UsageLimit:       acc.UsageLimit,
+			UsagePercent:     acc.UsagePercent,
+			OverageStatus:    acc.OverageStatus,
+			OverageAllowed:   isUpstreamOverageEnabled(acc) || allowOverUsage,
+			CachedModelCount: len(p.modelLists[acc.ID]),
+		})
+	}
+	return out
 }
 
 // GetAllAccounts 获取所有账号副本

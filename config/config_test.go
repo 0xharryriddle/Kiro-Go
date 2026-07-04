@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -59,6 +60,99 @@ func TestUpdateSettingsPatchCanExplicitlyDisableAPIKey(t *testing.T) {
 // upstream-Overages-switch refactor (which carried `allowOverage: true` per
 // account) is migrated into OverageStatus="ENABLED" on first load, and that
 // the legacy field is cleared so future saves don't re-emit it.
+func TestLoadEmptyConfigRecreatesDefault(t *testing.T) {
+	dir := t.TempDir()
+	cfgFile := filepath.Join(dir, "config.json")
+	if err := os.WriteFile(cfgFile, nil, 0600); err != nil {
+		t.Fatalf("write empty config: %v", err)
+	}
+	if err := Init(cfgFile); err != nil {
+		t.Fatalf("init empty config: %v", err)
+	}
+	if got := strings.TrimSpace(string(mustReadFile(t, cfgFile))); got == "" {
+		t.Fatal("expected empty config to be replaced with default JSON")
+	}
+	if GetPassword() != "changeme" {
+		t.Fatalf("expected default password, got %q", GetPassword())
+	}
+}
+
+func TestLoadInvalidConfigRecoversBackup(t *testing.T) {
+	dir := t.TempDir()
+	cfgFile := filepath.Join(dir, "config.json")
+	backup := []byte(`{"password":"backup-pass","port":8080,"host":"0.0.0.0","accounts":[]}`)
+	if err := os.WriteFile(cfgFile+".bak", backup, 0600); err != nil {
+		t.Fatalf("write backup: %v", err)
+	}
+	if err := os.WriteFile(cfgFile, []byte(`{"password"`), 0600); err != nil {
+		t.Fatalf("write invalid config: %v", err)
+	}
+	if err := Init(cfgFile); err != nil {
+		t.Fatalf("init invalid config with backup: %v", err)
+	}
+	if GetPassword() != "backup-pass" {
+		t.Fatalf("expected recovered password, got %q", GetPassword())
+	}
+}
+
+func TestRollingBackupsAndStatus(t *testing.T) {
+	dir := t.TempDir()
+	cfgFile := filepath.Join(dir, "config.json")
+	if err := Init(cfgFile); err != nil {
+		t.Fatalf("init: %v", err)
+	}
+	for i := 0; i < maxConfigBackups+2; i++ {
+		if err := UpdateSettingsPatch(nil, nil, "pass"); err != nil {
+			t.Fatalf("save %d: %v", i, err)
+		}
+	}
+	st := Status()
+	if !st.Valid {
+		t.Fatalf("expected active config valid: %#v", st)
+	}
+	if st.BackupCount != maxConfigBackups+1 {
+		t.Fatalf("expected %d backups including .bak, got %d", maxConfigBackups+1, st.BackupCount)
+	}
+	if st.Backups[0].Name != "config.json.bak" || !st.Backups[0].Valid {
+		t.Fatalf("unexpected latest backup: %#v", st.Backups[0])
+	}
+}
+
+func TestCreateAndRestoreBackup(t *testing.T) {
+	dir := t.TempDir()
+	cfgFile := filepath.Join(dir, "config.json")
+	if err := Init(cfgFile); err != nil {
+		t.Fatalf("init: %v", err)
+	}
+	if err := UpdateSettingsPatch(nil, nil, "before"); err != nil {
+		t.Fatalf("set before: %v", err)
+	}
+	if err := CreateBackup(); err != nil {
+		t.Fatalf("create backup: %v", err)
+	}
+	if err := UpdateSettingsPatch(nil, nil, "after"); err != nil {
+		t.Fatalf("set after: %v", err)
+	}
+	if GetPassword() != "after" {
+		t.Fatalf("expected updated password")
+	}
+	if err := RestoreBackup("config.json.bak"); err != nil {
+		t.Fatalf("restore backup: %v", err)
+	}
+	if GetPassword() != "before" {
+		t.Fatalf("expected restored password, got %q", GetPassword())
+	}
+}
+
+func mustReadFile(t *testing.T, path string) []byte {
+	t.Helper()
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read %s: %v", path, err)
+	}
+	return b
+}
+
 func TestAccountAllowOverageMigration(t *testing.T) {
 	dir := t.TempDir()
 	cfgFile := filepath.Join(dir, "config.json")

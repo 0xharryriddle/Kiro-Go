@@ -35,6 +35,14 @@ follows [Keep a Changelog](https://keepachangelog.com/).
   `HOST` env overrides (precedence: flag > env > `config.json`), so the proxy can run
   on a port other than `8080` without editing the config. `docker-compose.yml` honors
   `KIRO_PORT` for the published host port (`KIRO_PORT=9090 docker compose up -d`).
+- **Operator health and recovery tooling.** Added `/healthz`, `/readyz`, config status /
+  backup / restore / export APIs, rolling config backups, and atomic config writes with
+  startup recovery from valid backups.
+- **Admin diagnostics and observability.** Added persistent request logs, metrics summary,
+  server-side log filtering/export, account diagnostics, model routing diagnostics, and a
+  safe request replay dry-run endpoint for validating payloads without upstream calls.
+- **Operator runbook.** Added `docs/operator-runbook.md` with deployment verification,
+  troubleshooting, credential recovery, diagnostics, logs, metrics, and security checks.
 
 ### Fixed
 - `external_idp` imports previously returned `400 "external IdP refresh requires

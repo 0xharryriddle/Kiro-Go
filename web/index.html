@@ -105,6 +105,8 @@
                 data-i18n="tabs.accounts"></span></button>
             <button type="button" class="tab" data-tab="settings"><i class="fa-solid fa-sliders tab-icon"></i><span
                 data-i18n="tabs.settings"></span></button>
+            <button type="button" class="tab" data-tab="tools"><i class="fa-solid fa-toolbox tab-icon"></i><span
+                data-i18n="tabs.tools"></span></button>
             <button type="button" class="tab" data-tab="api"><i class="fa-solid fa-plug tab-icon"></i><span
                 data-i18n="tabs.api"></span></button>
             <button type="button" class="tab" data-tab="logs"><i class="fa-solid fa-list tab-icon"></i><span
@@ -132,6 +134,8 @@
     </header>
 
     <div class="container">
+      <div id="securityBanner" class="security-banner hidden"></div>
+
       <!-- Stats summary -->
       <div class="stats-grid">
         <div class="stat-card">
@@ -233,6 +237,82 @@
         </div>
       </div>
 
+      <!-- Tools tab -->
+      <div id="tabTools" class="tab-content hidden">
+        <div class="tools-intro card">
+          <div>
+            <span class="card-title" data-i18n="tools.title"></span>
+            <p class="muted-text" data-i18n="tools.desc"></p>
+          </div>
+        </div>
+        <div class="tools-launcher" role="group">
+          <button type="button" class="btn btn-outline btn-sm tool-launch-btn" data-tool-panel="recoveryWizardCard" data-i18n="recovery.title"></button>
+          <button type="button" class="btn btn-outline btn-sm tool-launch-btn" data-tool-panel="accountDiagnosticsCard" data-i18n="diag.title"></button>
+          <button type="button" class="btn btn-outline btn-sm tool-launch-btn" data-tool-panel="modelRoutingCard" data-i18n="models.routingTitle"></button>
+          <button type="button" class="btn btn-outline btn-sm tool-launch-btn" data-tool-panel="replayDiagnosticsCard" data-i18n="replay.title"></button>
+        </div>
+
+      <div class="card tool-panel hidden" id="accountDiagnosticsCard">
+        <div class="card-header">
+          <span class="card-title" data-i18n="diag.title"></span>
+          <button class="btn btn-outline btn-sm" id="refreshDiagnosticsBtn" data-i18n="common.refresh"></button>
+        </div>
+        <div id="diagnosticsBody" class="diag-body muted-text" data-i18n="diag.loading"></div>
+      </div>
+
+      <div class="card tool-panel hidden" id="modelRoutingCard">
+        <div class="card-header">
+          <span class="card-title" data-i18n="models.routingTitle"></span>
+          <button class="btn btn-outline btn-sm" id="refreshRoutingModelsBtn" data-i18n="models.refreshAll"></button>
+        </div>
+        <div class="routing-controls">
+          <input id="routingModelInput" type="text" data-i18n-placeholder="models.routingPlaceholder" />
+          <button class="btn btn-secondary btn-sm" id="checkModelRoutingBtn" data-i18n="models.checkRouting"></button>
+        </div>
+        <div id="modelRoutingBody" class="routing-body muted-text" data-i18n="models.routingHint"></div>
+      </div>
+
+      <div class="card tool-panel hidden" id="replayDiagnosticsCard">
+        <div class="card-header">
+          <span class="card-title" data-i18n="replay.title"></span>
+        </div>
+        <div class="replay-controls">
+          <select id="replayEndpointSelect">
+            <option value="openai" data-i18n="replay.endpointOpenAI"></option>
+            <option value="claude" data-i18n="replay.endpointClaude"></option>
+          </select>
+          <button class="btn btn-secondary btn-sm" id="runReplayDiagnoseBtn" data-i18n="replay.run"></button>
+        </div>
+        <textarea id="replayPayloadInput" class="replay-payload" spellcheck="false"></textarea>
+        <div id="replayResultBody" class="replay-result muted-text" data-i18n="replay.hint"></div>
+      </div>
+
+      <div class="card tool-panel hidden" id="recoveryWizardCard">
+        <div class="card-header">
+          <span class="card-title" data-i18n="recovery.title"></span>
+          <button class="btn btn-outline btn-sm" id="refreshRecoveryBtn" data-i18n="common.refresh"></button>
+        </div>
+        <div class="recovery-grid">
+          <div class="recovery-step">
+            <h4 data-i18n="recovery.ideTitle"></h4>
+            <p data-i18n="recovery.ideDesc"></p>
+            <button class="btn btn-secondary btn-sm" id="previewIdeCacheBtn" data-i18n="recovery.previewIde"></button>
+          </div>
+          <div class="recovery-step">
+            <h4 data-i18n="recovery.jsonTitle"></h4>
+            <p data-i18n="recovery.jsonDesc"></p>
+            <textarea id="recoveryJsonText" class="font-mono" data-i18n-placeholder="recovery.jsonPlaceholder"></textarea>
+            <div class="btn-row">
+              <button class="btn btn-secondary btn-sm" id="previewRecoveryJsonBtn" data-i18n="recovery.previewJson"></button>
+              <button class="btn btn-primary btn-sm" id="importRecoveryJsonBtn" data-i18n="recovery.importJson"></button>
+            </div>
+          </div>
+        </div>
+        <div id="recoveryPreviewBody" class="recovery-preview muted-text" data-i18n="recovery.previewEmpty"></div>
+      </div>
+
+      </div>
+
       <!-- Settings tab -->
       <div id="tabSettings" class="tab-content hidden">
         <!-- API settings -->
@@ -331,6 +411,20 @@
             <input type="password" id="newPassword" data-i18n-placeholder="settings.newPasswordPlaceholder" />
           </div>
           <button class="btn btn-primary" id="changePasswordBtn" data-i18n="settings.changePassword"></button>
+        </div>
+
+        <!-- Config health -->
+        <div class="card">
+          <div class="card-header">
+            <span class="card-title" data-i18n="settings.configHealth"></span>
+            <button class="btn btn-secondary btn-sm" id="refreshConfigStatusBtn" data-i18n="common.refresh"></button>
+          </div>
+          <div id="configHealthBody" class="config-health-body"></div>
+          <div class="btn-row" style="margin-top: 1rem;">
+            <button class="btn btn-primary btn-sm" id="createConfigBackupBtn" data-i18n="settings.createConfigBackup"></button>
+            <button class="btn btn-secondary btn-sm" id="restoreConfigBackupBtn" data-i18n="settings.restoreConfigBackup"></button>
+            <button class="btn btn-secondary btn-sm" id="exportConfigBtn" data-i18n="settings.exportConfig"></button>
+          </div>
         </div>
 
         <!-- Outbound proxy -->
@@ -504,12 +598,16 @@
                 <option value="success" data-i18n="logs.filterSuccess"></option>
                 <option value="error" data-i18n="logs.filterError"></option>
               </select>
+              <input id="logsSearchInput" class="logs-search" type="search" data-i18n-placeholder="logs.search" />
+              <button class="btn btn-outline btn-sm" id="logsExportJsonBtn"><i class="fa-solid fa-file-code"></i><span class="btn-text" data-i18n="logs.exportJson"></span></button>
+              <button class="btn btn-outline btn-sm" id="logsExportCsvBtn"><i class="fa-solid fa-file-csv"></i><span class="btn-text" data-i18n="logs.exportCsv"></span></button>
               <button class="btn btn-outline btn-sm" id="logsRefreshBtn"><i class="fa-solid fa-rotate"></i><span class="btn-text" data-i18n="logs.refresh"></span></button>
               <label class="logs-auto-toggle"><input type="checkbox" id="logsAutoRefresh" /> <span data-i18n="logs.autoRefresh"></span></label>
               <button class="btn btn-danger btn-sm" id="logsClearBtn"><i class="fa-solid fa-trash"></i><span class="btn-text" data-i18n="logs.clear"></span></button>
             </div>
           </div>
           <div class="logs-summary" id="logsSummary"></div>
+          <div class="metrics-summary" id="metricsSummary"></div>
           <div id="logsList" class="logs-list">
             <p class="text-muted" data-i18n="logs.empty"></p>
           </div>

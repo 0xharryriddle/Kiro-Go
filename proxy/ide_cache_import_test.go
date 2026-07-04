@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"encoding/base64"
 	"os"
 	"path/filepath"
 	"strings"
@@ -48,6 +49,29 @@ func TestReadIdeCacheCredentialExternalIdp(t *testing.T) {
 	}
 	if !strings.Contains(req.Scopes, "offline_access") {
 		t.Fatalf("scopes = %q", req.Scopes)
+	}
+}
+
+func testJWT(payload string) string {
+	return "e30." + base64.RawURLEncoding.EncodeToString([]byte(payload)) + ".sig"
+}
+
+func TestReadIdeCacheCredentialEmailFromJWT(t *testing.T) {
+	accessToken := testJWT(`{"preferred_username":"britta.huotari@codezdev-cn.cc"}`)
+	path := writeTempCache(t, `{
+	  "accessToken": "`+accessToken+`",
+	  "refreshToken": "rt-ide",
+	  "authMethod": "external_idp",
+	  "tokenEndpoint": "https://login.microsoftonline.com/tenant/oauth2/v2.0/token",
+	  "clientId": "azure-client-123"
+	}`)
+
+	req, err := readIdeCacheCredential(path)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if req.Email != "britta.huotari@codezdev-cn.cc" {
+		t.Fatalf("email = %q", req.Email)
 	}
 }
 

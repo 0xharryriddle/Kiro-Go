@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 // newExternalIdpTokenServer stands up a fake IdP token endpoint that answers the
@@ -40,6 +41,10 @@ func writeHelperFile(t *testing.T, dir, name, tokenEndpoint, refreshToken, email
 	path := filepath.Join(dir, name)
 	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
 		t.Fatalf("write helper file: %v", err)
+	}
+	old := time.Now().Add(-3 * time.Second)
+	if err := os.Chtimes(path, old, old); err != nil {
+		t.Fatalf("backdate helper file: %v", err)
 	}
 }
 
@@ -91,6 +96,10 @@ func TestImportWatcherMovesInvalidFileToFailed(t *testing.T) {
 	path := filepath.Join(dir, "broken.json")
 	if err := os.WriteFile(path, []byte("{ this is not json"), 0o600); err != nil {
 		t.Fatalf("write broken file: %v", err)
+	}
+	old := time.Now().Add(-3 * time.Second)
+	if err := os.Chtimes(path, old, old); err != nil {
+		t.Fatalf("backdate broken file: %v", err)
 	}
 
 	h := &Handler{pool: accountpool.GetPool()}

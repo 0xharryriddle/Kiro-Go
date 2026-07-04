@@ -237,6 +237,90 @@ func TestDisableAccountSetsCooldown(t *testing.T) {
 	}
 }
 
+func TestRecordErrorDoesNotSetCooldown(t *testing.T) {
+	p := newTestPool(config.Account{ID: "a"})
+
+	p.RecordError("a", true)
+	p.RecordError("a", false)
+
+	p.mu.RLock()
+	_, hasCooldown := p.cooldowns["a"]
+	p.mu.RUnlock()
+	if hasCooldown {
+		t.Fatal("expected RecordError not to set local cooldown")
+	}
+}
+
+func TestDiagnosticsExplainUnavailableAccounts(t *testing.T) {
+	p := newTestPool(
+		config.Account{ID: "ok", Enabled: true},
+		config.Account{ID: "disabled", Enabled: false},
+		config.Account{ID: "quota", Enabled: true, UsageCurrent: 10, UsageLimit: 10},
+	)
+	p.cooldowns["cooling"] = time.Now().Add(time.Hour)
+	p.accounts = append(p.accounts, config.Account{ID: "cooling", Enabled: true})
+
+	diagnostics := p.DiagnosticsFor([]config.Account{
+		{ID: "ok", Enabled: true},
+		{ID: "disabled", Enabled: false},
+		{ID: "quota", Enabled: true, UsageCurrent: 10, UsageLimit: 10},
+		{ID: "cooling", Enabled: true},
+	})
+	reasons := map[string]string{}
+	for _, d := range diagnostics {
+		reasons[d.ID] = d.Reason
+	}
+	if reasons["ok"] != "available" {
+		t.Fatalf("ok reason = %q", reasons["ok"])
+	}
+	if reasons["disabled"] != "disabled" {
+		t.Fatalf("disabled reason = %q", reasons["disabled"])
+	}
+	if reasons["quota"] != "quota_exhausted" {
+		t.Fatalf("quota reason = %q", reasons["quota"])
+	}
+	if reasons["cooling"] != "cooldown" {
+		t.Fatalf("cooling reason = %q", reasons["cooling"])
+	}
+}
+
+func TestGetNextExcludingDoesNotBreakCooldown(t *testing.T) {
+	p := newTestPool(config.Account{ID: "cooling"})
+	p.cooldowns["cooling"] = time.Now().Add(time.Hour)
+
+	if acc := p.GetNextExcluding(nil); acc != nil {
+		t.Fatalf("expected nil for cooled-down account, got %q", acc.ID)
+	}
+}
+
+func TestModelRoutingReportsUnsupportedModel(t *testing.T) {
+	p := newTestPool(config.Account{ID: "a", Enabled: true}, config.Account{ID: "b", Enabled: true})
+	p.SetModelList("a", []string{"claude-sonnet-4.5"})
+	p.SetModelList("b", []string{"claude-opus-4.5"})
+
+	routing := p.ModelRoutingFor([]config.Account{{ID: "a", Enabled: true}, {ID: "b", Enabled: true}}, "claude-sonnet-4.5")
+	if routing.RouteableCount != 1 || !routing.HasAnyModelCache || routing.OptimisticFallback {
+		t.Fatalf("unexpected routing summary: %#v", routing)
+	}
+	reasons := map[string]string{}
+	for _, item := range routing.Accounts {
+		reasons[item.ID] = item.Reason
+	}
+	if reasons["a"] != "available" || reasons["b"] != "unsupported_model" {
+		t.Fatalf("unexpected routing reasons: %#v", reasons)
+	}
+}
+
+func TestGetNextForModelExcludingDoesNotBreakCooldown(t *testing.T) {
+	p := newTestPool(config.Account{ID: "cooling"})
+	p.SetModelList("cooling", []string{"claude-opus-4.8"})
+	p.cooldowns["cooling"] = time.Now().Add(time.Hour)
+
+	if acc := p.GetNextForModelExcluding("claude-opus-4.8", nil); acc != nil {
+		t.Fatalf("expected nil for cooled-down model account, got %q", acc.ID)
+	}
+}
+
 func TestGetNextExcludingSkipsExcludedAccount(t *testing.T) {
 	p := &AccountPool{
 		accounts: []config.Account{

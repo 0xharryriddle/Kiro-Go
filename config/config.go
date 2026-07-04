@@ -15,7 +15,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
 	"runtime"
+	"strings"
 	"sync"
 	"time"
 )
@@ -262,15 +264,7 @@ func Load() error {
 	data, err := os.ReadFile(cfgPath)
 	if err != nil {
 		if os.IsNotExist(err) {
-			// Create default configuration.
-			// Binds to 0.0.0.0 by default for Docker/container compatibility.
-			cfg = &Config{
-				Password:      "changeme",
-				Port:          8080,
-				Host:          "0.0.0.0",
-				RequireApiKey: false,
-				Accounts:      []Account{},
-			}
+			cfg = defaultConfig()
 			return saveLocked()
 		}
 		return err
@@ -278,7 +272,14 @@ func Load() error {
 
 	var c Config
 	if err := json.Unmarshal(data, &c); err != nil {
-		return err
+		if recovered, recErr := recoverConfigFromBackup(); recErr == nil {
+			c = *recovered
+		} else if len(strings.TrimSpace(string(data))) == 0 {
+			cfg = defaultConfig()
+			return saveLocked()
+		} else {
+			return err
+		}
 	}
 	cfg = &c
 
@@ -334,6 +335,39 @@ func saveLocked() error {
 	return Save()
 }
 
+func defaultConfig() *Config {
+	// Binds to 0.0.0.0 by default for Docker/container compatibility.
+	return &Config{
+		Password:      "changeme",
+		Port:          8080,
+		Host:          "0.0.0.0",
+		RequireApiKey: false,
+		Accounts:      []Account{},
+	}
+}
+
+func recoverConfigFromBackup() (*Config, error) {
+	backups := listBackupPaths(cfgPath)
+	if len(backups) == 0 {
+		return nil, os.ErrNotExist
+	}
+	for _, backupPath := range backups {
+		data, err := os.ReadFile(backupPath)
+		if err != nil {
+			continue
+		}
+		var recovered Config
+		if err := json.Unmarshal(data, &recovered); err != nil {
+			continue
+		}
+		if err := atomicWriteConfig(cfgPath, data); err != nil {
+			return nil, err
+		}
+		return &recovered, nil
+	}
+	return nil, fmt.Errorf("no valid config backup found")
+}
+
 // newUUID returns a UUID v4 string. Defined here to avoid pulling extra deps in this file.
 func newUUID() string {
 	return GenerateMachineId()
@@ -346,7 +380,196 @@ func Save() error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(cfgPath, data, 0600)
+	return atomicWriteConfig(cfgPath, data)
+}
+
+func atomicWriteConfig(path string, data []byte) error {
+	if len(data) == 0 {
+		return fmt.Errorf("refusing to write empty config")
+	}
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return err
+	}
+	if current, err := os.ReadFile(path); err == nil && json.Valid(current) {
+		_ = rotateConfigBackups(path, current)
+	}
+	tmp, err := os.CreateTemp(dir, filepath.Base(path)+".*.tmp")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	defer os.Remove(tmpName)
+	if _, err := tmp.Write(data); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if err := os.Chmod(tmpName, 0600); err != nil {
+		return err
+	}
+	return os.Rename(tmpName, path)
+}
+
+const maxConfigBackups = 5
+
+type BackupInfo struct {
+	Name     string `json:"name"`
+	Path     string `json:"path"`
+	Size     int64  `json:"size"`
+	ModTime  int64  `json:"modTime"`
+	Valid    bool   `json:"valid"`
+	Checksum string `json:"checksum"`
+}
+
+type StatusInfo struct {
+	Path                 string       `json:"path"`
+	Valid                bool         `json:"valid"`
+	Size                 int64        `json:"size"`
+	ModTime              int64        `json:"modTime"`
+	AccountCount         int          `json:"accountCount"`
+	BackupCount          int          `json:"backupCount"`
+	Backups              []BackupInfo `json:"backups"`
+	AdminPasswordDefault bool         `json:"adminPasswordDefault"`
+	Error                string       `json:"error,omitempty"`
+}
+
+func rotateConfigBackups(path string, current []byte) error {
+	for i := maxConfigBackups; i >= 2; i-- {
+		oldPath := fmt.Sprintf("%s.bak.%d", path, i-1)
+		newPath := fmt.Sprintf("%s.bak.%d", path, i)
+		if _, err := os.Stat(oldPath); err == nil {
+			_ = os.Rename(oldPath, newPath)
+		}
+	}
+	if _, err := os.Stat(path + ".bak"); err == nil {
+		_ = os.Rename(path+".bak", path+".bak.1")
+	}
+	return os.WriteFile(path+".bak", current, 0600)
+}
+
+func listBackupPaths(path string) []string {
+	paths := []string{path + ".bak"}
+	for i := 1; i <= maxConfigBackups; i++ {
+		paths = append(paths, fmt.Sprintf("%s.bak.%d", path, i))
+	}
+	return paths
+}
+
+func backupInfo(path string) (BackupInfo, bool) {
+	st, err := os.Stat(path)
+	if err != nil {
+		return BackupInfo{}, false
+	}
+	data, readErr := os.ReadFile(path)
+	valid := readErr == nil && json.Valid(data)
+	return BackupInfo{
+		Name:     filepath.Base(path),
+		Path:     path,
+		Size:     st.Size(),
+		ModTime:  st.ModTime().Unix(),
+		Valid:    valid,
+		Checksum: checksum(data),
+	}, true
+}
+
+func checksum(data []byte) string {
+	if len(data) == 0 {
+		return ""
+	}
+	// Lightweight checksum for UI comparison; not a security boundary.
+	var sum uint32
+	for _, b := range data {
+		sum = sum*33 + uint32(b)
+	}
+	return fmt.Sprintf("%08x", sum)
+}
+
+func Status() StatusInfo {
+	cfgLock.RLock()
+	path := cfgPath
+	password := ""
+	accountCount := 0
+	if cfg != nil {
+		password = cfg.Password
+		accountCount = len(cfg.Accounts)
+	}
+	cfgLock.RUnlock()
+
+	info := StatusInfo{Path: path, AccountCount: accountCount, AdminPasswordDefault: password == "changeme"}
+	if st, err := os.Stat(path); err == nil {
+		info.Size = st.Size()
+		info.ModTime = st.ModTime().Unix()
+	} else {
+		info.Error = err.Error()
+	}
+	if data, err := os.ReadFile(path); err == nil {
+		info.Valid = json.Valid(data)
+		if !info.Valid && info.Error == "" {
+			info.Error = "invalid JSON"
+		}
+	} else if info.Error == "" {
+		info.Error = err.Error()
+	}
+	for _, p := range listBackupPaths(path) {
+		if bi, ok := backupInfo(p); ok {
+			info.Backups = append(info.Backups, bi)
+		}
+	}
+	info.BackupCount = len(info.Backups)
+	return info
+}
+
+func CreateBackup() error {
+	data, err := os.ReadFile(cfgPath)
+	if err != nil {
+		return err
+	}
+	if !json.Valid(data) {
+		return fmt.Errorf("refusing to back up invalid config")
+	}
+	return rotateConfigBackups(cfgPath, data)
+}
+
+func RestoreBackup(name string) error {
+	if name == "" {
+		name = filepath.Base(cfgPath + ".bak")
+	}
+	var selected string
+	for _, p := range listBackupPaths(cfgPath) {
+		if filepath.Base(p) == name {
+			selected = p
+			break
+		}
+	}
+	if selected == "" {
+		return fmt.Errorf("unknown backup %q", name)
+	}
+	data, err := os.ReadFile(selected)
+	if err != nil {
+		return err
+	}
+	if !json.Valid(data) {
+		return fmt.Errorf("backup %s is not valid JSON", name)
+	}
+	var c Config
+	if err := json.Unmarshal(data, &c); err != nil {
+		return err
+	}
+	cfgLock.Lock()
+	cfg = &c
+	cfgLock.Unlock()
+	return atomicWriteConfig(cfgPath, data)
+}
+
+func ExportJSON() ([]byte, error) {
+	return os.ReadFile(cfgPath)
 }
 
 // SetPassword updates the admin password.

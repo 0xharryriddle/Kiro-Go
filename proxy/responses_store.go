@@ -115,10 +115,13 @@ func loadResponse(id string) (*ResponsesObject, error) {
 }
 
 func purgeExpiredResponses(ttl time.Duration) {
+	purgeExpiredResponsesInDir(responsesDir(), ttl)
+}
+
+func purgeExpiredResponsesInDir(dir string, ttl time.Duration) {
 	if ttl <= 0 {
 		ttl = responsesDefaultTTL
 	}
-	dir := responsesDir()
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		return

@@ -375,10 +375,14 @@ func CallKiroAPI(account *config.Account, payload *KiroPayload, callback *KiroSt
 		}
 
 		if resp.StatusCode == 429 {
+			retryAfter := retryAfterFromHeader(resp.Header.Get("Retry-After"))
 			resp.Body.Close()
-			logger.Warnf("[KiroAPI] Endpoint %s quota exhausted (429), trying next...", ep.Name)
-			lastErr = fmt.Errorf("quota exhausted on %s", ep.Name)
-			continue
+			if retryAfter != "" {
+				logger.Warnf("[KiroAPI] Endpoint %s throttled/quota exhausted (429, retry after %s); stopping endpoint fan-out for this account", ep.Name, retryAfter)
+				return fmt.Errorf("HTTP 429 from %s: quota exhausted; retry after %s", ep.Name, retryAfter)
+			}
+			logger.Warnf("[KiroAPI] Endpoint %s throttled/quota exhausted (429); stopping endpoint fan-out for this account", ep.Name)
+			return fmt.Errorf("HTTP 429 from %s: quota exhausted", ep.Name)
 		}
 
 		if resp.StatusCode != 200 {
@@ -409,6 +413,22 @@ func accountEmailForLog(account *config.Account) string {
 		return "<nil>"
 	}
 	return account.Email
+}
+
+func retryAfterFromHeader(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return ""
+	}
+	if seconds, err := strconv.Atoi(raw); err == nil && seconds >= 0 {
+		return (time.Duration(seconds) * time.Second).String()
+	}
+	if t, err := http.ParseTime(raw); err == nil {
+		if d := time.Until(t).Round(time.Second); d > 0 {
+			return d.String()
+		}
+	}
+	return raw
 }
 
 // ==================== Event Stream Parsing ====================

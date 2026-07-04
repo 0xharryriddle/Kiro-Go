@@ -8,6 +8,7 @@ import (
 	accountpool "kiro-go/pool"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -259,7 +260,19 @@ func TestResponsesContinuationKeepsNewInstructions(t *testing.T) {
 
 func setupResponsesTestHandler(t *testing.T) (*Handler, func()) {
 	t.Helper()
-	cfgFile := filepath.Join(t.TempDir(), "config.json")
+	tmpDir, err := os.MkdirTemp("", t.Name())
+	if err != nil {
+		t.Fatalf("mkdir temp: %v", err)
+	}
+	t.Cleanup(func() {
+		for i := 0; i < 5; i++ {
+			if err := os.RemoveAll(tmpDir); err == nil {
+				return
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
+	})
+	cfgFile := filepath.Join(tmpDir, "config.json")
 	if err := config.Init(cfgFile); err != nil {
 		t.Fatalf("config.Init: %v", err)
 	}

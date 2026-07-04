@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"encoding/csv"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -9,6 +10,7 @@ import (
 	"kiro-go/logger"
 	"kiro-go/pool"
 	"net/http"
+	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -21,19 +23,27 @@ const tokenRefreshSkewSeconds int64 = 120
 
 // RequestLog stores details about a single API request (success or failure).
 type RequestLog struct {
-	Time      int64  `json:"time"`      // Unix timestamp
-	Endpoint  string `json:"endpoint"`  // claude/openai/responses
-	Model     string `json:"model"`     // Requested model
-	AccountID string `json:"accountId"` // Account used
-	Status    string `json:"status"`    // "success" or "error"
-	Error     string `json:"error"`     // Error message (empty on success)
-	ErrorType string `json:"errorType"` // Error category (empty on success)
-	Tokens    int    `json:"tokens"`    // Total tokens (input+output, 0 on failure)
-	Credits   float64 `json:"credits"`  // Credits consumed (0 on failure)
-	Duration  int64  `json:"duration"`  // Request duration in ms
+	Time      int64   `json:"time"`      // Unix timestamp
+	Endpoint  string  `json:"endpoint"`  // endpoint type
+	Model     string  `json:"model"`     // model name
+	AccountID string  `json:"accountId"` // account ID used
+	Status    string  `json:"status"`    // success/error
+	Tokens    int     `json:"tokens"`    // estimated tokens
+	Credits   float64 `json:"credits"`   // credits used
+	Error     string  `json:"error,omitempty"`
+	ErrorType string  `json:"errorType,omitempty"`
+	Duration  int64   `json:"duration"` // duration in ms
 }
 
-const requestLogsMaxSize = 500
+type replayDiagnosticRequest struct {
+	Endpoint string          `json:"endpoint"`
+	Payload  json.RawMessage `json:"payload"`
+}
+
+const (
+	requestLogsMaxSize = 500
+	requestLogsPath    = "data/request_logs.json"
+)
 
 // Handler HTTP 处理器
 type Handler struct {
@@ -245,12 +255,15 @@ func NewHandler() *Handler {
 		stopStatsSaver:  make(chan struct{}),
 		promptCache:     newPromptCacheTracker(defaultPromptCacheTTL),
 	}
+	h.loadRequestLogs()
 	// 启动后台刷新
 	go h.backgroundRefresh()
 	// 启动后台统计保存 (每30秒保存一次)
 	go h.backgroundStatsSaver()
-	// 清理过期的 stored responses（>30 天）
-	go purgeExpiredResponses(responsesDefaultTTL)
+	// 清理过期的 stored responses（>30 天）. Capture the directory before the
+	// goroutine starts so tests that reinitialize global config do not race cleanup.
+	responsesCleanupDir := responsesDir()
+	go purgeExpiredResponsesInDir(responsesCleanupDir, responsesDefaultTTL)
 	// Opt-in auto-ingest watcher (KIRO_IMPORT_WATCH); no-op when disabled.
 	h.startImportWatcher()
 	return h
@@ -375,6 +388,10 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	// 路由
 	switch {
+	case path == "/healthz":
+		h.handleHealthz(w, r)
+	case path == "/readyz":
+		h.handleReadyz(w, r)
 	// API 端点（需要验证 API Key）
 	case path == "/v1/messages" || path == "/messages" || path == "/anthropic/v1/messages":
 		ar := h.authenticateForClaude(w, r)
@@ -672,6 +689,88 @@ func (h *Handler) apiRefreshAccountModels(w http.ResponseWriter, r *http.Request
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"success": true,
 		"count":   len(h.pool.GetModelList(id)),
+	})
+}
+
+func (h *Handler) apiGetModelRouting(w http.ResponseWriter, r *http.Request) {
+	model := r.URL.Query().Get("model")
+	if strings.TrimSpace(model) == "" {
+		w.WriteHeader(400)
+		json.NewEncoder(w).Encode(map[string]string{"error": "model query parameter is required"})
+		return
+	}
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"success": true,
+		"routing": h.pool.ModelRouting(model),
+	})
+}
+
+func (h *Handler) apiReplayDiagnose(w http.ResponseWriter, r *http.Request) {
+	var req replayDiagnosticRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		w.WriteHeader(400)
+		json.NewEncoder(w).Encode(map[string]interface{}{"success": false, "error": "invalid JSON"})
+		return
+	}
+	endpoint := strings.ToLower(strings.TrimSpace(req.Endpoint))
+	if endpoint == "" {
+		endpoint = "openai"
+	}
+	if len(req.Payload) == 0 || string(req.Payload) == "null" {
+		w.WriteHeader(400)
+		json.NewEncoder(w).Encode(map[string]interface{}{"success": false, "error": "payload is required"})
+		return
+	}
+
+	model := ""
+	estimatedTokens := 0
+	translated := false
+	var validation string
+	switch endpoint {
+	case "claude", "anthropic":
+		var cr ClaudeRequest
+		if err := json.Unmarshal(req.Payload, &cr); err != nil {
+			validation = "invalid claude payload JSON"
+		} else {
+			model = strings.TrimSpace(cr.Model)
+			validation = validateClaudeRequestShape(&cr)
+			estimatedTokens = estimateClaudeRequestInputTokens(&cr)
+			translated = validation == ""
+			endpoint = "claude"
+		}
+	case "openai", "chat", "chat_completions":
+		var or OpenAIRequest
+		if err := json.Unmarshal(req.Payload, &or); err != nil {
+			validation = "invalid openai payload JSON"
+		} else {
+			model = strings.TrimSpace(or.Model)
+			validation = validateOpenAIRequestShape(&or)
+			estimatedTokens = estimateOpenAIRequestInputTokens(&or)
+			translated = validation == ""
+			endpoint = "openai"
+		}
+	default:
+		w.WriteHeader(400)
+		json.NewEncoder(w).Encode(map[string]interface{}{"success": false, "error": "endpoint must be one of: openai, claude"})
+		return
+	}
+	if model == "" {
+		model = "auto"
+	}
+	status := "valid"
+	if validation != "" {
+		status = "invalid"
+	}
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"success":         true,
+		"status":          status,
+		"endpoint":        endpoint,
+		"model":           model,
+		"estimatedTokens": estimatedTokens,
+		"translated":      translated,
+		"validationError": validation,
+		"dryRun":          true,
+		"routing":         h.pool.ModelRouting(model),
 	})
 }
 
@@ -1286,7 +1385,9 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 	}
 
 	h.recordFailureWithDetails("claude", model, "", lastErr)
-	h.sendClaudeError(w, 500, "api_error", lastErr.Error())
+	status := statusForUpstreamError(lastErr)
+	applyRetryAfterHeader(w, lastErr)
+	h.sendClaudeError(w, status, "api_error", lastErr.Error())
 }
 
 func (h *Handler) sendSSE(w http.ResponseWriter, flusher http.Flusher, event string, data interface{}) {
@@ -1407,7 +1508,50 @@ func (h *Handler) appendRequestLog(entry RequestLog) {
 		h.requestLogs = h.requestLogs[1:]
 	}
 	h.requestLogs = append(h.requestLogs, entry)
+	snapshot := append([]RequestLog(nil), h.requestLogs...)
 	h.requestLogsMu.Unlock()
+	go persistRequestLogs(snapshot)
+}
+
+func (h *Handler) loadRequestLogs() {
+	raw, err := os.ReadFile(requestLogsPath)
+	if err != nil {
+		return
+	}
+	var logs []RequestLog
+	if err := json.Unmarshal(raw, &logs); err != nil {
+		logger.Warnf("[Logs] Failed to load %s: %v", requestLogsPath, err)
+		return
+	}
+	if len(logs) > requestLogsMaxSize {
+		logs = logs[len(logs)-requestLogsMaxSize:]
+	}
+	h.requestLogsMu.Lock()
+	h.requestLogs = logs
+	h.requestLogsMu.Unlock()
+}
+
+func persistRequestLogs(logs []RequestLog) {
+	if len(logs) > requestLogsMaxSize {
+		logs = logs[len(logs)-requestLogsMaxSize:]
+	}
+	if err := os.MkdirAll("data", 0755); err != nil {
+		logger.Warnf("[Logs] Failed to create data dir: %v", err)
+		return
+	}
+	raw, err := json.MarshalIndent(logs, "", "  ")
+	if err != nil {
+		logger.Warnf("[Logs] Failed to encode request logs: %v", err)
+		return
+	}
+	tmp := requestLogsPath + ".tmp"
+	if err := os.WriteFile(tmp, raw, 0600); err != nil {
+		logger.Warnf("[Logs] Failed to write %s: %v", tmp, err)
+		return
+	}
+	if err := os.Rename(tmp, requestLogsPath); err != nil {
+		logger.Warnf("[Logs] Failed to replace %s: %v", requestLogsPath, err)
+	}
 }
 
 // classifyError categorizes an error message into a type for display.
@@ -1561,7 +1705,9 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayl
 	}
 
 	h.recordFailureWithDetails("claude", model, "", lastErr)
-	h.sendClaudeError(w, 500, "api_error", lastErr.Error())
+	status := statusForUpstreamError(lastErr)
+	applyRetryAfterHeader(w, lastErr)
+	h.sendClaudeError(w, status, "api_error", lastErr.Error())
 }
 
 func (h *Handler) sendClaudeError(w http.ResponseWriter, status int, errType, message string) {
@@ -2003,7 +2149,9 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 	}
 
 	h.recordFailureWithDetails("openai", model, "", lastErr)
-	h.sendOpenAIError(w, 500, "server_error", lastErr.Error())
+	status := statusForUpstreamError(lastErr)
+	applyRetryAfterHeader(w, lastErr)
+	h.sendOpenAIError(w, status, errorTypeForOpenAIStatus(status), lastErr.Error())
 }
 
 // handleOpenAINonStream OpenAI 非流式响应
@@ -2087,7 +2235,9 @@ func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, payload *KiroPayl
 	}
 
 	h.recordFailureWithDetails("openai", model, "", lastErr)
-	h.sendOpenAIError(w, 500, "server_error", lastErr.Error())
+	status := statusForUpstreamError(lastErr)
+	applyRetryAfterHeader(w, lastErr)
+	h.sendOpenAIError(w, status, errorTypeForOpenAIStatus(status), lastErr.Error())
 }
 
 func (h *Handler) sendOpenAIError(w http.ResponseWriter, status int, errType, message string) {
@@ -2172,9 +2322,15 @@ func (h *Handler) handleAdminAPI(w http.ResponseWriter, r *http.Request) {
 		h.apiAddAccount(w, r)
 	case path == "/accounts/batch" && r.Method == "POST":
 		h.apiBatchAccounts(w, r)
+	case path == "/accounts/diagnostics" && r.Method == "GET":
+		h.apiGetAccountDiagnostics(w, r)
 	// models/refresh 必须在通用 /refresh 前匹配，否则会被误拦截
 	case path == "/accounts/models/refresh" && r.Method == "POST":
 		h.apiRefreshAllAccountsModels(w, r)
+	case path == "/models/routing" && r.Method == "GET":
+		h.apiGetModelRouting(w, r)
+	case path == "/replay/diagnose" && r.Method == "POST":
+		h.apiReplayDiagnose(w, r)
 	case strings.HasPrefix(path, "/accounts/") && strings.HasSuffix(path, "/models/refresh") && r.Method == "POST":
 		id := strings.TrimSuffix(strings.TrimPrefix(path, "/accounts/"), "/models/refresh")
 		h.apiRefreshAccountModels(w, r, id)
@@ -2223,8 +2379,12 @@ func (h *Handler) handleAdminAPI(w http.ResponseWriter, r *http.Request) {
 		h.apiImportSsoToken(w, r)
 	case path == "/auth/credentials" && r.Method == "POST":
 		h.apiImportCredentials(w, r)
+	case path == "/auth/import-cli-json/preview" && r.Method == "POST":
+		h.apiPreviewCliJson(w, r)
 	case path == "/auth/import-cli-json" && r.Method == "POST":
 		h.apiImportCliJson(w, r)
+	case path == "/auth/import-ide-cache/preview" && r.Method == "POST":
+		h.apiPreviewIdeCache(w, r)
 	case path == "/auth/import-ide-cache" && r.Method == "POST":
 		h.apiImportIdeCache(w, r)
 	case path == "/status" && r.Method == "GET":
@@ -2233,10 +2393,22 @@ func (h *Handler) handleAdminAPI(w http.ResponseWriter, r *http.Request) {
 		h.apiGetSettings(w, r)
 	case path == "/settings" && r.Method == "POST":
 		h.apiUpdateSettings(w, r)
+	case path == "/security/status" && r.Method == "GET":
+		h.apiGetSecurityStatus(w, r)
+	case path == "/config/status" && r.Method == "GET":
+		h.apiGetConfigStatus(w, r)
+	case path == "/config/backup" && r.Method == "POST":
+		h.apiCreateConfigBackup(w, r)
+	case path == "/config/restore" && r.Method == "POST":
+		h.apiRestoreConfigBackup(w, r)
+	case path == "/config/export" && r.Method == "GET":
+		h.apiExportConfig(w, r)
 	case path == "/stats" && r.Method == "GET":
 		h.apiGetStats(w, r)
 	case path == "/stats/reset" && r.Method == "POST":
 		h.apiResetStats(w, r)
+	case path == "/metrics/summary" && r.Method == "GET":
+		h.apiGetMetricsSummary(w, r)
 	case path == "/logs" && r.Method == "GET":
 		h.apiGetLogs(w, r)
 	case path == "/logs" && r.Method == "DELETE":
@@ -2280,6 +2452,126 @@ func (h *Handler) handleAdminAPI(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(404)
 		json.NewEncoder(w).Encode(map[string]string{"error": "Not Found"})
 	}
+}
+
+func (h *Handler) handleHealthz(w http.ResponseWriter, r *http.Request) {
+	json.NewEncoder(w).Encode(map[string]interface{}{"status": "ok", "time": time.Now().Unix()})
+}
+
+func (h *Handler) handleReadyz(w http.ResponseWriter, r *http.Request) {
+	checks := map[string]interface{}{}
+	status := "ok"
+
+	cfgStatus := config.Status()
+	checks["config"] = cfgStatus.Valid
+	checks["configWritable"] = isPathWritable("data")
+	checks["importsWritable"] = isPathWritable("data/imports")
+	checks["accounts"] = cfgStatus.AccountCount
+	checks["webAssets"] = fileExists("web/index.html")
+	if !cfgStatus.Valid || !checks["configWritable"].(bool) || !checks["webAssets"].(bool) {
+		status = "degraded"
+	}
+
+	code := http.StatusOK
+	if status != "ok" {
+		code = http.StatusServiceUnavailable
+	}
+	w.WriteHeader(code)
+	json.NewEncoder(w).Encode(map[string]interface{}{"status": status, "checks": checks})
+}
+
+func isPathWritable(path string) bool {
+	if err := os.MkdirAll(path, 0o755); err != nil {
+		return false
+	}
+	f, err := os.CreateTemp(path, ".readyz-*.tmp")
+	if err != nil {
+		return false
+	}
+	name := f.Name()
+	_ = f.Close()
+	_ = os.Remove(name)
+	return true
+}
+
+func fileExists(path string) bool {
+	_, err := os.Stat(path)
+	return err == nil
+}
+
+func (h *Handler) apiGetConfigStatus(w http.ResponseWriter, r *http.Request) {
+	json.NewEncoder(w).Encode(config.Status())
+}
+
+func (h *Handler) apiCreateConfigBackup(w http.ResponseWriter, r *http.Request) {
+	if err := config.CreateBackup(); err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		return
+	}
+	json.NewEncoder(w).Encode(map[string]interface{}{"success": true, "status": config.Status()})
+}
+
+func (h *Handler) apiRestoreConfigBackup(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Name string `json:"name"`
+	}
+	_ = json.NewDecoder(r.Body).Decode(&req)
+	if err := config.RestoreBackup(req.Name); err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		return
+	}
+	h.pool.Reload()
+	json.NewEncoder(w).Encode(map[string]interface{}{"success": true, "status": config.Status()})
+}
+
+func (h *Handler) apiExportConfig(w http.ResponseWriter, r *http.Request) {
+	data, err := config.ExportJSON()
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		return
+	}
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.Header().Set("Content-Disposition", `attachment; filename="config.json"`)
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(data)
+}
+
+func (h *Handler) apiGetAccountDiagnostics(w http.ResponseWriter, r *http.Request) {
+	diagnostics := h.pool.Diagnostics()
+	summary := map[string]int{
+		"total":          len(diagnostics),
+		"available":      0,
+		"disabled":       0,
+		"cooldown":       0,
+		"tokenExpiring":  0,
+		"quotaExhausted": 0,
+		"notInPool":      0,
+	}
+	for _, d := range diagnostics {
+		if d.Available {
+			summary["available"]++
+		}
+		switch d.Reason {
+		case "disabled":
+			summary["disabled"]++
+		case "cooldown":
+			summary["cooldown"]++
+		case "token_expiring":
+			summary["tokenExpiring"]++
+		case "quota_exhausted":
+			summary["quotaExhausted"]++
+		case "not_in_pool":
+			summary["notInPool"]++
+		}
+	}
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"success":     true,
+		"summary":     summary,
+		"diagnostics": diagnostics,
+	})
 }
 
 func (h *Handler) apiGetAccounts(w http.ResponseWriter, r *http.Request) {
@@ -3116,6 +3408,9 @@ func (h *Handler) importOne(req importCredentialRequest) (config.Account, error)
 	if email == "" {
 		email, _, _ = auth.GetUserInfo(accessToken)
 	}
+	if email == "" {
+		email = emailFromJWT(accessToken)
+	}
 
 	account := config.Account{
 		ID:            auth.GenerateAccountID(),
@@ -3155,11 +3450,91 @@ func pickProfileArn(resolved, fromHelper string) string {
 	return strings.TrimSpace(fromHelper)
 }
 
-// apiImportCliJson ingests one or many CLIProxyAPI_*.json documents produced by
-// kiro-login-helper.py (the standalone Microsoft 365 / Entra ID sign-in helper).
-// It accepts a single helper object, a JSON array, a { "files": [...] } /
-// { "accounts": [...] } wrapper, or raw text with several objects, normalizes
-// each (snake_case native, camelCase tolerated), and imports through the same
+type importPreviewItem struct {
+	Index            int    `json:"index"`
+	AuthMethod       string `json:"authMethod"`
+	Provider         string `json:"provider"`
+	Email            string `json:"email,omitempty"`
+	Nickname         string `json:"nickname,omitempty"`
+	Region           string `json:"region,omitempty"`
+	TokenEndpoint    string `json:"tokenEndpoint,omitempty"`
+	IssuerURL        string `json:"issuerUrl,omitempty"`
+	ProfileArn       string `json:"profileArn,omitempty"`
+	HasRefreshToken  bool   `json:"hasRefreshToken"`
+	HasAccessToken   bool   `json:"hasAccessToken"`
+	HasClientID      bool   `json:"hasClientId"`
+	HasClientSecret  bool   `json:"hasClientSecret"`
+	WillReplaceEmail bool   `json:"willReplaceEmail"`
+}
+
+func previewImportRequests(reqs []importCredentialRequest) []importPreviewItem {
+	accounts := config.GetAccounts()
+	items := make([]importPreviewItem, 0, len(reqs))
+	for i, req := range reqs {
+		email := strings.TrimSpace(req.Email)
+		if email == "" {
+			email = emailFromJWT(req.AccessToken)
+		}
+		willReplace := false
+		for _, acc := range accounts {
+			if email != "" && strings.EqualFold(strings.TrimSpace(acc.Email), email) {
+				willReplace = true
+				break
+			}
+		}
+		items = append(items, importPreviewItem{
+			Index:            i + 1,
+			AuthMethod:       req.AuthMethod,
+			Provider:         req.Provider,
+			Email:            email,
+			Nickname:         req.Nickname,
+			Region:           req.Region,
+			TokenEndpoint:    req.TokenEndpoint,
+			IssuerURL:        req.IssuerURL,
+			ProfileArn:       req.ProfileArn,
+			HasRefreshToken:  strings.TrimSpace(req.RefreshToken) != "",
+			HasAccessToken:   strings.TrimSpace(req.AccessToken) != "",
+			HasClientID:      strings.TrimSpace(req.ClientID) != "",
+			HasClientSecret:  strings.TrimSpace(req.ClientSecret) != "",
+			WillReplaceEmail: willReplace,
+		})
+	}
+	return items
+}
+
+func (h *Handler) apiPreviewCliJson(w http.ResponseWriter, r *http.Request) {
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		w.WriteHeader(400)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Invalid request body"})
+		return
+	}
+	reqs, warnings, err := normalizeCliJson(body)
+	if err != nil {
+		w.WriteHeader(400)
+		json.NewEncoder(w).Encode(map[string]interface{}{"success": false, "error": err.Error(), "warnings": warnings})
+		return
+	}
+	json.NewEncoder(w).Encode(map[string]interface{}{"success": true, "count": len(reqs), "items": previewImportRequests(reqs), "warnings": warnings})
+}
+
+func (h *Handler) apiPreviewIdeCache(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Path string `json:"path"`
+	}
+	_ = json.NewDecoder(r.Body).Decode(&body)
+	path := ideCachePath(body.Path)
+	req, err := readIdeCacheCredential(path)
+	if err != nil {
+		w.WriteHeader(importErrorStatus(err))
+		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		return
+	}
+	json.NewEncoder(w).Encode(map[string]interface{}{"success": true, "source": path, "count": 1, "items": previewImportRequests([]importCredentialRequest{req})})
+}
+
+// apiImportCliJson imports one or more raw CLIProxyAPI_*.json helper documents. It
+// accepts the helper's native snake_case external_idp shape and funnels it into the
 // importOne core the legacy endpoint uses. Per-item results are returned so a
 // partial batch still reports which credentials landed.
 func (h *Handler) apiImportCliJson(w http.ResponseWriter, r *http.Request) {
@@ -3331,6 +3706,44 @@ func (h *Handler) apiUpdatePromptFilter(w http.ResponseWriter, r *http.Request) 
 	json.NewEncoder(w).Encode(map[string]bool{"success": true})
 }
 
+func passwordStrength(password string) (string, []string) {
+	warnings := []string{}
+	if password == "" {
+		return "empty", []string{"empty_password"}
+	}
+	if password == "changeme" {
+		warnings = append(warnings, "default_password")
+	}
+	if len(password) < 12 {
+		warnings = append(warnings, "short_password")
+	}
+	if strings.Contains(strings.ToLower(password), "password") {
+		warnings = append(warnings, "contains_password")
+	}
+	if len(warnings) == 0 {
+		return "strong", warnings
+	}
+	if password == "changeme" || len(password) < 8 {
+		return "weak", warnings
+	}
+	return "medium", warnings
+}
+
+func (h *Handler) apiGetSecurityStatus(w http.ResponseWriter, r *http.Request) {
+	password := config.GetPassword()
+	strength, warnings := passwordStrength(password)
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"success":               true,
+		"adminPasswordDefault":  password == "changeme",
+		"adminPasswordSet":      password != "",
+		"adminPasswordLength":   len(password),
+		"adminPasswordStrength": strength,
+		"warnings":              warnings,
+		"requireApiKey":         config.IsApiKeyRequired(),
+		"apiKeyConfigured":      config.GetApiKey() != "",
+	})
+}
+
 func (h *Handler) apiUpdateSettings(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		ApiKey         *string `json:"apiKey,omitempty"`
@@ -3387,9 +3800,96 @@ func (h *Handler) apiResetStats(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]bool{"success": true})
 }
 
-func (h *Handler) apiGetLogs(w http.ResponseWriter, r *http.Request) {
+func (h *Handler) apiGetMetricsSummary(w http.ResponseWriter, r *http.Request) {
+	logs := h.getRequestLogs()
+	byEndpoint := map[string]int{}
+	byErrorType := map[string]int{}
+	recentErrors := make([]RequestLog, 0, 10)
+	var totalDuration int64
+	var durationCount int64
+	for _, log := range logs {
+		byEndpoint[log.Endpoint]++
+		if log.Status == "error" {
+			byErrorType[log.ErrorType]++
+			if len(recentErrors) < 10 {
+				recentErrors = append(recentErrors, log)
+			}
+		}
+		if log.Duration > 0 {
+			totalDuration += log.Duration
+			durationCount++
+		}
+	}
+	avgDuration := int64(0)
+	if durationCount > 0 {
+		avgDuration = totalDuration / durationCount
+	}
 	json.NewEncoder(w).Encode(map[string]interface{}{
-		"logs": h.getRequestLogs(),
+		"success":         true,
+		"totalRequests":   atomic.LoadInt64(&h.totalRequests),
+		"successRequests": atomic.LoadInt64(&h.successRequests),
+		"failedRequests":  atomic.LoadInt64(&h.failedRequests),
+		"totalTokens":     atomic.LoadInt64(&h.totalTokens),
+		"totalCredits":    h.getCredits(),
+		"logCount":        len(logs),
+		"byEndpoint":      byEndpoint,
+		"byErrorType":     byErrorType,
+		"avgDurationMs":   avgDuration,
+		"recentErrors":    recentErrors,
+		"persistedPath":   requestLogsPath,
+	})
+}
+
+func filterRequestLogs(logs []RequestLog, status, query string, limit int) []RequestLog {
+	status = strings.ToLower(strings.TrimSpace(status))
+	query = strings.ToLower(strings.TrimSpace(query))
+	if status == "all" {
+		status = ""
+	}
+	filtered := make([]RequestLog, 0, len(logs))
+	for _, log := range logs {
+		if status != "" && log.Status != status {
+			continue
+		}
+		if query != "" {
+			haystack := strings.ToLower(strings.Join([]string{log.Endpoint, log.Model, log.AccountID, log.Status, log.ErrorType, log.Error}, " "))
+			if !strings.Contains(haystack, query) {
+				continue
+			}
+		}
+		filtered = append(filtered, log)
+		if limit > 0 && len(filtered) >= limit {
+			break
+		}
+	}
+	return filtered
+}
+
+func (h *Handler) apiGetLogs(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	logs := filterRequestLogs(h.getRequestLogs(), q.Get("status"), q.Get("q"), 0)
+	format := strings.ToLower(q.Get("format"))
+	if format == "csv" {
+		w.Header().Set("Content-Type", "text/csv; charset=utf-8")
+		w.Header().Set("Content-Disposition", "attachment; filename=kiro-go-request-logs.csv")
+		cw := csv.NewWriter(w)
+		_ = cw.Write([]string{"time", "endpoint", "model", "accountId", "status", "errorType", "error", "tokens", "credits", "durationMs"})
+		for _, log := range logs {
+			_ = cw.Write([]string{
+				fmt.Sprintf("%d", log.Time), log.Endpoint, log.Model, log.AccountID, log.Status, log.ErrorType, log.Error,
+				fmt.Sprintf("%d", log.Tokens), fmt.Sprintf("%.6f", log.Credits), fmt.Sprintf("%d", log.Duration),
+			})
+		}
+		cw.Flush()
+		return
+	}
+	if format == "json" {
+		w.Header().Set("Content-Disposition", "attachment; filename=kiro-go-request-logs.json")
+	}
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"logs":          logs,
+		"count":         len(logs),
+		"persistedPath": requestLogsPath,
 	})
 }
 
@@ -3397,6 +3897,7 @@ func (h *Handler) apiClearLogs(w http.ResponseWriter, r *http.Request) {
 	h.requestLogsMu.Lock()
 	h.requestLogs = h.requestLogs[:0]
 	h.requestLogsMu.Unlock()
+	_ = os.Remove(requestLogsPath)
 	json.NewEncoder(w).Encode(map[string]bool{"success": true})
 }
 
@@ -3461,7 +3962,10 @@ func (h *Handler) apiTestAccount(w http.ResponseWriter, r *http.Request, id stri
 
 	err := CallKiroAPI(account, kiroPayload, callback)
 	if err != nil {
-		w.WriteHeader(500)
+		h.handleAccountFailure(account, err)
+		status := statusForUpstreamError(err)
+		applyRetryAfterHeader(w, err)
+		w.WriteHeader(status)
 		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
 		return
 	}

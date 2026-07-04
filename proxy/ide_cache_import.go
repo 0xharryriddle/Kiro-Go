@@ -1,6 +1,8 @@
 package proxy
 
 import (
+	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -68,6 +70,10 @@ func readIdeCacheCredential(path string) (importCredentialRequest, error) {
 		}
 	}
 
+	if strings.TrimSpace(req.Email) == "" {
+		req.Email = emailFromJWT(req.AccessToken)
+	}
+
 	if strings.TrimSpace(req.RefreshToken) == "" {
 		return importCredentialRequest{}, &importValidationError{
 			"Kiro IDE cache " + path + " has no refreshToken — re-open the Kiro IDE to " +
@@ -84,6 +90,27 @@ func readIdeCacheCredential(path string) (importCredentialRequest, error) {
 		}
 	}
 	return req, nil
+}
+
+func emailFromJWT(token string) string {
+	parts := strings.Split(token, ".")
+	if len(parts) < 2 {
+		return ""
+	}
+	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		return ""
+	}
+	var claims struct {
+		Email             string `json:"email"`
+		PreferredUsername string `json:"preferred_username"`
+		UPN               string `json:"upn"`
+		Username          string `json:"username"`
+	}
+	if err := json.Unmarshal(payload, &claims); err != nil {
+		return ""
+	}
+	return firstNonEmpty(claims.Email, claims.PreferredUsername, claims.UPN, claims.Username)
 }
 
 // describeIdeCacheImport returns a short, log-friendly summary of what an IDE

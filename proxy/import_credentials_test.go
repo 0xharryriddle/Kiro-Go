@@ -155,12 +155,13 @@ func TestApiImportCredentialsExternalIdpHappyPath(t *testing.T) {
 	// response), NOT the AWS OIDC endpoint. Stand up that token server and pass
 	// its URL as token_endpoint in the helper JSON.
 	var gotGrant, gotClientID string
+	importedAccessToken := testJWT(`{"preferred_username":"imported.user@example.com"}`)
 	idp := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_ = r.ParseForm()
 		gotGrant = r.Form.Get("grant_type")
 		gotClientID = r.Form.Get("client_id")
 		w.Header().Set("Content-Type", "application/json")
-		fmt.Fprintf(w, `{"access_token":"at-idp","refresh_token":"rt-idp-rotated","expires_in":%d}`, upstreamExpiresIn)
+		fmt.Fprintf(w, `{"access_token":%q,"refresh_token":"rt-idp-rotated","expires_in":%d}`, importedAccessToken, upstreamExpiresIn)
 	}))
 	defer idp.Close()
 
@@ -201,8 +202,11 @@ func TestApiImportCredentialsExternalIdpHappyPath(t *testing.T) {
 	if got.AuthMethod != "external_idp" {
 		t.Fatalf("expected authMethod external_idp, got %q", got.AuthMethod)
 	}
-	if got.AccessToken != "at-idp" {
+	if got.AccessToken != importedAccessToken {
 		t.Fatalf("expected IdP-issued accessToken, got %q", got.AccessToken)
+	}
+	if got.Email != "imported.user@example.com" {
+		t.Fatalf("expected email from access-token claims, got %q", got.Email)
 	}
 	if got.RefreshToken != "rt-idp-rotated" {
 		t.Fatalf("expected rotated refreshToken, got %q", got.RefreshToken)
@@ -256,6 +260,33 @@ func TestApiImportCredentialsExternalIdpRejectsMissingTokenEndpoint(t *testing.T
 	}
 	if accs := config.GetAccounts(); len(accs) != 0 {
 		t.Fatalf("expected no account persisted, got %d", len(accs))
+	}
+}
+
+func TestApiPreviewCliJsonDoesNotPersistSecrets(t *testing.T) {
+	cfgFile := t.TempDir() + "/config.json"
+	if err := config.Init(cfgFile); err != nil {
+		t.Fatalf("config init: %v", err)
+	}
+	h := &Handler{pool: accountpool.GetPool()}
+	body := `{"auth_method":"external_idp","client_id":"client-preview","refresh_token":"rt-secret","access_token":"at-secret","token_endpoint":"https://login.example/token","email":"preview@example.com","profile_arn":"arn:aws:sso:::profile/preview","type":"kiro"}`
+	req := httptest.NewRequest("POST", "/auth/import-cli-json/preview", strings.NewReader(body))
+	rec := httptest.NewRecorder()
+
+	h.apiPreviewCliJson(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	if accs := config.GetAccounts(); len(accs) != 0 {
+		t.Fatalf("preview must not persist accounts, got %d", len(accs))
+	}
+	response := rec.Body.String()
+	if strings.Contains(response, "rt-secret") || strings.Contains(response, "at-secret") || strings.Contains(response, "client-preview") {
+		t.Fatalf("preview leaked credential material: %s", response)
+	}
+	if !strings.Contains(response, "preview@example.com") || !strings.Contains(response, "hasRefreshToken") {
+		t.Fatalf("preview missing expected metadata: %s", response)
 	}
 }
 

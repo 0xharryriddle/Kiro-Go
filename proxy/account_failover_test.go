@@ -1,6 +1,11 @@
 package proxy
 
-import "testing"
+import (
+	"errors"
+	"net/http"
+	"net/http/httptest"
+	"testing"
+)
 
 func TestAccountFailureClassifiers(t *testing.T) {
 	tests := []struct {
@@ -19,5 +24,20 @@ func TestAccountFailureClassifiers(t *testing.T) {
 		if !tc.fn(tc.msg) {
 			t.Fatalf("%s classifier did not match %q", tc.name, tc.msg)
 		}
+	}
+}
+
+func TestStatusForUpstreamErrorMapsQuotaTo429(t *testing.T) {
+	status := statusForUpstreamError(errors.New("HTTP 429 from Kiro IDE: quota exhausted"))
+	if status != http.StatusTooManyRequests {
+		t.Fatalf("expected 429, got %d", status)
+	}
+}
+
+func TestApplyRetryAfterHeader(t *testing.T) {
+	rec := httptest.NewRecorder()
+	applyRetryAfterHeader(rec, errors.New("HTTP 429 from Kiro IDE: quota exhausted; retry after 120"))
+	if got := rec.Header().Get("Retry-After"); got != "120" {
+		t.Fatalf("expected Retry-After 120, got %q", got)
 	}
 }

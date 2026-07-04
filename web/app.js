@@ -14,6 +14,7 @@
   let currentLang = localStorage.getItem('kiro_lang') || 'zh';
   const dict = { en: null, zh: null };
   let accountsData = [];
+  let accountDiagnostics = { summary: {}, diagnostics: [] };
   const selectedAccounts = new Set();
   let filterKeyword = '';
   let filterStatus = 'all';
@@ -662,7 +663,7 @@
 
   // Data loaders
   async function loadData() {
-    await Promise.all([loadStats(), loadAccounts(), loadSettings(), loadVersion()]);
+    await Promise.all([loadStats(), loadAccounts(), loadSettings(), loadSecurityStatus(), loadVersion()]);
     renderEndpointCode('claudeEndpoint', baseUrl + '/v1/messages');
     renderEndpointCode('openaiEndpoint', baseUrl + '/v1/chat/completions');
     renderEndpointCode('openaiResponsesEndpoint', baseUrl + '/v1/responses');
@@ -683,6 +684,7 @@
 
   // ===== Logs =====
   let logsFilter = 'all';
+  let logsSearch = '';
   let logsAutoTimer = null;
   let logsCache = [];
 
@@ -710,10 +712,32 @@
 
   async function loadLogs() {
     try {
-      const res = await api('/logs');
+      const params = new URLSearchParams();
+      if (logsFilter !== 'all') params.set('status', logsFilter);
+      if (logsSearch) params.set('q', logsSearch);
+      const res = await api('/logs' + (params.toString() ? '?' + params.toString() : ''));
       const d = await res.json();
       const logs = d.logs || [];
       renderLogs(logs);
+      loadMetricsSummary();
+    } catch (e) {
+      // silent
+    }
+  }
+
+  async function loadMetricsSummary() {
+    try {
+      const res = await api('/metrics/summary');
+      if (!res.ok) return;
+      const d = await res.json();
+      const box = $('metricsSummary');
+      if (!box) return;
+      const errors = d.byErrorType || {};
+      box.innerHTML =
+        '<span>' + escapeHtml(t('metrics.logCount')) + ': <strong>' + escapeHtml(String(d.logCount || 0)) + '</strong></span>' +
+        '<span>' + escapeHtml(t('metrics.avgLatency')) + ': <strong>' + escapeHtml(String(d.avgDurationMs || 0)) + 'ms</strong></span>' +
+        '<span>' + escapeHtml(t('metrics.quotaErrors')) + ': <strong>' + escapeHtml(String(errors.quota || 0)) + '</strong></span>' +
+        '<span>' + escapeHtml(t('metrics.persisted')) + ': <code>' + escapeHtml(d.persistedPath || '-') + '</code></span>';
     } catch (e) {
       // silent
     }
@@ -733,7 +757,7 @@
       '<span>' + escapeHtml(t('logs.success')) + ': <strong>' + okCount + '</strong></span>' +
       '<span>' + escapeHtml(t('logs.errors')) + ': <strong>' + errCount + '</strong></span>';
 
-    const filtered = logs.filter(l => logsFilter === 'all' || l.status === logsFilter);
+    const filtered = logs;
 
     if (!filtered.length) {
       list.innerHTML = '<p class="text-muted">' + escapeHtml(t('logs.empty')) + '</p>';
@@ -781,7 +805,29 @@
     if (!confirm(t('logs.clearConfirm'))) return;
     await api('/logs', { method: 'DELETE' });
     renderLogs([]);
+    loadMetricsSummary();
     toast(t('logs.cleared'), 'success');
+  }
+
+  async function exportLogs(format) {
+    const params = new URLSearchParams({ format });
+    if (logsFilter !== 'all') params.set('status', logsFilter);
+    if (logsSearch) params.set('q', logsSearch);
+    const res = await api('/logs?' + params.toString());
+    if (!res.ok) {
+      toast(t('logs.exportFailed'), 'error');
+      return;
+    }
+    const blob = await res.blob();
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = 'kiro-go-request-logs.' + (format === 'csv' ? 'csv' : 'json');
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+    toast(t('logs.exported'), 'success');
   }
 
   function toggleLogsAutoRefresh() {
@@ -800,8 +846,16 @@
     renderAccounts();
   }
 
-  // Account list
+  async function loadAccountDiagnostics() {
+    const res = await api('/accounts/diagnostics');
+    if (!res.ok) return;
+    accountDiagnostics = await res.json();
+    renderAccountDiagnostics();
+    renderAccounts();
+  }
+
   function getFilteredAccounts() {
+
     return accountsData.filter(a => {
       if (filterStatus === 'enabled' && !a.enabled) return false;
       if (filterStatus === 'disabled' && (a.enabled || (a.banStatus && a.banStatus !== 'ACTIVE'))) return false;
@@ -926,6 +980,110 @@
       const pct = Math.max(0, Math.min(100, parseFloat(el.dataset.usagePct) || 0));
       el.style.width = pct + '%';
     });
+  }
+
+  function diagnosticReasonLabel(reason) {
+    return t('diag.reason.' + (reason || 'unknown'));
+  }
+
+  async function checkModelRouting() {
+    const input = $('routingModelInput');
+    const body = $('modelRoutingBody');
+    const model = input ? input.value.trim() : '';
+    if (!model) return toast(t('models.routingModelRequired'), 'warning');
+    if (body) body.textContent = t('common.loading');
+    try {
+      const res = await api('/models/routing?model=' + encodeURIComponent(model));
+      const d = await res.json();
+      if (!res.ok || d.success === false) throw new Error(d.error || t('common.failed'));
+      renderModelRouting(d.routing || {});
+    } catch (e) {
+      if (body) body.innerHTML = '<div class="alert alert-error">' + escapeHtml(e.message || String(e)) + '</div>';
+    }
+  }
+
+  function defaultReplayPayload(endpoint) {
+    if (endpoint === 'claude') {
+      return JSON.stringify({ model: 'claude-sonnet-4.5', max_tokens: 64, messages: [{ role: 'user', content: 'Say hello.' }] }, null, 2);
+    }
+    return JSON.stringify({ model: 'claude-sonnet-4.5', messages: [{ role: 'user', content: 'Say hello.' }], max_tokens: 64 }, null, 2);
+  }
+
+  async function runReplayDiagnose() {
+    const endpoint = $('replayEndpointSelect') ? $('replayEndpointSelect').value : 'openai';
+    const input = $('replayPayloadInput');
+    const body = $('replayResultBody');
+    let payload;
+    try {
+      payload = JSON.parse(input ? input.value : '');
+    } catch (e) {
+      if (body) body.innerHTML = '<div class="alert alert-error">' + escapeHtml(t('replay.invalidJson')) + '</div>';
+      return;
+    }
+    if (body) body.textContent = t('common.loading');
+    try {
+      const res = await api('/replay/diagnose', { method: 'POST', body: JSON.stringify({ endpoint, payload }) });
+      const d = await res.json();
+      if (!res.ok || d.success === false) throw new Error(d.error || t('common.failed'));
+      renderReplayResult(d);
+    } catch (e) {
+      if (body) body.innerHTML = '<div class="alert alert-error">' + escapeHtml(e.message || String(e)) + '</div>';
+    }
+  }
+
+  function renderReplayResult(d) {
+    const body = $('replayResultBody');
+    if (!body) return;
+    const routing = d.routing || {};
+    body.innerHTML =
+      '<div class="routing-summary">' +
+      '<span>' + escapeHtml(t('replay.status')) + ': <strong>' + escapeHtml(d.status || '-') + '</strong></span>' +
+      '<span>' + escapeHtml(t('models.routingModel')) + ': <strong>' + escapeHtml(d.model || '-') + '</strong></span>' +
+      '<span>' + escapeHtml(t('replay.estimatedTokens')) + ': <strong>' + escapeHtml(String(d.estimatedTokens || 0)) + '</strong></span>' +
+      '<span>' + escapeHtml(t('models.routeable')) + ': <strong>' + escapeHtml(String(routing.routeableCount || 0)) + '</strong></span>' +
+      '</div>' +
+      (d.validationError ? '<div class="alert alert-warning">' + escapeHtml(d.validationError) + '</div>' : '<div class="alert alert-success">' + escapeHtml(t('replay.validDryRun')) + '</div>');
+  }
+
+  function renderModelRouting(routing) {
+    const body = $('modelRoutingBody');
+    if (!body) return;
+    const accounts = routing.accounts || [];
+    body.innerHTML =
+      '<div class="routing-summary">' +
+      '<span>' + escapeHtml(t('models.routingModel')) + ': <strong>' + escapeHtml(routing.model || '-') + '</strong></span>' +
+      '<span>' + escapeHtml(t('models.routeable')) + ': <strong>' + escapeHtml(String(routing.routeableCount || 0)) + '</strong></span>' +
+      '<span>' + escapeHtml(t('models.optimisticFallback')) + ': <strong>' + escapeHtml(routing.optimisticFallback ? 'ON' : 'OFF') + '</strong></span>' +
+      '</div>' +
+      '<div class="routing-list">' + accounts.map(a =>
+        '<div class="routing-chip ' + (a.available ? 'routing-chip--ok' : 'routing-chip--warn') + '">' +
+        '<strong>' + escapeHtml(a.id || '-') + '</strong>' +
+        '<span>' + escapeHtml(diagnosticReasonLabel(a.reason)) + '</span>' +
+        '<span>' + escapeHtml(t('diag.cachedModels')) + ': ' + escapeHtml(String(a.cachedModelCount || 0)) + '</span>' +
+        '</div>'
+      ).join('') + '</div>';
+  }
+
+  function renderAccountDiagnostics() {
+    const box = $('diagnosticsBody');
+    if (!box) return;
+    const summary = accountDiagnostics.summary || {};
+    const items = accountDiagnostics.diagnostics || [];
+    box.innerHTML =
+      '<div class="diag-summary">' +
+      '<span>' + escapeHtml(t('diag.total')) + ': <strong>' + escapeHtml(String(summary.total || 0)) + '</strong></span>' +
+      '<span>' + escapeHtml(t('diag.available')) + ': <strong>' + escapeHtml(String(summary.available || 0)) + '</strong></span>' +
+      '<span>' + escapeHtml(t('diag.quota')) + ': <strong>' + escapeHtml(String(summary.quotaExhausted || 0)) + '</strong></span>' +
+      '<span>' + escapeHtml(t('diag.cooldown')) + ': <strong>' + escapeHtml(String(summary.cooldown || 0)) + '</strong></span>' +
+      '</div>' +
+      '<div class="diag-list">' + items.map(d =>
+        '<div class="diag-chip ' + (d.available ? 'diag-chip--ok' : 'diag-chip--warn') + '">' +
+        '<strong>' + escapeHtml(d.id || '-') + '</strong>' +
+        '<span>' + escapeHtml(diagnosticReasonLabel(d.reason)) + '</span>' +
+        '<span>' + escapeHtml(t('diag.errors')) + ': ' + escapeHtml(String(d.errorCount || 0)) + '</span>' +
+        '<span>' + escapeHtml(t('diag.cachedModels')) + ': ' + escapeHtml(String(d.cachedModelCount || 0)) + '</span>' +
+        '</div>'
+      ).join('') + '</div>';
   }
 
   function renderAccounts() {
@@ -1531,13 +1689,38 @@
     if (modalBtn) modalBtn.removeAttribute('aria-busy');
   }
 
+  async function loadSecurityStatus() {
+    try {
+      const res = await api('/security/status');
+      if (!res.ok) return;
+      const d = await res.json();
+      const banner = $('securityBanner');
+      if (!banner) return;
+      const warnings = d.warnings || [];
+      if (!warnings.length) {
+        banner.classList.add('hidden');
+        banner.innerHTML = '';
+        return;
+      }
+      banner.classList.remove('hidden');
+      banner.innerHTML =
+        '<div class="security-banner-icon"><i class="fa-solid fa-shield-halved"></i></div>' +
+        '<div><strong>' + escapeHtml(t('security.title')) + '</strong><p>' + escapeHtml(t('security.defaultPasswordWarning')) + '</p></div>' +
+        '<button class="btn btn-warning btn-sm" id="securityOpenSettingsBtn">' + escapeHtml(t('security.openSettings')) + '</button>';
+      const btn = $('securityOpenSettingsBtn');
+      if (btn) btn.addEventListener('click', () => switchTab('settings'));
+    } catch (e) {
+      // silent
+    }
+  }
+
   // Settings
   async function loadSettings() {
     const res = await api('/settings');
     const d = await res.json();
     $('requireApiKey').checked = d.requireApiKey;
     $('allowOverUsage').checked = d.allowOverUsage || false;
-    await Promise.all([loadThinkingConfig(), loadEndpointConfig(), loadProxyConfig(), loadPromptFilter(), loadApiKeys()]);
+    await Promise.all([loadThinkingConfig(), loadEndpointConfig(), loadProxyConfig(), loadPromptFilter(), loadApiKeys(), loadConfigStatus()]);
     refreshCustomSelects();
   }
   async function loadThinkingConfig() {
@@ -1645,9 +1828,71 @@
     await api('/settings', { method: 'POST', body: JSON.stringify({ allowOverUsage }) });
     toast(t('settings.overUsageSaved'), 'success');
   }
+  function formatDateTime(ts) {
+    if (!ts) return '-';
+    return new Date(ts * 1000).toLocaleString();
+  }
+
+  async function loadConfigStatus() {
+    const box = $('configHealthBody');
+    if (!box) return;
+    box.innerHTML = '<div class="api-view-loading"><i class="fa-solid fa-spinner fa-spin"></i> ' + escapeHtml(t('common.loading')) + '</div>';
+    try {
+      const res = await api('/config/status');
+      const d = await res.json();
+      const validCls = d.valid ? 'ok' : 'err';
+      const passWarning = d.adminPasswordDefault ? '<div class="alert alert-warning">' + escapeHtml(t('settings.configDefaultPassword')) + '</div>' : '';
+      const emptyWarning = (d.accountCount || 0) === 0 ? '<div class="alert alert-warning">' + escapeHtml(t('settings.configNoAccounts')) + '</div>' : '';
+      const backups = Array.isArray(d.backups) && d.backups.length
+        ? d.backups.map(b => '<div class="config-backup-row"><span>' + escapeHtml(b.name) + '</span><span>' + escapeHtml(String(b.size || 0)) + ' B</span><span>' + escapeHtml(formatDateTime(b.modTime)) + '</span><span>' + escapeHtml(b.valid ? 'OK' : 'BAD') + '</span></div>').join('')
+        : '<div class="muted">' + escapeHtml(t('settings.configNoBackups')) + '</div>';
+      box.innerHTML = passWarning + emptyWarning +
+        '<div class="config-health-grid">' +
+        '<div><strong>' + escapeHtml(t('settings.configValid')) + '</strong><span class="status-dot ' + validCls + '"></span> ' + escapeHtml(d.valid ? 'OK' : 'BAD') + '</div>' +
+        '<div><strong>' + escapeHtml(t('settings.configSize')) + '</strong> ' + escapeHtml(String(d.size || 0)) + ' B</div>' +
+        '<div><strong>' + escapeHtml(t('settings.configAccounts')) + '</strong> ' + escapeHtml(String(d.accountCount || 0)) + '</div>' +
+        '<div><strong>' + escapeHtml(t('settings.configModified')) + '</strong> ' + escapeHtml(formatDateTime(d.modTime)) + '</div>' +
+        '</div><div class="config-backups"><strong>' + escapeHtml(t('settings.configBackups')) + '</strong>' + backups + '</div>';
+    } catch (e) {
+      box.innerHTML = '<div class="alert alert-error">' + escapeHtml(e.message || String(e)) + '</div>';
+    }
+  }
+
+  async function createConfigBackup() {
+    const res = await api('/config/backup', { method: 'POST' });
+    const d = await res.json().catch(() => ({}));
+    if (!res.ok || d.success === false) return toastError((d && d.error) || t('common.failed'));
+    toast(t('settings.configBackupCreated'), 'success');
+    loadConfigStatus();
+  }
+
+  async function restoreConfigBackup() {
+    if (!confirm(t('settings.configRestoreConfirm'))) return;
+    const res = await api('/config/restore', { method: 'POST', body: JSON.stringify({}) });
+    const d = await res.json().catch(() => ({}));
+    if (!res.ok || d.success === false) return toastError((d && d.error) || t('common.failed'));
+    toast(t('settings.configRestored'), 'success');
+    await Promise.all([loadConfigStatus(), loadAccounts(), loadStats()]);
+  }
+
+  async function exportConfig() {
+    const res = await api('/config/export');
+    if (!res.ok) return toastError(t('common.failed'));
+    const blob = await res.blob();
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = 'config.json';
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+  }
+
   async function changePassword() {
     const np = $('newPassword').value;
     if (!np) return toast(t('settings.passwordRequired'), 'warning');
+    if (np.length < 12) return toast(t('security.passwordTooShort'), 'warning');
     try {
       const res = await api('/settings', { method: 'POST', body: JSON.stringify({ password: np }) });
       const d = await res.json().catch(() => ({}));
@@ -1655,6 +1900,7 @@
       setActivePassword(np, localStorage.getItem('kiro_remember') === '1');
       toast(t('settings.passwordChanged'), 'success');
       $('newPassword').value = '';
+      loadSecurityStatus();
     } catch (e) {
       toast((e && e.message) || t('common.saveFailed'), 'error');
     }
@@ -2495,6 +2741,53 @@
   // host (~/.aws/sso/cache/kiro-auth-token.json) with no browser sign-in. The
   // backend reads the file server-side, so this only works when the IDE and the
   // proxy run on the same host (or the cache is mounted + KIRO_IDE_CACHE is set).
+  function renderRecoveryPreview(data) {
+    const box = $('recoveryPreviewBody');
+    if (!box) return;
+    const items = (data && data.items) || [];
+    if (!items.length) {
+      box.textContent = t('recovery.previewEmpty');
+      return;
+    }
+    box.innerHTML = items.map(item =>
+      '<div class="recovery-preview-item">' +
+      '<strong>#' + escapeHtml(String(item.index || 1)) + ' ' + escapeHtml(item.email || t('common.unknownError')) + '</strong>' +
+      '<div>' + escapeHtml(item.authMethod || '-') + ' / ' + escapeHtml(item.provider || '-') + '</div>' +
+      '<div>' + escapeHtml(t('recovery.material')) + ': refresh=' + escapeHtml(String(!!item.hasRefreshToken)) + ', access=' + escapeHtml(String(!!item.hasAccessToken)) + ', clientId=' + escapeHtml(String(!!item.hasClientId)) + '</div>' +
+      (item.tokenEndpoint ? '<div>' + escapeHtml(t('recovery.tokenEndpoint')) + ': ' + escapeHtml(item.tokenEndpoint) + '</div>' : '') +
+      (item.willReplaceEmail ? '<div class="warning-text">' + escapeHtml(t('recovery.willReplace')) + '</div>' : '') +
+      '</div>'
+    ).join('');
+  }
+
+  async function previewIdeCache() {
+    const res = await api('/auth/import-ide-cache/preview', { method: 'POST', body: JSON.stringify({}) });
+    const d = await res.json().catch(() => ({}));
+    if (!res.ok || d.success === false) return toastError((d && d.error) || t('common.failed'));
+    renderRecoveryPreview(d);
+    toast(t('recovery.previewReady'), 'success');
+  }
+
+  async function previewRecoveryJson() {
+    const raw = ($('recoveryJsonText').value || '').trim();
+    if (!raw) return toastWarning(t('kirosso.helperJsonEmpty'));
+    const res = await api('/auth/import-cli-json/preview', { method: 'POST', body: raw });
+    const d = await res.json().catch(() => ({}));
+    if (!res.ok || d.success === false) return toastError((d && d.error) || t('common.failed'));
+    renderRecoveryPreview(d);
+    toast(t('recovery.previewReady'), 'success');
+  }
+
+  async function importRecoveryJson() {
+    const raw = ($('recoveryJsonText').value || '').trim();
+    if (!raw) return toastWarning(t('kirosso.helperJsonEmpty'));
+    const res = await api('/auth/import-cli-json', { method: 'POST', body: raw });
+    const d = await res.json().catch(() => ({}));
+    if (!res.ok || d.success === false) return toastError((d && d.error) || t('common.failed'));
+    toastPrimary(t('sso.importSuccess', (d.imported || []).length));
+    await Promise.all([loadAccounts(), loadStats(), loadConfigStatus()]);
+  }
+
   async function importIdeCache() {
     const res = await api('/auth/import-ide-cache', { method: 'POST', body: JSON.stringify({}) });
     const d = await res.json();
@@ -2841,6 +3134,14 @@
   function closeUpdateModal() { closeDialog('updateModal'); }
 
   // Tabs
+  function showToolPanel(panelId) {
+    qsa('.tool-panel').forEach(panel => panel.classList.toggle('hidden', panel.id !== panelId));
+    qsa('.tool-launch-btn').forEach(btn => btn.classList.toggle('active', btn.dataset.toolPanel === panelId));
+    if (panelId === 'accountDiagnosticsCard') loadAccountDiagnostics();
+    const panel = $(panelId);
+    if (panel) panel.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+  }
+
   function switchTab(tab) {
     qsa('.tab').forEach(el => el.classList.toggle('active', el.dataset.tab === tab));
     qsa('.tab-content').forEach(c => c.classList.add('hidden'));
@@ -2887,6 +3188,7 @@
     $('logoutBtn').addEventListener('click', logout);
 
     qsa('#tabBar .tab').forEach(tab => tab.addEventListener('click', () => switchTab(tab.dataset.tab)));
+    qsa('.tool-launch-btn').forEach(btn => btn.addEventListener('click', () => showToolPanel(btn.dataset.toolPanel)));
 
     qsa('[data-copy]').forEach(btn => btn.addEventListener('click', async () => {
       const id = btn.dataset.copy;
@@ -2918,6 +3220,16 @@
       logsFilter = e.target.value;
       loadLogs();
     });
+    const logsSearchInput = $('logsSearchInput');
+    if (logsSearchInput) logsSearchInput.addEventListener('input', e => {
+      logsSearch = e.target.value.trim();
+      clearTimeout(logsSearchInput._timer);
+      logsSearchInput._timer = setTimeout(loadLogs, 250);
+    });
+    const exportJsonBtn = $('logsExportJsonBtn');
+    if (exportJsonBtn) exportJsonBtn.addEventListener('click', () => exportLogs('json'));
+    const exportCsvBtn = $('logsExportCsvBtn');
+    if (exportCsvBtn) exportCsvBtn.addEventListener('click', () => exportLogs('csv'));
   }
 
   function bindAccountEvents() {
@@ -2969,6 +3281,10 @@
     $('saveThinkingBtn').addEventListener('click', saveThinkingConfig);
     $('saveEndpointBtn').addEventListener('click', saveEndpointConfig);
     $('changePasswordBtn').addEventListener('click', changePassword);
+    $('refreshConfigStatusBtn').addEventListener('click', loadConfigStatus);
+    $('createConfigBackupBtn').addEventListener('click', createConfigBackup);
+    $('restoreConfigBackupBtn').addEventListener('click', restoreConfigBackup);
+    $('exportConfigBtn').addEventListener('click', exportConfig);
     $('proxyType').addEventListener('change', onProxyTypeChange);
     $('saveProxyBtn').addEventListener('click', saveProxyConfig);
     $('resetStatsBtn').addEventListener('click', resetStats);
@@ -3276,6 +3592,28 @@
     bindModalEvents();
     bindDetailEvents();
     bindTestEvents();
+    const refreshDiagnosticsBtn = $('refreshDiagnosticsBtn');
+    if (refreshDiagnosticsBtn) refreshDiagnosticsBtn.addEventListener('click', loadAccountDiagnostics);
+    const checkRoutingBtn = $('checkModelRoutingBtn');
+    if (checkRoutingBtn) checkRoutingBtn.addEventListener('click', checkModelRouting);
+    const routingInput = $('routingModelInput');
+    if (routingInput) routingInput.addEventListener('keydown', e => { if (e.key === 'Enter') checkModelRouting(); });
+    const refreshRoutingModelsBtn = $('refreshRoutingModelsBtn');
+    if (refreshRoutingModelsBtn) refreshRoutingModelsBtn.addEventListener('click', refreshAllModels);
+    const replayInput = $('replayPayloadInput');
+    const replayEndpoint = $('replayEndpointSelect');
+    if (replayInput && !replayInput.value) replayInput.value = defaultReplayPayload(replayEndpoint ? replayEndpoint.value : 'openai');
+    if (replayEndpoint) replayEndpoint.addEventListener('change', () => { if (replayInput) replayInput.value = defaultReplayPayload(replayEndpoint.value); });
+    const replayBtn = $('runReplayDiagnoseBtn');
+    if (replayBtn) replayBtn.addEventListener('click', runReplayDiagnose);
+    const previewIdeBtn = $('previewIdeCacheBtn');
+    if (previewIdeBtn) previewIdeBtn.addEventListener('click', previewIdeCache);
+    const previewJsonBtn = $('previewRecoveryJsonBtn');
+    if (previewJsonBtn) previewJsonBtn.addEventListener('click', previewRecoveryJson);
+    const importJsonBtn = $('importRecoveryJsonBtn');
+    if (importJsonBtn) importJsonBtn.addEventListener('click', importRecoveryJson);
+    const refreshRecoveryBtn = $('refreshRecoveryBtn');
+    if (refreshRecoveryBtn) refreshRecoveryBtn.addEventListener('click', () => renderRecoveryPreview({ items: [] }));
   }
 
   // Init

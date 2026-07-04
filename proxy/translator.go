@@ -276,6 +276,11 @@ func ClaudeToKiro(req *ClaudeRequest, thinking bool) *KiroPayload {
 	// the current message text so the upstream does not reject the request.
 	currentToolResultIDs := collectToolResultIDs(currentToolResults)
 	keepCurrentToolResults := currentToolResultsMatchLastAssistant(history, currentToolResultIDs)
+	if !keepCurrentToolResults && len(currentImages) > 0 && len(currentToolResults) > 0 {
+		// Preserve image-bearing tool results on the active turn; flattening would
+		// drop the association between the attached image and its tool output.
+		keepCurrentToolResults = true
+	}
 
 	// Flatten structured tool calls/results that live in history; upstream only
 	// accepts a single active tool turn (last assistant toolUses ⟺ current toolResults).
@@ -1223,6 +1228,9 @@ func OpenAIToKiro(req *OpenAIRequest, thinking bool) *KiroPayload {
 	// flatten them into the current message text (see ClaudeToKiro for rationale).
 	currentToolResultIDs := collectToolResultIDs(currentToolResults)
 	keepCurrentToolResults := currentToolResultsMatchLastAssistant(history, currentToolResultIDs)
+	if !keepCurrentToolResults && len(currentImages) > 0 && len(currentToolResults) > 0 {
+		keepCurrentToolResults = true
+	}
 
 	if keepCurrentToolResults {
 		history = sanitizeKiroHistory(history, currentToolResultIDs)
@@ -1555,7 +1563,9 @@ func sanitizeKiroHistory(history []KiroHistoryMessage, currentToolResultIDs map[
 			if len(ctx.ToolResults) > 0 {
 				narrated := narrateToolResults(ctx.ToolResults, toolNames)
 				msg.UserInputMessage.Content = joinHistoryText(msg.UserInputMessage.Content, narrated)
-				ctx.ToolResults = nil
+				if len(msg.UserInputMessage.Images) == 0 {
+					ctx.ToolResults = nil
+				}
 			}
 			// History messages must not carry structured tool specs either.
 			ctx.Tools = nil
