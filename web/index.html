@@ -251,6 +251,7 @@
           <button type="button" class="btn btn-outline btn-sm tool-launch-btn" data-tool-panel="externalIdpDiagnosticsCard" data-i18n="externalIdpDiag.title"></button>
           <button type="button" class="btn btn-outline btn-sm tool-launch-btn" data-tool-panel="modelRoutingCard" data-i18n="models.routingTitle"></button>
           <button type="button" class="btn btn-outline btn-sm tool-launch-btn" data-tool-panel="replayDiagnosticsCard" data-i18n="replay.title"></button>
+          <button type="button" class="btn btn-outline btn-sm tool-launch-btn" data-tool-panel="usageAuditCard" data-i18n="usageAudit.title"></button>
           <button type="button" class="btn btn-outline btn-sm tool-launch-btn" data-tool-panel="auditLogsCard" data-i18n="audit.title"></button>
         </div>
 
@@ -296,6 +297,20 @@
         </div>
         <textarea id="replayPayloadInput" class="replay-payload" spellcheck="false"></textarea>
         <div id="replayResultBody" class="replay-result muted-text" data-i18n="replay.hint"></div>
+      </div>
+
+      <div class="card tool-panel hidden" id="usageAuditCard">
+        <div class="card-header">
+          <span class="card-title" data-i18n="usageAudit.title"></span>
+          <div class="usage-audit-actions">
+            <button class="btn btn-secondary btn-sm" id="recheckUsageAuditBtn" data-i18n="usageAudit.recheckAll"></button>
+            <button class="btn btn-outline btn-sm" id="refreshUsageAuditBtn" data-i18n="common.refresh"></button>
+          </div>
+        </div>
+        <p class="muted-text" data-i18n="usageAudit.desc"></p>
+        <div id="usageAuditSummary" class="usage-audit-summary"></div>
+        <div id="usageAuditBody" class="diag-body muted-text" data-i18n="diag.loading"></div>
+        <p class="muted-text usage-audit-note" data-i18n="usageAudit.creditsNote"></p>
       </div>
 
       <div class="card tool-panel hidden" id="auditLogsCard">

@@ -883,6 +883,39 @@
     renderAuditLogs(data);
   }
 
+  async function loadUsageAudit() {
+    const box = $('usageAuditBody');
+    if (box) box.textContent = t('diag.loading');
+    const res = await api('/accounts/usage-audit');
+    if (!res.ok) return;
+    const data = await res.json();
+    renderUsageAudit(data);
+  }
+
+  async function recheckUsageAudit(accountId) {
+    const btn = $('recheckUsageAuditBtn');
+    if (btn) { btn.disabled = true; btn.textContent = t('usageAudit.rechecking'); }
+    const box = $('usageAuditBody');
+    if (box) box.textContent = t('usageAudit.rechecking');
+    try {
+      const body = accountId ? JSON.stringify({ accountId }) : '{}';
+      const res = await api('/accounts/usage-audit/recheck', { method: 'POST', body });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok || data.success === false) {
+        return toastError((data && data.error) || t('common.failed'));
+      }
+      renderUsageAudit(data);
+      if (Array.isArray(data.errors) && data.errors.length) {
+        toastError(t('usageAudit.recheckPartial', data.errors.length));
+      } else {
+        toast(t('usageAudit.recheckDone', data.rechecked || 0), 'success');
+      }
+      await loadAccounts();
+    } finally {
+      if (btn) { btn.disabled = false; btn.textContent = t('usageAudit.recheckAll'); }
+    }
+  }
+
   function getFilteredAccounts() {
 
     return accountsData.filter(a => {
@@ -1160,6 +1193,82 @@
       (log.reason ? '<span>' + escapeHtml(log.reason) + '</span>' : '') +
       '</div>'
     ).join('') + '</div>';
+  }
+
+  function usageConfidenceMeta(conf) {
+    switch (conf) {
+      case 'clean': return { cls: 'usage-badge--clean', label: t('usageAudit.confidence.clean') };
+      case 'external': return { cls: 'usage-badge--external', label: t('usageAudit.confidence.external') };
+      case 'strong_external': return { cls: 'usage-badge--strong', label: t('usageAudit.confidence.strongExternal') };
+      default: return { cls: 'usage-badge--unknown', label: t('usageAudit.confidence.unknown') };
+    }
+  }
+
+  function renderUsageAudit(data) {
+    const summaryBox = $('usageAuditSummary');
+    const box = $('usageAuditBody');
+    if (!box) return;
+    const summary = (data && data.summary) || {};
+    const items = (data && data.items) || [];
+    if (summaryBox) {
+      summaryBox.innerHTML =
+        '<span>' + escapeHtml(t('usageAudit.total')) + ': <strong>' + escapeHtml(String(summary.total || 0)) + '</strong></span>' +
+        '<span class="usage-badge usage-badge--clean">' + escapeHtml(t('usageAudit.confidence.clean')) + ': <strong>' + escapeHtml(String(summary.clean || 0)) + '</strong></span>' +
+        '<span class="usage-badge usage-badge--external">' + escapeHtml(t('usageAudit.confidence.external')) + ': <strong>' + escapeHtml(String(summary.external || 0)) + '</strong></span>' +
+        '<span class="usage-badge usage-badge--strong">' + escapeHtml(t('usageAudit.confidence.strongExternal')) + ': <strong>' + escapeHtml(String(summary.strongExternal || 0)) + '</strong></span>' +
+        '<span class="usage-badge usage-badge--unknown">' + escapeHtml(t('usageAudit.confidence.unknown')) + ': <strong>' + escapeHtml(String(summary.unknown || 0)) + '</strong></span>' +
+        '<span>' + escapeHtml(t('usageAudit.fleetExternal')) + ': <strong>' + escapeHtml(formatCredits(summary.fleetExternalCredits)) + '</strong></span>';
+    }
+    if (!items.length) {
+      box.innerHTML = '<div class="empty-state">' + escapeHtml(t('usageAudit.empty')) + '</div>';
+      return;
+    }
+    box.innerHTML = '<div class="diag-list">' + items.map(item => {
+      const meta = usageConfidenceMeta(item.confidence);
+      const our = Math.max(0, Number(item.ourPeriodCredits) || 0);
+      const ext = Math.max(0, Number(item.externalCredits) || 0);
+      const totalBar = our + ext;
+      const ourPct = totalBar > 0 ? (our / totalBar) * 100 : 0;
+      const extPct = totalBar > 0 ? (ext / totalBar) * 100 : 0;
+      const chipCls = (item.confidence === 'external' || item.confidence === 'strong_external') ? 'diag-chip--warn' : 'diag-chip--ok';
+      const disabledFlag = (!item.enabled && (item.confidence === 'external' || item.confidence === 'strong_external'))
+        ? '<span class="usage-flag">' + escapeHtml(t('usageAudit.disabledButGrowing')) + '</span>' : '';
+      const bar = totalBar > 0
+        ? '<div class="usage-bar" title="' + escapeAttr(t('usageAudit.ours') + ' ' + formatCredits(our) + ' / ' + t('usageAudit.external') + ' ' + formatCredits(ext)) + '">' +
+            '<span class="usage-bar-ours" style="width:' + ourPct.toFixed(1) + '%"></span>' +
+            '<span class="usage-bar-external" style="width:' + extPct.toFixed(1) + '%"></span>' +
+          '</div>'
+        : '';
+      return '<div class="diag-chip ' + chipCls + '">' +
+        '<div class="usage-row-head">' +
+          '<strong>' + escapeHtml(accountLabel(item.accountId, item.email)) + '</strong>' +
+          '<span class="usage-badge ' + meta.cls + '">' + escapeHtml(meta.label) + '</span>' +
+          disabledFlag +
+        '</div>' +
+        bar +
+        '<span>' + escapeHtml(t('usageAudit.external')) + ': <strong>' + escapeHtml(formatCredits(item.externalCredits)) + '</strong> ' + escapeHtml(t('usageAudit.creditsUnit')) + '</span>' +
+        '<span>' + escapeHtml(t('usageAudit.ours')) + ': ' + escapeHtml(formatCredits(item.ourPeriodCredits)) + ' ' + escapeHtml(t('usageAudit.creditsUnit')) +
+          ' · ' + escapeHtml(t('usageAudit.ourTokens')) + ': ' + escapeHtml(formatNumber(item.ourTokensTotal)) + '</span>' +
+        '<span>' + escapeHtml(t('usageAudit.upstream')) + ': ' + escapeHtml(formatCredits(item.upstreamCurrent)) +
+          (item.upstreamLimit > 0 ? ' / ' + escapeHtml(formatCredits(item.upstreamLimit)) : '') + ' ' + escapeHtml(t('usageAudit.creditsUnit')) + '</span>' +
+        (item.hasUpstream
+          ? '<span class="usage-drill">' + escapeHtml(t('usageAudit.periodStart')) + ': ' + escapeHtml(formatCredits(item.periodStart)) +
+            ' · ' + escapeHtml(t('usageAudit.nextReset')) + ': ' + escapeHtml(item.nextResetDate || '-') +
+            ' · ' + escapeHtml(t('usageAudit.checkedAt')) + ': ' + escapeHtml(item.externalCheckedAt ? formatDateTime(item.externalCheckedAt) : '-') + '</span>'
+          : '<span class="usage-drill">' + escapeHtml(t('usageAudit.noUpstream')) + '</span>') +
+        '<button class="btn btn-secondary btn-sm" data-action="usageRecheck" data-id="' + escapeAttr(item.accountId || '') + '">' + escapeHtml(t('usageAudit.recheckOne')) + '</button>' +
+        '</div>';
+    }).join('') + '</div>';
+  }
+
+  function formatCredits(v) {
+    const n = Number(v) || 0;
+    return n.toFixed(2);
+  }
+
+  function formatNumber(v) {
+    const n = Number(v) || 0;
+    return n.toLocaleString();
   }
 
   async function runExternalIdpLiveCheck(accountId) {
@@ -3262,6 +3371,7 @@
     if (panelId === 'accountDiagnosticsCard') loadAccountDiagnostics();
     if (panelId === 'externalIdpDiagnosticsCard') loadExternalIdpDiagnostics();
     if (panelId === 'auditLogsCard') loadAuditLogs();
+    if (panelId === 'usageAuditCard') loadUsageAudit();
     const panel = $(panelId);
     if (panel) panel.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
   }
@@ -3727,6 +3837,15 @@
     });
     const refreshAuditLogsBtn = $('refreshAuditLogsBtn');
     if (refreshAuditLogsBtn) refreshAuditLogsBtn.addEventListener('click', loadAuditLogs);
+    const refreshUsageAuditBtn = $('refreshUsageAuditBtn');
+    if (refreshUsageAuditBtn) refreshUsageAuditBtn.addEventListener('click', loadUsageAudit);
+    const recheckUsageAuditBtn = $('recheckUsageAuditBtn');
+    if (recheckUsageAuditBtn) recheckUsageAuditBtn.addEventListener('click', () => recheckUsageAudit());
+    const usageAuditBody = $('usageAuditBody');
+    if (usageAuditBody) usageAuditBody.addEventListener('click', e => {
+      const btn = e.target.closest('button[data-action="usageRecheck"]');
+      if (btn) recheckUsageAudit(btn.dataset.id);
+    });
     const checkRoutingBtn = $('checkModelRoutingBtn');
     if (checkRoutingBtn) checkRoutingBtn.addEventListener('click', checkModelRouting);
     const routingInput = $('routingModelInput');

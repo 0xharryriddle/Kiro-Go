@@ -350,9 +350,65 @@ func (h *Handler) refreshAllAccounts() {
 		}
 
 		config.UpdateAccountInfo(account.ID, *info)
+		h.recomputeExternalUsage(account.ID, info, true)
 		logger.Infof("[BackgroundRefresh] Refreshed %s: %s %.1f/%.1f", account.Email, info.SubscriptionType, info.UsageCurrent, info.UsageLimit)
 	}
 	h.pool.Reload()
+}
+
+// recomputeExternalUsage recomputes and persists an account's external-usage
+// verdict from the freshly-observed upstream usage. When the verdict transitions
+// into (strong-)external for the first time this period, it emits an audit event.
+// hasUpstream=false forces an UNKNOWN verdict (no live data to compare against).
+func (h *Handler) recomputeExternalUsage(accountID string, info *config.AccountInfo, hasUpstream bool) config.ExternalUsageState {
+	prev, ok := config.GetExternalUsageState(accountID)
+	if !ok {
+		return config.ExternalUsageState{Confidence: config.ExternalConfidenceUnknown}
+	}
+	acc, accOk := config.GetAccountByID(accountID)
+	enabled := accOk && acc.Enabled
+
+	in := config.ExternalUsageInput{HasUpstream: hasUpstream, EnabledLocally: enabled}
+	if hasUpstream && info != nil {
+		// Only treat upstream as usable when we actually have a period key and a
+		// usage limit signal; a zero/blank read is "no data", not "zero usage".
+		in.PeriodKey = strings.TrimSpace(info.NextResetDate)
+		in.UpstreamCurrent = info.UsageCurrent
+		if in.PeriodKey == "" && info.UsageLimit <= 0 {
+			in.HasUpstream = false
+		}
+	} else {
+		in.HasUpstream = false
+	}
+
+	next := config.ComputeExternalUsage(prev, in, time.Now().Unix())
+	if err := config.SetExternalUsageState(accountID, next); err != nil {
+		logger.Warnf("[ExternalUsage] persist failed for %s: %v", accountID, err)
+	}
+
+	// Emit an audit event only on a fresh transition into external territory, so
+	// operators are alerted once per crossing rather than every refresh cycle.
+	wasExternal := prev.Confidence == config.ExternalConfidenceExternal || prev.Confidence == config.ExternalConfidenceStrongExternal
+	isExternal := next.Confidence == config.ExternalConfidenceExternal || next.Confidence == config.ExternalConfidenceStrongExternal
+	if isExternal && !wasExternal {
+		email := ""
+		if accOk {
+			email = acc.Email
+		}
+		h.appendAuditLog(AuditLog{
+			Category:     "security",
+			Action:       "external_usage_detected",
+			Status:       "warning",
+			AccountID:    accountID,
+			AccountEmail: email,
+			Reason:       next.Confidence,
+			SafeDetails: map[string]string{
+				"externalCredits": strconv.FormatFloat(next.Estimate, 'f', 2, 64),
+				"periodKey":       next.PeriodKey,
+			},
+		})
+	}
+	return next
 }
 
 // validateApiKey 验证 API Key（Bool 包装，旧签名仍被部分调用方使用）
@@ -2428,6 +2484,10 @@ func (h *Handler) handleAdminAPI(w http.ResponseWriter, r *http.Request) {
 		h.apiGetExternalIDPDiagnostics(w, r)
 	case path == "/accounts/external-idp-diagnostics/live" && r.Method == "POST":
 		h.apiRunExternalIDPLiveDiagnostics(w, r)
+	case path == "/accounts/usage-audit" && r.Method == "GET":
+		h.apiGetUsageAudit(w, r)
+	case path == "/accounts/usage-audit/recheck" && r.Method == "POST":
+		h.apiRecheckUsageAudit(w, r)
 	// models/refresh 必须在通用 /refresh 前匹配，否则会被误拦截
 	case path == "/accounts/models/refresh" && r.Method == "POST":
 		h.apiRefreshAllAccountsModels(w, r)

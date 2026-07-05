@@ -117,6 +117,25 @@ type Account struct {
 	LastUsed     int64   `json:"lastUsed,omitempty"`     // Last request timestamp
 	TotalTokens  int     `json:"totalTokens,omitempty"`  // Cumulative tokens processed
 	TotalCredits float64 `json:"totalCredits,omitempty"` // Cumulative credits consumed
+
+	// External-usage audit (period-scoped). Detects whether a credential is being
+	// used outside this proxy (e.g. the real Kiro IDE or another sharer) by comparing
+	// upstream period usage growth against the credits WE metered in the same period.
+	//
+	// Both upstream CurrentUsage and our metered credits use the same AWS metering
+	// unit (agentic-request credits), so a positive gap that we did not drive is
+	// third-party ("external") consumption. There is no upstream TOKEN figure for
+	// traffic we didn't originate, so this audit is expressed in credits only.
+	//
+	// PeriodKey tracks the billing period we are accumulating against (mirrors
+	// NextResetDate). When it changes, the period baseline is rolled over so usage
+	// from a prior period is never miscounted as external.
+	ExternalPeriodKey       string  `json:"externalPeriodKey,omitempty"`       // Billing period being tracked (NextResetDate)
+	ExternalPeriodStart     float64 `json:"externalPeriodStart,omitempty"`     // Upstream CurrentUsage captured at period start
+	ExternalPeriodOurCredit float64 `json:"externalPeriodOurCredit,omitempty"` // Credits WE metered within this period
+	ExternalCreditsEstimate float64 `json:"externalCreditsEstimate,omitempty"` // Last computed external credits (clamped >=0)
+	ExternalConfidence      string  `json:"externalConfidence,omitempty"`      // "clean" | "external" | "strong_external" | "unknown"
+	ExternalCheckedAt       int64   `json:"externalCheckedAt,omitempty"`       // Last time the estimate was recomputed (Unix seconds)
 }
 
 // PromptFilterRule defines a single custom prompt sanitization rule.
@@ -670,6 +689,19 @@ func AccountIDExists(id string) bool {
 	return false
 }
 
+// GetAccountByID returns a copy of the account with the given ID and whether it
+// was found.
+func GetAccountByID(id string) (Account, bool) {
+	cfgLock.RLock()
+	defer cfgLock.RUnlock()
+	for _, a := range cfg.Accounts {
+		if a.ID == id {
+			return a, true
+		}
+	}
+	return Account{}, false
+}
+
 func GetEnabledAccounts() []Account {
 	cfgLock.RLock()
 	defer cfgLock.RUnlock()
@@ -880,6 +912,63 @@ func UpdateAccountStats(id string, requestCount, errorCount, totalTokens int, to
 			cfg.Accounts[i].TotalTokens = totalTokens
 			cfg.Accounts[i].TotalCredits = totalCredits
 			cfg.Accounts[i].LastUsed = lastUsed
+			return Save()
+		}
+	}
+	return nil
+}
+
+// AddExternalPeriodOurCredit accumulates the credits WE metered for a request into
+// the account's current external-usage billing period. This is the local half of
+// the external-usage audit: ComputeExternalUsage later subtracts this from upstream
+// period growth to estimate third-party consumption. Deltas are added signed so
+// metering lag averages out; callers pass the per-request metered credits.
+func AddExternalPeriodOurCredit(id string, credits float64) error {
+	if credits == 0 {
+		return nil
+	}
+	cfgLock.Lock()
+	defer cfgLock.Unlock()
+	for i, a := range cfg.Accounts {
+		if a.ID == id {
+			cfg.Accounts[i].ExternalPeriodOurCredit += credits
+			return Save()
+		}
+	}
+	return nil
+}
+
+// GetExternalUsageState reads the current external-usage accumulator for an account.
+func GetExternalUsageState(id string) (ExternalUsageState, bool) {
+	cfgLock.RLock()
+	defer cfgLock.RUnlock()
+	for _, a := range cfg.Accounts {
+		if a.ID == id {
+			return ExternalUsageState{
+				PeriodKey:       a.ExternalPeriodKey,
+				PeriodStart:     a.ExternalPeriodStart,
+				PeriodOurCredit: a.ExternalPeriodOurCredit,
+				Estimate:        a.ExternalCreditsEstimate,
+				Confidence:      a.ExternalConfidence,
+				CheckedAt:       a.ExternalCheckedAt,
+			}, true
+		}
+	}
+	return ExternalUsageState{}, false
+}
+
+// SetExternalUsageState persists a recomputed external-usage verdict for an account.
+func SetExternalUsageState(id string, st ExternalUsageState) error {
+	cfgLock.Lock()
+	defer cfgLock.Unlock()
+	for i, a := range cfg.Accounts {
+		if a.ID == id {
+			cfg.Accounts[i].ExternalPeriodKey = st.PeriodKey
+			cfg.Accounts[i].ExternalPeriodStart = st.PeriodStart
+			cfg.Accounts[i].ExternalPeriodOurCredit = st.PeriodOurCredit
+			cfg.Accounts[i].ExternalCreditsEstimate = st.Estimate
+			cfg.Accounts[i].ExternalConfidence = st.Confidence
+			cfg.Accounts[i].ExternalCheckedAt = st.CheckedAt
 			return Save()
 		}
 	}

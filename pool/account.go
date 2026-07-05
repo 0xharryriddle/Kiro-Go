@@ -442,6 +442,12 @@ func (p *AccountPool) UpdateStats(id string, tokens int, credits float64) {
 	}
 	if updated {
 		go config.UpdateAccountStats(id, requestCount, errorCount, totalTokens, totalCredits, lastUsed)
+		// Accumulate the credits WE metered into the current external-usage billing
+		// period. This is the local half of the external-usage audit; the upstream
+		// half is captured on backgroundRefresh and compared in ComputeExternalUsage.
+		if credits > 0 {
+			go config.AddExternalPeriodOurCredit(id, credits)
+		}
 	}
 }
 

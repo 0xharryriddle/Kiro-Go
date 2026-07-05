@@ -51,9 +51,73 @@ The Tools tab includes External IdP Diagnostics:
 - Static checks report missing refresh material, rejected endpoints, refresh windows, missing profile ARN, and local routing state.
 - Live refresh check is explicit and refreshes one selected external IdP account.
 
+## Account Usage Audit (External-Usage Detection)
+
+The Tools tab includes an Account Usage Audit panel that estimates whether each
+credential is being used **outside this proxy** — for example by the real Kiro
+IDE, a second proxy, or another person the credential was shared with.
+
+### How it works
+
+Two independent usage numbers exist per account:
+
+- **Upstream authoritative usage** — `getUsageLimits` (AWS Q) reports the credits
+  the credential burned this billing period from *any* client. Refreshed every 30
+  minutes and on an explicit recheck.
+- **Our usage** — the credits Kiro-Go itself metered (from the `meteringEvent`
+  stream) for requests it proxied, accumulated per billing period.
+
+Both use the **same AWS metering unit (agentic-request credits)**, so:
+
+```
+externalCredits = (upstreamCurrent - periodStart) - ourPeriodCredits   (clamped >= 0)
+```
+
+The signed delta is accumulated across the period and clamped to zero only at
+display, so metering lag (a credit we posted before upstream accounted for it)
+averages out instead of biasing the estimate upward.
+
+### Units — important
+
+This audit is expressed in **credits only**. Upstream exposes **no token count**
+for traffic Kiro-Go did not originate, so there is deliberately no "external
+tokens" figure — it would be fabricated. The only honest token number is
+*our tokens*, which covers only requests this proxy served.
+
+### Confidence tiers
+
+| Tier | Meaning |
+|---|---|
+| `clean` | External usage within tolerance — only this proxy uses the credential |
+| `external` | External usage materially positive — credential used elsewhere too |
+| `strong_external` | Account disabled for local routing yet upstream grew — unambiguous third-party use |
+| `unknown` | No upstream data yet, a mid-period import with no baseline, or a just-reset period |
+
+Tolerance is the greater of a small absolute floor (1 credit) or 5% of in-period
+upstream growth, to avoid flapping on metering noise.
+
+### Period rollover
+
+When the billing period changes (`nextResetDate` differs) or upstream usage drops
+below the recorded baseline (a reset we missed), the baseline is re-captured, the
+in-period accumulator is zeroed, and the verdict is `unknown` for that one cycle.
+Usage from a prior period is never miscounted as external, and a verdict is never
+emitted from an incomplete baseline. A freshly imported account therefore shows
+`unknown` until the next reset — honest by design.
+
+### Recheck
+
+`GET /admin/api/accounts/usage-audit` returns the cached fleet verdict and makes
+no upstream calls. `POST /admin/api/accounts/usage-audit/recheck` (optionally with
+`{"accountId":"..."}`) forces a live upstream fetch and recompute. A first
+transition into `external`/`strong_external` emits a `security` /
+`external_usage_detected` audit event.
+
 ## Audit Logs
 
-Audit logs record safe operational events for previews, imports, replacements, and live diagnostics. They do not store refresh tokens, access tokens, client secrets, or raw pasted JSON.
+Audit logs record safe operational events for previews, imports, replacements,
+live diagnostics, and external-usage detection. They do not store refresh tokens,
+access tokens, client secrets, or raw pasted JSON.
 
 ## Troubleshooting
 
