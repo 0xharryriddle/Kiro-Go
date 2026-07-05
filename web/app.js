@@ -2403,6 +2403,8 @@
     $('apiKeyForm_enabled').checked = entry ? !!entry.enabled : true;
     $('apiKeyForm_tokenLimit').value = entry ? String(entry.tokenLimit || 0) : '0';
     $('apiKeyForm_creditLimit').value = entry ? String(entry.creditLimit || 0) : '0';
+    if ($('apiKeyForm_rpmLimit')) $('apiKeyForm_rpmLimit').value = entry ? String(entry.rpmLimit || 0) : '0';
+    if ($('apiKeyForm_tpmLimit')) $('apiKeyForm_tpmLimit').value = entry ? String(entry.tpmLimit || 0) : '0';
     apiKeyModalSubmitting = false;
     $('apiKeyModalSaveBtn').disabled = false;
     openDialog('apiKeyModal');
@@ -2425,11 +2427,15 @@
       const enabled = $('apiKeyForm_enabled').checked;
       const tokenLimit = parseInt($('apiKeyForm_tokenLimit').value, 10);
       const creditLimit = parseFloat($('apiKeyForm_creditLimit').value);
+      const rpmLimit = $('apiKeyForm_rpmLimit') ? parseInt($('apiKeyForm_rpmLimit').value, 10) : 0;
+      const tpmLimit = $('apiKeyForm_tpmLimit') ? parseInt($('apiKeyForm_tpmLimit').value, 10) : 0;
       const payload = {
         name: name,
         enabled: enabled,
         tokenLimit: isNaN(tokenLimit) || tokenLimit < 0 ? 0 : tokenLimit,
-        creditLimit: isNaN(creditLimit) || creditLimit < 0 ? 0 : creditLimit
+        creditLimit: isNaN(creditLimit) || creditLimit < 0 ? 0 : creditLimit,
+        rpmLimit: isNaN(rpmLimit) || rpmLimit < 0 ? 0 : rpmLimit,
+        tpmLimit: isNaN(tpmLimit) || tpmLimit < 0 ? 0 : tpmLimit
       };
       let res, d;
       if (apiKeyEditingId) {

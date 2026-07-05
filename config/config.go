@@ -167,6 +167,14 @@ type ApiKeyEntry struct {
 	TokenLimit  int64   `json:"tokenLimit,omitempty"`
 	CreditLimit float64 `json:"creditLimit,omitempty"`
 
+	// Windowed rate limits (0 = unlimited). Unlike the cumulative TokenLimit/
+	// CreditLimit above (which never reset), these are sliding-window rates
+	// enforced in-process: RpmLimit caps requests per 60s, TpmLimit caps tokens
+	// per 60s. Exceeding either yields HTTP 429 with a Retry-After header. The
+	// window counters are in-memory only (single-instance assumption).
+	RpmLimit int64 `json:"rpmLimit,omitempty"` // max requests per 60s window
+	TpmLimit int64 `json:"tpmLimit,omitempty"` // max tokens per 60s window
+
 	// Cumulative usage (never auto-reset)
 	TokensUsed    int64   `json:"tokensUsed,omitempty"`
 	CreditsUsed   float64 `json:"creditsUsed,omitempty"`

@@ -5,6 +5,7 @@ import (
 	"kiro-go/config"
 	"net/http"
 	"strings"
+	"time"
 )
 
 // apiKeyContextKey is an unexported type used as the context key for the matched ApiKeyEntry
@@ -12,16 +13,27 @@ import (
 type apiKeyContextKey struct{}
 
 // authError describes why authentication failed. status is the HTTP status code to send.
+// retryAfter (seconds, > 0) is set for rate-limit errors so callers can emit a
+// Retry-After header.
 type authError struct {
-	status  int
-	code    string
-	message string
+	status     int
+	code       string
+	message    string
+	retryAfter int64
 }
 
 func (e *authError) Error() string { return e.message }
 
 func newAuthError(status int, code, message string) *authError {
 	return &authError{status: status, code: code, message: message}
+}
+
+// newRateLimitError builds a 429 authError carrying a Retry-After hint (seconds).
+func newRateLimitError(retryAfter int64, message string) *authError {
+	if retryAfter < 1 {
+		retryAfter = 1
+	}
+	return &authError{status: http.StatusTooManyRequests, code: "rate_limit_error", message: message, retryAfter: retryAfter}
 }
 
 // extractProvidedKey reads the API key from Authorization (Bearer ...) or X-Api-Key header.
@@ -75,6 +87,20 @@ func (h *Handler) authenticate(r *http.Request) (*config.ApiKeyEntry, error) {
 				return nil, newAuthError(http.StatusTooManyRequests, "rate_limit_error", "token limit exceeded")
 			}
 			return nil, newAuthError(http.StatusTooManyRequests, "rate_limit_error", "credit limit exceeded")
+		}
+		// F6: windowed RPM/TPM rate limit (in-process, best-effort TPM). RPM is
+		// enforced at admission; TPM rejects only when the window is already over
+		// (actual tokens are folded back post-response via RecordTokens). No-op
+		// when both limits are 0 or the limiter is absent (e.g. in unit tests).
+		if h.rateLimiter != nil && (entry.RpmLimit > 0 || entry.TpmLimit > 0) {
+			dec := h.rateLimiter.Admit(entry.ID, entry.RpmLimit, entry.TpmLimit, 0, time.Now().Unix())
+			if !dec.Allowed {
+				msg := "request rate limit exceeded (rpm)"
+				if dec.Reason == "tpm" {
+					msg = "token rate limit exceeded (tpm)"
+				}
+				return nil, newRateLimitError(dec.RetryAfter, msg)
+			}
 		}
 		return entry, nil
 	}

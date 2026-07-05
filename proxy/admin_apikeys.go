@@ -18,6 +18,8 @@ type apiKeyView struct {
 	LastUsedAt    int64   `json:"lastUsedAt,omitempty"`
 	TokenLimit    int64   `json:"tokenLimit,omitempty"`
 	CreditLimit   float64 `json:"creditLimit,omitempty"`
+	RpmLimit      int64   `json:"rpmLimit,omitempty"`
+	TpmLimit      int64   `json:"tpmLimit,omitempty"`
 	TokensUsed    int64   `json:"tokensUsed"`
 	CreditsUsed   float64 `json:"creditsUsed"`
 	RequestsCount int64   `json:"requestsCount"`
@@ -34,6 +36,8 @@ func toApiKeyView(e config.ApiKeyEntry) apiKeyView {
 		LastUsedAt:    e.LastUsedAt,
 		TokenLimit:    e.TokenLimit,
 		CreditLimit:   e.CreditLimit,
+		RpmLimit:      e.RpmLimit,
+		TpmLimit:      e.TpmLimit,
 		TokensUsed:    e.TokensUsed,
 		CreditsUsed:   e.CreditsUsed,
 		RequestsCount: e.RequestsCount,
@@ -65,6 +69,8 @@ type apiKeyCreateRequest struct {
 	Enabled     *bool   `json:"enabled,omitempty"`
 	TokenLimit  int64   `json:"tokenLimit,omitempty"`
 	CreditLimit float64 `json:"creditLimit,omitempty"`
+	RpmLimit    int64   `json:"rpmLimit,omitempty"`
+	TpmLimit    int64   `json:"tpmLimit,omitempty"`
 }
 
 func (h *Handler) apiCreateApiKey(w http.ResponseWriter, r *http.Request) {
@@ -91,6 +97,8 @@ func (h *Handler) apiCreateApiKey(w http.ResponseWriter, r *http.Request) {
 		Enabled:     enabled,
 		TokenLimit:  req.TokenLimit,
 		CreditLimit: req.CreditLimit,
+		RpmLimit:    req.RpmLimit,
+		TpmLimit:    req.TpmLimit,
 	})
 	if err != nil {
 		w.WriteHeader(http.StatusBadRequest)
@@ -113,6 +121,8 @@ type apiKeyUpdateRequest struct {
 	Enabled     *bool    `json:"enabled,omitempty"`
 	TokenLimit  *int64   `json:"tokenLimit,omitempty"`
 	CreditLimit *float64 `json:"creditLimit,omitempty"`
+	RpmLimit    *int64   `json:"rpmLimit,omitempty"`
+	TpmLimit    *int64   `json:"tpmLimit,omitempty"`
 }
 
 func (h *Handler) apiUpdateApiKey(w http.ResponseWriter, r *http.Request, id string) {
@@ -145,6 +155,12 @@ func (h *Handler) apiUpdateApiKey(w http.ResponseWriter, r *http.Request, id str
 	}
 	if req.CreditLimit != nil {
 		patch.CreditLimit = *req.CreditLimit
+	}
+	if req.RpmLimit != nil {
+		patch.RpmLimit = *req.RpmLimit
+	}
+	if req.TpmLimit != nil {
+		patch.TpmLimit = *req.TpmLimit
 	}
 
 	if err := config.UpdateApiKey(id, patch); err != nil {

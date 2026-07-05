@@ -820,6 +820,16 @@
           <input type="number" id="apiKeyForm_creditLimit" min="0" step="0.01" value="0" />
           <small data-i18n="apiKeys.limitHint"></small>
         </div>
+        <div class="form-group">
+          <label data-i18n="apiKeys.limitRpm"></label>
+          <input type="number" id="apiKeyForm_rpmLimit" min="0" step="1" value="0" />
+          <small data-i18n="apiKeys.rateLimitHint"></small>
+        </div>
+        <div class="form-group">
+          <label data-i18n="apiKeys.limitTpm"></label>
+          <input type="number" id="apiKeyForm_tpmLimit" min="0" step="1" value="0" />
+          <small data-i18n="apiKeys.rateLimitHint"></small>
+        </div>
         <div class="modal-footer">
           <button class="btn btn-secondary" id="apiKeyModalCancelBtn" type="button" data-i18n="apiKeys.cancelBtn"></button>
           <button class="btn btn-primary" id="apiKeyModalSaveBtn" type="button" data-i18n="apiKeys.saveBtn"></button>

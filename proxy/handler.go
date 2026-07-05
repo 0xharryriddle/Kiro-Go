@@ -88,6 +88,8 @@ type Handler struct {
 	requestLogsMu sync.RWMutex
 	auditLogs     []AuditLog
 	auditLogsMu   sync.RWMutex
+	// F6: per-API-key sliding-window RPM/TPM limiter (in-process).
+	rateLimiter *rateLimiter
 }
 
 type thinkingStreamSource int
@@ -275,6 +277,7 @@ func NewHandler() *Handler {
 		stopRefresh:     make(chan struct{}),
 		stopStatsSaver:  make(chan struct{}),
 		promptCache:     newPromptCacheTracker(defaultPromptCacheTTL),
+		rateLimiter:     newRateLimiter(),
 	}
 	h.loadRequestLogs()
 	h.loadAuditLogs()
@@ -455,6 +458,9 @@ func (h *Handler) authenticateForClaude(w http.ResponseWriter, r *http.Request) 
 		if ae == nil {
 			ae = newAuthError(http.StatusUnauthorized, "authentication_error", err.Error())
 		}
+		if ae.retryAfter > 0 {
+			w.Header().Set("Retry-After", strconv.FormatInt(ae.retryAfter, 10))
+		}
 		h.sendClaudeError(w, ae.status, ae.code, ae.message)
 		return nil
 	}
@@ -468,6 +474,9 @@ func (h *Handler) authenticateForOpenAI(w http.ResponseWriter, r *http.Request) 
 		ae, _ := err.(*authError)
 		if ae == nil {
 			ae = newAuthError(http.StatusUnauthorized, "authentication_error", err.Error())
+		}
+		if ae.retryAfter > 0 {
+			w.Header().Set("Retry-After", strconv.FormatInt(ae.retryAfter, 10))
 		}
 		h.sendOpenAIError(w, ae.status, ae.code, ae.message)
 		return nil
@@ -1564,6 +1573,11 @@ func (h *Handler) recordSuccessForApiKey(apiKeyID string, inputTokens, outputTok
 	}
 	if err := config.RecordApiKeyUsage(apiKeyID, int64(inputTokens+outputTokens), credits); err != nil {
 		logger.Warnf("[ApiKey] failed to record usage for key %s: %v", apiKeyID, err)
+	}
+	// F6: fold actual tokens into the key's rate window (best-effort TPM), so the
+	// next request's TPM check reflects real consumption.
+	if h.rateLimiter != nil {
+		h.rateLimiter.RecordTokens(apiKeyID, int64(inputTokens+outputTokens), time.Now().Unix())
 	}
 }
 

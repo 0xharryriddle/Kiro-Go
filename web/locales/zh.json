@@ -660,5 +660,8 @@
   "matrix.accountsWithCache": "有缓存的账号",
   "matrix.capable": "可用账号",
   "matrix.optimistic": "尚无账号缓存模型列表——路由为乐观模式（任意账号可服务任意模型）。刷新账号模型以填充矩阵。",
-  "matrix.empty": "暂无缓存的模型。"
+  "matrix.empty": "暂无缓存的模型。",
+  "apiKeys.limitRpm": "每分钟请求数 (RPM)",
+  "apiKeys.limitTpm": "每分钟令牌数 (TPM)",
+  "apiKeys.rateLimitHint": "60 秒滑动窗口速率限制。0 = 不限。超出返回 HTTP 429 并带 Retry-After。"
 }

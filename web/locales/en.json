@@ -660,5 +660,8 @@
   "matrix.accountsWithCache": "Accounts with cache",
   "matrix.capable": "Capable",
   "matrix.optimistic": "No account has a cached model list yet — routing is optimistic (any account may serve any model). Refresh account models to populate the matrix.",
-  "matrix.empty": "No models cached."
+  "matrix.empty": "No models cached.",
+  "apiKeys.limitRpm": "Requests / min (RPM)",
+  "apiKeys.limitTpm": "Tokens / min (TPM)",
+  "apiKeys.rateLimitHint": "Windowed rate limit over 60s. 0 = unlimited. Exceeding returns HTTP 429 with Retry-After."
 }
