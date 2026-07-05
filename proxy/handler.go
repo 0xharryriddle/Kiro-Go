@@ -4190,11 +4190,12 @@ func (h *Handler) apiGetStatus(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) apiGetSettings(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]interface{}{
-		"apiKey":         config.GetApiKey(),
-		"requireApiKey":  config.IsApiKeyRequired(),
-		"port":           config.GetPort(),
-		"host":           config.GetHost(),
-		"allowOverUsage": config.GetAllowOverUsage(),
+		"apiKey":            config.GetApiKey(),
+		"requireApiKey":     config.IsApiKeyRequired(),
+		"port":              config.GetPort(),
+		"host":              config.GetHost(),
+		"allowOverUsage":    config.GetAllowOverUsage(),
+		"quotaAwareRouting": config.GetQuotaAwareRouting(),
 	})
 }
 
@@ -4281,10 +4282,11 @@ func (h *Handler) apiGetSecurityStatus(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) apiUpdateSettings(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		ApiKey         *string `json:"apiKey,omitempty"`
-		RequireApiKey  *bool   `json:"requireApiKey,omitempty"`
-		Password       string  `json:"password,omitempty"`
-		AllowOverUsage *bool   `json:"allowOverUsage,omitempty"`
+		ApiKey            *string `json:"apiKey,omitempty"`
+		RequireApiKey     *bool   `json:"requireApiKey,omitempty"`
+		Password          string  `json:"password,omitempty"`
+		AllowOverUsage    *bool   `json:"allowOverUsage,omitempty"`
+		QuotaAwareRouting *bool   `json:"quotaAwareRouting,omitempty"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		w.WriteHeader(400)
@@ -4307,6 +4309,16 @@ func (h *Handler) apiUpdateSettings(w http.ResponseWriter, r *http.Request) {
 		}
 		// Rebuild the pool so over-quota accounts are re-included or dropped immediately.
 		h.pool.Reload()
+	}
+
+	// Update quota-aware routing toggle. No pool rebuild needed — the picker
+	// reads the toggle live on each selection.
+	if req.QuotaAwareRouting != nil {
+		if err := config.UpdateQuotaAwareRouting(*req.QuotaAwareRouting); err != nil {
+			w.WriteHeader(500)
+			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
 	}
 
 	json.NewEncoder(w).Encode(map[string]bool{"success": true})

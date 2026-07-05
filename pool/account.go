@@ -111,6 +111,14 @@ func (p *AccountPool) GetNextExcluding(excluded map[string]bool) *config.Account
 	n := len(p.accounts)
 	seen := make(map[string]bool)
 
+	// Quota-aware routing: prefer the account with the most remaining quota.
+	// Falls back to round-robin below when no account has usable quota data.
+	if config.GetQuotaAwareRouting() {
+		if acc := p.pickQuotaAware("", excluded, now, allowOverUsage); acc != nil {
+			return acc
+		}
+	}
+
 	// 加权轮询查找可用账号
 	for i := 0; i < n; i++ {
 		idx := atomic.AddUint64(&p.currentIndex, 1) % uint64(n)
@@ -207,6 +215,14 @@ func (p *AccountPool) GetNextForModelExcluding(model string, excluded map[string
 	now := time.Now()
 	n := len(p.accounts)
 	seen := make(map[string]bool)
+
+	// Quota-aware routing: prefer the model-capable account with the most
+	// remaining quota. Falls back to round-robin below when none has usable data.
+	if config.GetQuotaAwareRouting() {
+		if acc := p.pickQuotaAware(model, excluded, now, allowOverUsage); acc != nil {
+			return acc
+		}
+	}
 
 	for i := 0; i < n; i++ {
 		idx := atomic.AddUint64(&p.currentIndex, 1) % uint64(n)
@@ -563,6 +579,71 @@ func (p *AccountPool) GetAllAccounts() []config.Account {
 
 func isOverUsageLimit(acc config.Account) bool {
 	return acc.UsageLimit > 0 && acc.UsageCurrent >= acc.UsageLimit
+}
+
+// remainingQuota returns the account's remaining period quota
+// (usageLimit - usageCurrent, clamped >= 0) and whether the account carries
+// usable quota data at all (usageLimit > 0). Accounts with no limit data return
+// (0, false) so quota-aware routing can fall back to round-robin for them.
+func remainingQuota(acc config.Account) (float64, bool) {
+	if acc.UsageLimit <= 0 {
+		return 0, false
+	}
+	rem := acc.UsageLimit - acc.UsageCurrent
+	if rem < 0 {
+		rem = 0
+	}
+	return rem, true
+}
+
+// eligibleForRoute reports whether an account can currently receive a request:
+// not excluded, not on cooldown, and not quota-blocked. The model filter is
+// applied separately by the caller. Caller must hold at least a read lock.
+func (p *AccountPool) eligibleForRoute(acc *config.Account, excluded map[string]bool, now time.Time, allowOverUsage bool) bool {
+	if excluded != nil && excluded[acc.ID] {
+		return false
+	}
+	if cooldown, ok := p.cooldowns[acc.ID]; ok && now.Before(cooldown) {
+		return false
+	}
+	if isQuotaBlocked(*acc, allowOverUsage) {
+		return false
+	}
+	return true
+}
+
+// pickQuotaAware returns the eligible account with the MOST remaining period
+// quota (usageLimit - usageCurrent). Pass model="" to skip the model filter.
+// It returns nil when no eligible account has usable quota data, so the caller
+// falls back to round-robin. Weighted duplicates are de-duplicated by ID; in
+// quota-aware mode selection is driven by remaining quota, not weight. Ties go
+// to the first candidate in list order (deterministic). Caller holds RLock.
+func (p *AccountPool) pickQuotaAware(model string, excluded map[string]bool, now time.Time, allowOverUsage bool) *config.Account {
+	var best *config.Account
+	var bestRem float64
+	seen := make(map[string]bool)
+	for i := range p.accounts {
+		acc := &p.accounts[i]
+		if seen[acc.ID] {
+			continue
+		}
+		seen[acc.ID] = true
+		if model != "" && !p.accountHasModel(acc.ID, model) {
+			continue
+		}
+		if !p.eligibleForRoute(acc, excluded, now, allowOverUsage) {
+			continue
+		}
+		rem, ok := remainingQuota(*acc)
+		if !ok {
+			continue
+		}
+		if best == nil || rem > bestRem {
+			best = acc
+			bestRem = rem
+		}
+	}
+	return best
 }
 
 // isQuotaBlocked reports whether an over-quota account should be skipped:

@@ -203,6 +203,12 @@ type Config struct {
 	// solely because usageCurrent >= usageLimit.
 	AllowOverUsage bool `json:"allowOverUsage,omitempty"`
 
+	// QuotaAwareRouting biases account selection toward the account with the most
+	// remaining period quota (usageLimit - usageCurrent) instead of blind
+	// round-robin. Defaults to false (round-robin). Falls back to round-robin when
+	// quota data is stale or absent. Fully reversible via this toggle.
+	QuotaAwareRouting bool `json:"quotaAwareRouting,omitempty"`
+
 	// Proxy configuration: optional outbound proxy for Kiro API requests
 	// Format: "socks5://host:port", "socks5://user:pass@host:port",
 	//         "http://host:port",  "http://user:pass@host:port"
@@ -1199,6 +1205,25 @@ func UpdateAllowOverUsage(allow bool) error {
 	cfgLock.Lock()
 	defer cfgLock.Unlock()
 	cfg.AllowOverUsage = allow
+	return Save()
+}
+
+// GetQuotaAwareRouting returns whether quota-aware routing is enabled. Defaults
+// to false (blind round-robin).
+func GetQuotaAwareRouting() bool {
+	cfgLock.RLock()
+	defer cfgLock.RUnlock()
+	if cfg == nil {
+		return false
+	}
+	return cfg.QuotaAwareRouting
+}
+
+// UpdateQuotaAwareRouting sets the quota-aware routing toggle and persists it.
+func UpdateQuotaAwareRouting(enabled bool) error {
+	cfgLock.Lock()
+	defer cfgLock.Unlock()
+	cfg.QuotaAwareRouting = enabled
 	return Save()
 }
 
