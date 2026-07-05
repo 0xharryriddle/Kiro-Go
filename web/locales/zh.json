@@ -663,5 +663,7 @@
   "matrix.empty": "暂无缓存的模型。",
   "apiKeys.limitRpm": "每分钟请求数 (RPM)",
   "apiKeys.limitTpm": "每分钟令牌数 (TPM)",
-  "apiKeys.rateLimitHint": "60 秒滑动窗口速率限制。0 = 不限。超出返回 HTTP 429 并带 Retry-After。"
+  "apiKeys.rateLimitHint": "60 秒滑动窗口速率限制。0 = 不限。超出返回 HTTP 429 并带 Retry-After。",
+  "settings.webhookURL": "事件 Webhook URL",
+  "settings.webhookURLHint": "可选。设置后，安全/警告事件（账号被封、检测到外部使用、自动禁用）将以 JSON POST 到该 URL（兼容 Slack/Discord）。仅发送安全字段，绝不包含令牌、密钥或提示内容。留空则禁用。"
 }

@@ -663,5 +663,7 @@
   "matrix.empty": "No models cached.",
   "apiKeys.limitRpm": "Requests / min (RPM)",
   "apiKeys.limitTpm": "Tokens / min (TPM)",
-  "apiKeys.rateLimitHint": "Windowed rate limit over 60s. 0 = unlimited. Exceeding returns HTTP 429 with Retry-After."
+  "apiKeys.rateLimitHint": "Windowed rate limit over 60s. 0 = unlimited. Exceeding returns HTTP 429 with Retry-After.",
+  "settings.webhookURL": "Event Webhook URL",
+  "settings.webhookURLHint": "Optional. When set, security/warning events (account banned, external usage detected, auto-disable) are POSTed to this URL (Slack/Discord-compatible). Only safe fields are sent — never tokens, secrets, or prompts. Leave empty to disable."
 }

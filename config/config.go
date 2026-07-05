@@ -227,6 +227,15 @@ type Config struct {
 	// tier, to avoid disabling on metering-lag noise.
 	ExternalUsageAutoDisable bool `json:"externalUsageAutoDisable,omitempty"`
 
+	// WebhookURL, when set, receives a JSON POST for selected security/warning
+	// audit events (account banned, external usage detected, auto-disable). This
+	// is the ONLY feature that makes outbound requests to a third-party endpoint,
+	// so it is opt-in: leave empty to disable (default). The payload carries only
+	// safe fields (category/action/status/account label/reason) — never refresh
+	// tokens, access tokens, client secrets, or raw prompt content, mirroring the
+	// audit-log redaction discipline. Slack/Discord-compatible JSON body.
+	WebhookURL string `json:"webhookURL,omitempty"`
+
 	// Proxy configuration: optional outbound proxy for Kiro API requests
 	// Format: "socks5://host:port", "socks5://user:pass@host:port",
 	//         "http://host:port",  "http://user:pass@host:port"
@@ -1264,6 +1273,24 @@ func UpdateExternalUsageAutoDisable(enabled bool) error {
 	cfgLock.Lock()
 	defer cfgLock.Unlock()
 	cfg.ExternalUsageAutoDisable = enabled
+	return Save()
+}
+
+// GetWebhookURL returns the configured event webhook URL, or "" when disabled.
+func GetWebhookURL() string {
+	cfgLock.RLock()
+	defer cfgLock.RUnlock()
+	if cfg == nil {
+		return ""
+	}
+	return cfg.WebhookURL
+}
+
+// UpdateWebhookURL sets the event webhook URL (empty disables) and persists it.
+func UpdateWebhookURL(url string) error {
+	cfgLock.Lock()
+	defer cfgLock.Unlock()
+	cfg.WebhookURL = url
 	return Save()
 }
 

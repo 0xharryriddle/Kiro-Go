@@ -1704,6 +1704,9 @@ func (h *Handler) appendAuditLog(entry AuditLog) {
 	snapshot := append([]AuditLog(nil), h.auditLogs...)
 	h.auditLogsMu.Unlock()
 	go persistAuditLogs(snapshot)
+	// F7: fan out security/warning events to the configured webhook (opt-in,
+	// safe fields only). No-op when no URL is set or the event is not webhookable.
+	go h.dispatchWebhook(entry)
 }
 
 func (h *Handler) loadAuditLogs() {
@@ -4246,6 +4249,7 @@ func (h *Handler) apiGetSettings(w http.ResponseWriter, r *http.Request) {
 		"allowOverUsage":           config.GetAllowOverUsage(),
 		"quotaAwareRouting":        config.GetQuotaAwareRouting(),
 		"externalUsageAutoDisable": config.GetExternalUsageAutoDisable(),
+		"webhookURL":               config.GetWebhookURL(),
 	})
 }
 
@@ -4338,6 +4342,7 @@ func (h *Handler) apiUpdateSettings(w http.ResponseWriter, r *http.Request) {
 		AllowOverUsage           *bool   `json:"allowOverUsage,omitempty"`
 		QuotaAwareRouting        *bool   `json:"quotaAwareRouting,omitempty"`
 		ExternalUsageAutoDisable *bool   `json:"externalUsageAutoDisable,omitempty"`
+		WebhookURL               *string `json:"webhookURL,omitempty"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		w.WriteHeader(400)
@@ -4377,6 +4382,22 @@ func (h *Handler) apiUpdateSettings(w http.ResponseWriter, r *http.Request) {
 	// explicit recheck).
 	if req.ExternalUsageAutoDisable != nil {
 		if err := config.UpdateExternalUsageAutoDisable(*req.ExternalUsageAutoDisable); err != nil {
+			w.WriteHeader(500)
+			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+	}
+
+	// F7: event webhook URL (empty disables). Basic validation: must be http(s)
+	// or empty; the dispatcher only ever POSTs safe fields.
+	if req.WebhookURL != nil {
+		url := strings.TrimSpace(*req.WebhookURL)
+		if url != "" && !strings.HasPrefix(url, "http://") && !strings.HasPrefix(url, "https://") {
+			w.WriteHeader(400)
+			json.NewEncoder(w).Encode(map[string]string{"error": "webhookURL must start with http:// or https://"})
+			return
+		}
+		if err := config.UpdateWebhookURL(url); err != nil {
 			w.WriteHeader(500)
 			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
 			return
