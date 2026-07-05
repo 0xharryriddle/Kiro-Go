@@ -1,7 +1,6 @@
 {
   "login.title": "Sign in",
   "login.subtitle": "Enter admin password to continue",
-
   "login.password": "Admin Password",
   "login.passwordPlaceholder": "Enter password",
   "login.submit": "Login",
@@ -579,5 +578,28 @@
   "errors.typeSuspended": "Suspended",
   "errors.typeOverage": "Overage",
   "errors.typeProfile": "Profile",
-  "errors.typeUnknown": "Unknown"
+  "errors.typeUnknown": "Unknown",
+  "externalIdpDiag": {
+    "title": "External IdP Diagnostics",
+    "desc": "Static checks for imported external IdP accounts. No live refresh is attempted from this panel.",
+    "empty": "No external IdP accounts found.",
+    "total": "External IdP",
+    "healthy": "Healthy",
+    "warning": "Warnings",
+    "error": "Errors",
+    "endpoint": "Token endpoint",
+    "liveCheck": "Live refresh check",
+    "liveSuccess": "External IdP live refresh check passed"
+  },
+  "recovery": {
+    "issuerUrl": "Issuer URL",
+    "derivedFrom": "Derived from",
+    "endpointValidation": "Endpoint validation",
+    "trustOnImport": "Using pasted access token expiry without live refresh; run diagnostics after import."
+  },
+  "audit": {
+    "title": "Audit Logs",
+    "desc": "Safe operational events for imports, diagnostics, and recovery actions. Secrets are not recorded.",
+    "empty": "No audit events yet."
+  }
 }

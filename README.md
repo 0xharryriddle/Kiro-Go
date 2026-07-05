@@ -102,7 +102,7 @@ curl http://localhost:8080/v1/chat/completions \
 
 ## Operations
 
-See [docs/operator-runbook.md](docs/operator-runbook.md) for production health checks, config backup/restore, credential recovery, account/model diagnostics, request replay dry-runs, logs, metrics, and deployment verification steps.
+See [docs/operator-runbook.md](docs/operator-runbook.md) for production health checks, config backup/restore, credential recovery, account/model diagnostics, request replay dry-runs, logs, metrics, and deployment verification steps. For external IdP import preview, conflict decisions, diagnostics, and audit behavior, see [docs/external-idp-import.md](docs/external-idp-import.md).
 
 ## Thinking Mode
 

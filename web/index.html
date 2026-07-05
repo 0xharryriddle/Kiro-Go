@@ -248,8 +248,10 @@
         <div class="tools-launcher" role="group">
           <button type="button" class="btn btn-outline btn-sm tool-launch-btn" data-tool-panel="recoveryWizardCard" data-i18n="recovery.title"></button>
           <button type="button" class="btn btn-outline btn-sm tool-launch-btn" data-tool-panel="accountDiagnosticsCard" data-i18n="diag.title"></button>
+          <button type="button" class="btn btn-outline btn-sm tool-launch-btn" data-tool-panel="externalIdpDiagnosticsCard" data-i18n="externalIdpDiag.title"></button>
           <button type="button" class="btn btn-outline btn-sm tool-launch-btn" data-tool-panel="modelRoutingCard" data-i18n="models.routingTitle"></button>
           <button type="button" class="btn btn-outline btn-sm tool-launch-btn" data-tool-panel="replayDiagnosticsCard" data-i18n="replay.title"></button>
+          <button type="button" class="btn btn-outline btn-sm tool-launch-btn" data-tool-panel="auditLogsCard" data-i18n="audit.title"></button>
         </div>
 
       <div class="card tool-panel hidden" id="accountDiagnosticsCard">
@@ -258,6 +260,15 @@
           <button class="btn btn-outline btn-sm" id="refreshDiagnosticsBtn" data-i18n="common.refresh"></button>
         </div>
         <div id="diagnosticsBody" class="diag-body muted-text" data-i18n="diag.loading"></div>
+      </div>
+
+      <div class="card tool-panel hidden" id="externalIdpDiagnosticsCard">
+        <div class="card-header">
+          <span class="card-title" data-i18n="externalIdpDiag.title"></span>
+          <button class="btn btn-outline btn-sm" id="refreshExternalIdpDiagnosticsBtn" data-i18n="common.refresh"></button>
+        </div>
+        <p class="muted-text" data-i18n="externalIdpDiag.desc"></p>
+        <div id="externalIdpDiagnosticsBody" class="diag-body muted-text" data-i18n="diag.loading"></div>
       </div>
 
       <div class="card tool-panel hidden" id="modelRoutingCard">
@@ -285,6 +296,15 @@
         </div>
         <textarea id="replayPayloadInput" class="replay-payload" spellcheck="false"></textarea>
         <div id="replayResultBody" class="replay-result muted-text" data-i18n="replay.hint"></div>
+      </div>
+
+      <div class="card tool-panel hidden" id="auditLogsCard">
+        <div class="card-header">
+          <span class="card-title" data-i18n="audit.title"></span>
+          <button class="btn btn-outline btn-sm" id="refreshAuditLogsBtn" data-i18n="common.refresh"></button>
+        </div>
+        <p class="muted-text" data-i18n="audit.desc"></p>
+        <div id="auditLogsBody" class="diag-body muted-text" data-i18n="diag.loading"></div>
       </div>
 
       <div class="card tool-panel hidden" id="recoveryWizardCard">

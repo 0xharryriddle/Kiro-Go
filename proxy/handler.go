@@ -11,6 +11,7 @@ import (
 	"kiro-go/pool"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -33,7 +34,22 @@ type RequestLog struct {
 	Credits      float64 `json:"credits"`      // credits used
 	Error        string  `json:"error,omitempty"`
 	ErrorType    string  `json:"errorType,omitempty"`
-	Duration     int64   `json:"duration"` // duration in ms
+	Duration     int64   `json:"duration"` // milliseconds
+	RequestID    string  `json:"requestId,omitempty"`
+}
+
+type AuditLog struct {
+	Time         int64             `json:"time"`
+	Category     string            `json:"category"`
+	Action       string            `json:"action"`
+	Status       string            `json:"status"`
+	AccountID    string            `json:"accountId,omitempty"`
+	AccountEmail string            `json:"accountEmail,omitempty"`
+	AuthMethod   string            `json:"authMethod,omitempty"`
+	Provider     string            `json:"provider,omitempty"`
+	Source       string            `json:"source,omitempty"`
+	Reason       string            `json:"reason,omitempty"`
+	SafeDetails  map[string]string `json:"safeDetails,omitempty"`
 }
 
 type replayDiagnosticRequest struct {
@@ -44,6 +60,8 @@ type replayDiagnosticRequest struct {
 const (
 	requestLogsMaxSize = 500
 	requestLogsPath    = "data/request_logs.json"
+	auditLogsMaxSize   = 1000
+	auditLogsPath      = "data/audit_logs.json"
 )
 
 // Handler HTTP 处理器
@@ -68,6 +86,8 @@ type Handler struct {
 	// 请求日志 (环形缓冲区，包含成功和失败)
 	requestLogs   []RequestLog
 	requestLogsMu sync.RWMutex
+	auditLogs     []AuditLog
+	auditLogsMu   sync.RWMutex
 }
 
 type thinkingStreamSource int
@@ -257,6 +277,7 @@ func NewHandler() *Handler {
 		promptCache:     newPromptCacheTracker(defaultPromptCacheTTL),
 	}
 	h.loadRequestLogs()
+	h.loadAuditLogs()
 	// 启动后台刷新
 	go h.backgroundRefresh()
 	// 启动后台统计保存 (每30秒保存一次)
@@ -1571,6 +1592,62 @@ func persistRequestLogs(logs []RequestLog) {
 	}
 }
 
+func (h *Handler) appendAuditLog(entry AuditLog) {
+	entry.Time = time.Now().Unix()
+	h.auditLogsMu.Lock()
+	if h.auditLogs == nil {
+		h.auditLogs = make([]AuditLog, 0, auditLogsMaxSize)
+	}
+	if len(h.auditLogs) >= auditLogsMaxSize {
+		h.auditLogs = h.auditLogs[1:]
+	}
+	h.auditLogs = append(h.auditLogs, entry)
+	snapshot := append([]AuditLog(nil), h.auditLogs...)
+	h.auditLogsMu.Unlock()
+	go persistAuditLogs(snapshot)
+}
+
+func (h *Handler) loadAuditLogs() {
+	raw, err := os.ReadFile(auditLogsPath)
+	if err != nil {
+		return
+	}
+	var logs []AuditLog
+	if err := json.Unmarshal(raw, &logs); err != nil {
+		logger.Warnf("[Audit] Failed to load %s: %v", auditLogsPath, err)
+		return
+	}
+	if len(logs) > auditLogsMaxSize {
+		logs = logs[len(logs)-auditLogsMaxSize:]
+	}
+	h.auditLogsMu.Lock()
+	h.auditLogs = logs
+	h.auditLogsMu.Unlock()
+}
+
+func persistAuditLogs(logs []AuditLog) {
+	if len(logs) > auditLogsMaxSize {
+		logs = logs[len(logs)-auditLogsMaxSize:]
+	}
+	if err := os.MkdirAll("data", 0755); err != nil {
+		logger.Warnf("[Audit] Failed to create data dir: %v", err)
+		return
+	}
+	raw, err := json.MarshalIndent(logs, "", "  ")
+	if err != nil {
+		logger.Warnf("[Audit] Failed to encode audit logs: %v", err)
+		return
+	}
+	tmp := auditLogsPath + ".tmp"
+	if err := os.WriteFile(tmp, raw, 0600); err != nil {
+		logger.Warnf("[Audit] Failed to write %s: %v", tmp, err)
+		return
+	}
+	if err := os.Rename(tmp, auditLogsPath); err != nil {
+		logger.Warnf("[Audit] Failed to replace %s: %v", auditLogsPath, err)
+	}
+}
+
 // classifyError categorizes an error message into a type for display.
 func classifyError(msg string) string {
 	switch {
@@ -2347,6 +2424,10 @@ func (h *Handler) handleAdminAPI(w http.ResponseWriter, r *http.Request) {
 		h.apiBatchAccounts(w, r)
 	case path == "/accounts/diagnostics" && r.Method == "GET":
 		h.apiGetAccountDiagnostics(w, r)
+	case path == "/accounts/external-idp-diagnostics" && r.Method == "GET":
+		h.apiGetExternalIDPDiagnostics(w, r)
+	case path == "/accounts/external-idp-diagnostics/live" && r.Method == "POST":
+		h.apiRunExternalIDPLiveDiagnostics(w, r)
 	// models/refresh 必须在通用 /refresh 前匹配，否则会被误拦截
 	case path == "/accounts/models/refresh" && r.Method == "POST":
 		h.apiRefreshAllAccountsModels(w, r)
@@ -2402,6 +2483,10 @@ func (h *Handler) handleAdminAPI(w http.ResponseWriter, r *http.Request) {
 		h.apiImportSsoToken(w, r)
 	case path == "/auth/credentials" && r.Method == "POST":
 		h.apiImportCredentials(w, r)
+	case path == "/import/credentials/preview" && r.Method == "POST":
+		h.apiPreviewCredentials(w, r)
+	case path == "/import/credentials/apply" && r.Method == "POST":
+		h.apiApplyCredentials(w, r)
 	case path == "/auth/import-cli-json/preview" && r.Method == "POST":
 		h.apiPreviewCliJson(w, r)
 	case path == "/auth/import-cli-json" && r.Method == "POST":
@@ -2434,6 +2519,8 @@ func (h *Handler) handleAdminAPI(w http.ResponseWriter, r *http.Request) {
 		h.apiGetMetricsSummary(w, r)
 	case path == "/logs" && r.Method == "GET":
 		h.apiGetLogs(w, r)
+	case path == "/audit-logs" && r.Method == "GET":
+		h.apiGetAuditLogs(w, r)
 	case path == "/logs" && r.Method == "DELETE":
 		h.apiClearLogs(w, r)
 	case path == "/generate-machine-id" && r.Method == "GET":
@@ -2595,6 +2682,140 @@ func (h *Handler) apiGetAccountDiagnostics(w http.ResponseWriter, r *http.Reques
 		"summary":     summary,
 		"diagnostics": diagnostics,
 	})
+}
+
+type externalIDPDiagnosticItem struct {
+	AccountID string            `json:"accountId"`
+	Email     string            `json:"email,omitempty"`
+	Provider  string            `json:"provider,omitempty"`
+	Region    string            `json:"region,omitempty"`
+	Enabled   bool              `json:"enabled"`
+	Status    string            `json:"status"`
+	Checks    map[string]bool   `json:"checks"`
+	Messages  []string          `json:"messages,omitempty"`
+	SafeMeta  map[string]string `json:"safeMeta,omitempty"`
+}
+
+func (h *Handler) apiGetExternalIDPDiagnostics(w http.ResponseWriter, r *http.Request) {
+	accounts := config.GetAccounts()
+	now := time.Now().Unix()
+	summary := map[string]int{"totalExternalIdp": 0, "healthy": 0, "warning": 0, "error": 0, "missingRefreshMaterial": 0, "endpointRejected": 0, "refreshDue": 0, "profileArnMissing": 0}
+	items := make([]externalIDPDiagnosticItem, 0)
+	for _, acc := range accounts {
+		if acc.AuthMethod != "external_idp" {
+			continue
+		}
+		summary["totalExternalIdp"]++
+		checks := map[string]bool{
+			"hasRefreshToken":      strings.TrimSpace(acc.RefreshToken) != "",
+			"hasClientId":          strings.TrimSpace(acc.ClientID) != "",
+			"hasTokenEndpoint":     strings.TrimSpace(acc.TokenEndpoint) != "",
+			"hasIssuerUrl":         strings.TrimSpace(acc.IssuerURL) != "",
+			"hasScopes":            strings.TrimSpace(acc.Scopes) != "",
+			"hasProfileArn":        strings.TrimSpace(acc.ProfileArn) != "",
+			"tokenExpired":         acc.ExpiresAt > 0 && now >= acc.ExpiresAt,
+			"tokenRefreshDue":      acc.ExpiresAt > 0 && now >= acc.ExpiresAt-tokenRefreshSkewSeconds,
+			"localRoutingEnabled":  acc.Enabled,
+			"tokenEndpointAllowed": false,
+			"issuerAllowed":        strings.TrimSpace(acc.IssuerURL) == "",
+		}
+		messages := []string{}
+		status := "healthy"
+		if checks["hasTokenEndpoint"] {
+			if err := auth.ValidateExternalIdpEndpoint(acc.TokenEndpoint); err != nil {
+				messages = append(messages, "token endpoint rejected: "+err.Error())
+				summary["endpointRejected"]++
+				status = "error"
+			} else {
+				checks["tokenEndpointAllowed"] = true
+			}
+		}
+		if checks["hasIssuerUrl"] {
+			if err := auth.ValidateExternalIdpEndpoint(acc.IssuerURL); err != nil {
+				messages = append(messages, "issuer URL rejected: "+err.Error())
+				status = "error"
+			} else {
+				checks["issuerAllowed"] = true
+			}
+		}
+		if !checks["hasRefreshToken"] || !checks["hasClientId"] || !checks["hasTokenEndpoint"] {
+			messages = append(messages, "missing required external IdP refresh material")
+			summary["missingRefreshMaterial"]++
+			status = "error"
+		}
+		if checks["tokenExpired"] {
+			messages = append(messages, "access token is expired")
+			status = "error"
+		} else if checks["tokenRefreshDue"] {
+			messages = append(messages, "access token is near the refresh window")
+			summary["refreshDue"]++
+			if status == "healthy" {
+				status = "warning"
+			}
+		}
+		if !checks["hasProfileArn"] {
+			messages = append(messages, "profile ARN is missing and will be resolved lazily")
+			summary["profileArnMissing"]++
+			if status == "healthy" {
+				status = "warning"
+			}
+		}
+		if !acc.Enabled {
+			messages = append(messages, "account is disabled for local routing only")
+			if status == "healthy" {
+				status = "warning"
+			}
+		}
+		summary[status]++
+		items = append(items, externalIDPDiagnosticItem{AccountID: acc.ID, Email: acc.Email, Provider: acc.Provider, Region: acc.Region, Enabled: acc.Enabled, Status: status, Checks: checks, Messages: messages, SafeMeta: map[string]string{"tokenEndpoint": acc.TokenEndpoint, "issuerUrl": acc.IssuerURL}})
+	}
+	json.NewEncoder(w).Encode(map[string]interface{}{"success": true, "summary": summary, "items": items})
+}
+
+func (h *Handler) apiRunExternalIDPLiveDiagnostics(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		AccountID string `json:"accountId"`
+	}
+	_ = json.NewDecoder(r.Body).Decode(&body)
+	accounts := config.GetAccounts()
+	var target *config.Account
+	for i := range accounts {
+		if body.AccountID == "" || accounts[i].ID == body.AccountID {
+			if accounts[i].AuthMethod == "external_idp" {
+				target = &accounts[i]
+				break
+			}
+		}
+	}
+	if target == nil {
+		w.WriteHeader(404)
+		json.NewEncoder(w).Encode(map[string]interface{}{"success": false, "error": "external_idp account not found"})
+		return
+	}
+	accessToken, refreshToken, expiresAt, profileArn, err := auth.RefreshToken(target)
+	if err != nil {
+		h.appendAuditLog(AuditLog{Category: "diagnostics", Action: "external_idp_live_refresh", Status: "error", AccountID: target.ID, AccountEmail: target.Email, AuthMethod: target.AuthMethod, Provider: target.Provider, Reason: err.Error()})
+		w.WriteHeader(502)
+		json.NewEncoder(w).Encode(map[string]interface{}{"success": false, "accountId": target.ID, "error": err.Error()})
+		return
+	}
+	if refreshToken == "" {
+		refreshToken = target.RefreshToken
+	}
+	if profileArn == "" {
+		profileArn = target.ProfileArn
+	}
+	if err := config.UpdateAccountToken(target.ID, accessToken, refreshToken, expiresAt); err != nil {
+		w.WriteHeader(500)
+		json.NewEncoder(w).Encode(map[string]interface{}{"success": false, "error": err.Error()})
+		return
+	}
+	if profileArn != "" && profileArn != target.ProfileArn {
+		_ = config.UpdateAccountProfileArn(target.ID, profileArn)
+	}
+	h.pool.Reload()
+	h.appendAuditLog(AuditLog{Category: "diagnostics", Action: "external_idp_live_refresh", Status: "success", AccountID: target.ID, AccountEmail: target.Email, AuthMethod: target.AuthMethod, Provider: target.Provider})
+	json.NewEncoder(w).Encode(map[string]interface{}{"success": true, "accountId": target.ID, "expiresAt": expiresAt, "hasProfileArn": profileArn != ""})
 }
 
 func (h *Handler) apiGetAccounts(w http.ResponseWriter, r *http.Request) {
@@ -3387,42 +3608,14 @@ func importErrorStatus(err error) int {
 // token carries no trustworthy expiry and guessing a short TTL makes the pool
 // skip the account forever (see ensureValidToken / Pick expiry handling).
 func (h *Handler) importOne(req importCredentialRequest) (config.Account, error) {
-	if strings.TrimSpace(req.RefreshToken) == "" {
-		return config.Account{}, &importValidationError{"refreshToken is required"}
+	plan := buildImportPlan(0, req)
+	if !plan.Valid {
+		if len(plan.Errors) > 0 {
+			return config.Account{}, &importValidationError{strings.Join(plan.Errors, "; ")}
+		}
+		return config.Account{}, &importValidationError{"credential import is not valid"}
 	}
-	if req.Region == "" {
-		req.Region = "us-east-1"
-	}
-	req.AuthMethod = normalizeAuthMethod(req.AuthMethod, req.TokenEndpoint, req.ClientID, req.ClientSecret)
-
-	derivedTE, derivedIss, derivedScopes := auth.DeriveExternalIdpEndpoints(req.UserID, req.ClientID, req.AccessToken)
-	if derivedTE != "" && auth.ValidateExternalIdpEndpoint(derivedTE) == nil && req.AuthMethod != "external_idp" {
-		req.AuthMethod = "external_idp"
-	}
-	if req.AuthMethod == "external_idp" {
-		if req.TokenEndpoint == "" {
-			req.TokenEndpoint = derivedTE
-		}
-		if req.IssuerURL == "" {
-			req.IssuerURL = derivedIss
-		}
-		if req.Scopes == "" {
-			req.Scopes = derivedScopes
-		}
-		if strings.TrimSpace(req.TokenEndpoint) == "" || strings.TrimSpace(req.ClientID) == "" {
-			return config.Account{}, &importValidationError{
-				"external_idp import requires token_endpoint and client_id (or userId/accessToken to derive them)",
-			}
-		}
-		if err := auth.ValidateExternalIdpEndpoint(req.TokenEndpoint); err != nil {
-			return config.Account{}, &importValidationError{"external IdP endpoint rejected: " + err.Error()}
-		}
-		if req.IssuerURL != "" {
-			if err := auth.ValidateExternalIdpEndpoint(req.IssuerURL); err != nil {
-				return config.Account{}, &importValidationError{"external IdP issuer rejected: " + err.Error()}
-			}
-		}
-	}
+	req = plan.Request
 
 	var (
 		accessToken     string
@@ -3510,59 +3703,279 @@ func pickProfileArn(resolved, fromHelper string) string {
 	return strings.TrimSpace(fromHelper)
 }
 
+type importDerivedInfo struct {
+	TokenEndpoint bool   `json:"tokenEndpoint"`
+	IssuerURL     bool   `json:"issuerUrl"`
+	Scopes        bool   `json:"scopes"`
+	Source        string `json:"source,omitempty"`
+}
+
+type importValidationInfo struct {
+	EndpointAllowed bool   `json:"endpointAllowed"`
+	EndpointReason  string `json:"endpointReason,omitempty"`
+	IssuerAllowed   bool   `json:"issuerAllowed"`
+	IssuerReason    string `json:"issuerReason,omitempty"`
+}
+
+type importConflictInfo struct {
+	Type          string `json:"type"`
+	ExistingID    string `json:"existingId,omitempty"`
+	ExistingEmail string `json:"existingEmail,omitempty"`
+	Severity      string `json:"severity"`
+	Message       string `json:"message"`
+}
+
 type importPreviewItem struct {
-	Index            int    `json:"index"`
-	AuthMethod       string `json:"authMethod"`
-	Provider         string `json:"provider"`
-	Email            string `json:"email,omitempty"`
-	Nickname         string `json:"nickname,omitempty"`
-	Region           string `json:"region,omitempty"`
-	TokenEndpoint    string `json:"tokenEndpoint,omitempty"`
-	IssuerURL        string `json:"issuerUrl,omitempty"`
-	ProfileArn       string `json:"profileArn,omitempty"`
-	HasRefreshToken  bool   `json:"hasRefreshToken"`
-	HasAccessToken   bool   `json:"hasAccessToken"`
-	HasClientID      bool   `json:"hasClientId"`
-	HasClientSecret  bool   `json:"hasClientSecret"`
-	WillReplaceEmail bool   `json:"willReplaceEmail"`
+	Index                int                     `json:"index"`
+	Valid                bool                    `json:"valid"`
+	AuthMethodRaw        string                  `json:"authMethodRaw,omitempty"`
+	AuthMethod           string                  `json:"authMethod"`
+	AuthMethodNormalized string                  `json:"authMethodNormalized"`
+	Provider             string                  `json:"provider"`
+	Email                string                  `json:"email,omitempty"`
+	Nickname             string                  `json:"nickname,omitempty"`
+	Region               string                  `json:"region,omitempty"`
+	TokenEndpoint        string                  `json:"tokenEndpoint,omitempty"`
+	IssuerURL            string                  `json:"issuerUrl,omitempty"`
+	ScopesPreview        string                  `json:"scopesPreview,omitempty"`
+	ProfileArn           string                  `json:"profileArn,omitempty"`
+	HasRefreshToken      bool                    `json:"hasRefreshToken"`
+	HasAccessToken       bool                    `json:"hasAccessToken"`
+	HasClientID          bool                    `json:"hasClientId"`
+	HasClientSecret      bool                    `json:"hasClientSecret"`
+	Derived              importDerivedInfo       `json:"derived"`
+	Validation           importValidationInfo    `json:"validation"`
+	ImportMode           string                  `json:"importMode"`
+	TrustOnImport        bool                    `json:"trustOnImport"`
+	JWTExpiresAt         int64                   `json:"jwtExpiresAt,omitempty"`
+	WillReplaceEmail     bool                    `json:"willReplaceEmail"`
+	WillReuseID          bool                    `json:"willReuseId"`
+	DuplicateID          bool                    `json:"duplicateId"`
+	Conflicts            []importConflictInfo    `json:"conflicts,omitempty"`
+	Warnings             []string                `json:"warnings,omitempty"`
+	Errors               []string                `json:"errors,omitempty"`
+	Request              importCredentialRequest `json:"-"`
+}
+
+func buildImportPlan(index int, req importCredentialRequest) importPreviewItem {
+	plan := importPreviewItem{Index: index, AuthMethodRaw: strings.TrimSpace(req.AuthMethod), Valid: true, Request: req}
+	if plan.Index == 0 {
+		plan.Index = 1
+	}
+	if strings.TrimSpace(req.Region) == "" {
+		req.Region = "us-east-1"
+	}
+	req.AuthMethod = normalizeAuthMethod(req.AuthMethod, req.TokenEndpoint, req.ClientID, req.ClientSecret)
+	derivedTE, derivedIss, derivedScopes := auth.DeriveExternalIdpEndpoints(req.UserID, req.ClientID, req.AccessToken)
+	if derivedTE != "" && auth.ValidateExternalIdpEndpoint(derivedTE) == nil && req.AuthMethod != "external_idp" {
+		req.AuthMethod = "external_idp"
+	}
+	if req.AuthMethod == "external_idp" {
+		if strings.TrimSpace(req.TokenEndpoint) == "" && derivedTE != "" {
+			req.TokenEndpoint = derivedTE
+			plan.Derived.TokenEndpoint = true
+		}
+		if strings.TrimSpace(req.IssuerURL) == "" && derivedIss != "" {
+			req.IssuerURL = derivedIss
+			plan.Derived.IssuerURL = true
+		}
+		if strings.TrimSpace(req.Scopes) == "" && derivedScopes != "" {
+			req.Scopes = derivedScopes
+			plan.Derived.Scopes = true
+		}
+		if plan.Derived.TokenEndpoint || plan.Derived.IssuerURL || plan.Derived.Scopes {
+			if strings.TrimSpace(req.UserID) != "" {
+				plan.Derived.Source = "userId"
+			} else {
+				plan.Derived.Source = "accessTokenIssuer"
+			}
+		}
+		if strings.TrimSpace(req.TokenEndpoint) == "" || strings.TrimSpace(req.ClientID) == "" {
+			plan.Errors = append(plan.Errors, "external_idp import requires token_endpoint and client_id (or userId/accessToken to derive them)")
+		}
+		if strings.TrimSpace(req.TokenEndpoint) != "" {
+			if err := auth.ValidateExternalIdpEndpoint(req.TokenEndpoint); err != nil {
+				plan.Validation.EndpointReason = err.Error()
+				plan.Errors = append(plan.Errors, "external IdP endpoint rejected: "+err.Error())
+			} else {
+				plan.Validation.EndpointAllowed = true
+				plan.Validation.EndpointReason = "host allow-listed"
+			}
+		}
+		if strings.TrimSpace(req.IssuerURL) != "" {
+			if err := auth.ValidateExternalIdpEndpoint(req.IssuerURL); err != nil {
+				plan.Validation.IssuerReason = err.Error()
+				plan.Errors = append(plan.Errors, "external IdP issuer rejected: "+err.Error())
+			} else {
+				plan.Validation.IssuerAllowed = true
+				plan.Validation.IssuerReason = "host allow-listed"
+			}
+		}
+	}
+	if strings.TrimSpace(req.RefreshToken) == "" {
+		plan.Errors = append(plan.Errors, "refreshToken is required")
+	}
+	plan.JWTExpiresAt = auth.ExpFromAccessTokenJWT(req.AccessToken)
+	plan.TrustOnImport = req.AuthMethod == "external_idp" && strings.TrimSpace(req.AccessToken) != "" && plan.JWTExpiresAt > 0
+	plan.ImportMode = "live_refresh"
+	if plan.TrustOnImport {
+		plan.ImportMode = "trust_access_token_exp"
+		plan.Warnings = append(plan.Warnings, "access token JWT exp can be used without a live refresh, but it does not prove the token is accepted upstream")
+	}
+	if len(plan.Errors) > 0 {
+		plan.Valid = false
+	}
+	email := strings.TrimSpace(req.Email)
+	if email == "" {
+		email = emailFromJWT(req.AccessToken)
+	}
+	plan.AuthMethod = req.AuthMethod
+	plan.AuthMethodNormalized = req.AuthMethod
+	plan.Provider = providerWithDefault(req.AuthMethod, req.Provider)
+	plan.Email = email
+	plan.Nickname = strings.TrimSpace(req.Nickname)
+	plan.Region = req.Region
+	plan.TokenEndpoint = req.TokenEndpoint
+	plan.IssuerURL = req.IssuerURL
+	plan.ScopesPreview = req.Scopes
+	plan.ProfileArn = req.ProfileArn
+	plan.HasRefreshToken = strings.TrimSpace(req.RefreshToken) != ""
+	plan.HasAccessToken = strings.TrimSpace(req.AccessToken) != ""
+	plan.HasClientID = strings.TrimSpace(req.ClientID) != ""
+	plan.HasClientSecret = strings.TrimSpace(req.ClientSecret) != ""
+	for _, acc := range config.GetAccounts() {
+		if email != "" && strings.EqualFold(strings.TrimSpace(acc.Email), email) {
+			plan.WillReplaceEmail = true
+			plan.Conflicts = append(plan.Conflicts, importConflictInfo{Type: "same_email", ExistingID: acc.ID, ExistingEmail: acc.Email, Severity: "warning", Message: "an existing account uses the same email"})
+		}
+		if strings.TrimSpace(req.ID) != "" && acc.ID == strings.TrimSpace(req.ID) {
+			plan.DuplicateID = true
+			plan.Conflicts = append(plan.Conflicts, importConflictInfo{Type: "same_id", ExistingID: acc.ID, ExistingEmail: acc.Email, Severity: "warning", Message: "an existing account uses the same ID; import will generate a new ID"})
+		}
+	}
+	plan.WillReuseID = strings.TrimSpace(req.ID) != "" && !plan.DuplicateID
+	plan.Request = req
+	return plan
 }
 
 func previewImportRequests(reqs []importCredentialRequest) []importPreviewItem {
-	accounts := config.GetAccounts()
 	items := make([]importPreviewItem, 0, len(reqs))
 	for i, req := range reqs {
-		email := strings.TrimSpace(req.Email)
-		if email == "" {
-			email = emailFromJWT(req.AccessToken)
-		}
-		willReplace := false
-		for _, acc := range accounts {
-			if email != "" && strings.EqualFold(strings.TrimSpace(acc.Email), email) {
-				willReplace = true
-				break
-			}
-		}
-		items = append(items, importPreviewItem{
-			Index:            i + 1,
-			AuthMethod:       req.AuthMethod,
-			Provider:         req.Provider,
-			Email:            email,
-			Nickname:         req.Nickname,
-			Region:           req.Region,
-			TokenEndpoint:    req.TokenEndpoint,
-			IssuerURL:        req.IssuerURL,
-			ProfileArn:       req.ProfileArn,
-			HasRefreshToken:  strings.TrimSpace(req.RefreshToken) != "",
-			HasAccessToken:   strings.TrimSpace(req.AccessToken) != "",
-			HasClientID:      strings.TrimSpace(req.ClientID) != "",
-			HasClientSecret:  strings.TrimSpace(req.ClientSecret) != "",
-			WillReplaceEmail: willReplace,
-		})
+		items = append(items, buildImportPlan(i+1, req))
 	}
 	return items
 }
 
+func (h *Handler) apiPreviewCredentials(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		w.WriteHeader(400)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Invalid request body"})
+		return
+	}
+	req, err := decodeImportRequest(body)
+	if err != nil {
+		w.WriteHeader(400)
+		json.NewEncoder(w).Encode(map[string]interface{}{"success": false, "error": err.Error()})
+		return
+	}
+	items := previewImportRequests([]importCredentialRequest{req})
+	h.appendAuditLog(AuditLog{Category: "import", Action: "preview_credentials", Status: "success", Source: "credentials", SafeDetails: map[string]string{"count": strconv.Itoa(len(items))}})
+	json.NewEncoder(w).Encode(map[string]interface{}{"success": true, "count": len(items), "items": items})
+}
+
+type importApplyDecision struct {
+	Action            string `json:"action"`
+	ExistingAccountID string `json:"existingAccountId"`
+}
+
+type importApplyRequest struct {
+	Raw       json.RawMessage                `json:"raw"`
+	Decisions map[string]importApplyDecision `json:"decisions"`
+}
+
+func (h *Handler) apiApplyCredentials(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		w.WriteHeader(400)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Invalid request body"})
+		return
+	}
+	payload := body
+	var applyReq importApplyRequest
+	if err := json.Unmarshal(body, &applyReq); err == nil && len(applyReq.Raw) > 0 {
+		payload = applyReq.Raw
+	}
+	reqs, warnings, err := normalizeCliJson(payload)
+	if err != nil {
+		single, singleErr := decodeImportRequest(payload)
+		if singleErr != nil {
+			w.WriteHeader(400)
+			json.NewEncoder(w).Encode(map[string]interface{}{"success": false, "error": err.Error(), "warnings": warnings})
+			return
+		}
+		reqs = []importCredentialRequest{single}
+	}
+	var imported []map[string]interface{}
+	var skipped []int
+	var errs []string
+	for i, req := range reqs {
+		decision := importApplyDecision{Action: "create_new"}
+		if applyReq.Decisions != nil {
+			if d, ok := applyReq.Decisions[strconv.Itoa(i+1)]; ok {
+				decision = d
+			}
+		}
+		switch decision.Action {
+		case "skip":
+			skipped = append(skipped, i+1)
+			continue
+		case "", "create_new":
+			account, impErr := h.importOne(req)
+			if impErr != nil {
+				errs = append(errs, fmt.Sprintf("item %d: %s", i+1, impErr.Error()))
+				continue
+			}
+			imported = append(imported, map[string]interface{}{"id": account.ID, "email": account.Email, "authMethod": account.AuthMethod, "action": "create_new"})
+			h.appendAuditLog(AuditLog{Category: "import", Action: "import_credentials", Status: "success", AccountID: account.ID, AccountEmail: account.Email, AuthMethod: account.AuthMethod, Provider: account.Provider, Source: "apply", SafeDetails: map[string]string{"decision": "create_new"}})
+		case "replace_existing":
+			if strings.TrimSpace(decision.ExistingAccountID) == "" {
+				errs = append(errs, fmt.Sprintf("item %d: existingAccountId is required for replace_existing", i+1))
+				continue
+			}
+			account, impErr := h.importOne(req)
+			if impErr != nil {
+				errs = append(errs, fmt.Sprintf("item %d: %s", i+1, impErr.Error()))
+				continue
+			}
+			newID := account.ID
+			account.ID = decision.ExistingAccountID
+			if err := config.UpdateAccount(decision.ExistingAccountID, account); err != nil {
+				errs = append(errs, fmt.Sprintf("item %d: replace failed: %s", i+1, err.Error()))
+				continue
+			}
+			_ = config.DeleteAccount(newID)
+			imported = append(imported, map[string]interface{}{"id": account.ID, "email": account.Email, "authMethod": account.AuthMethod, "action": "replace_existing"})
+			h.appendAuditLog(AuditLog{Category: "import", Action: "replace_account", Status: "success", AccountID: account.ID, AccountEmail: account.Email, AuthMethod: account.AuthMethod, Provider: account.Provider, Source: "apply", SafeDetails: map[string]string{"replacedId": decision.ExistingAccountID}})
+		default:
+			errs = append(errs, fmt.Sprintf("item %d: unsupported action %q", i+1, decision.Action))
+		}
+	}
+	if len(imported) > 0 {
+		h.pool.Reload()
+	}
+	if len(imported) == 0 && len(skipped) == 0 {
+		w.WriteHeader(500)
+		json.NewEncoder(w).Encode(map[string]interface{}{"success": false, "error": strings.Join(errs, "; "), "warnings": warnings})
+		return
+	}
+	json.NewEncoder(w).Encode(map[string]interface{}{"success": true, "imported": imported, "skipped": skipped, "errors": errs, "warnings": warnings})
+}
+
 func (h *Handler) apiPreviewCliJson(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
 		w.WriteHeader(400)
@@ -3575,7 +3988,9 @@ func (h *Handler) apiPreviewCliJson(w http.ResponseWriter, r *http.Request) {
 		json.NewEncoder(w).Encode(map[string]interface{}{"success": false, "error": err.Error(), "warnings": warnings})
 		return
 	}
-	json.NewEncoder(w).Encode(map[string]interface{}{"success": true, "count": len(reqs), "items": previewImportRequests(reqs), "warnings": warnings})
+	items := previewImportRequests(reqs)
+	h.appendAuditLog(AuditLog{Category: "import", Action: "preview_credentials", Status: "success", Source: "cli_json", SafeDetails: map[string]string{"count": strconv.Itoa(len(items))}})
+	json.NewEncoder(w).Encode(map[string]interface{}{"success": true, "count": len(reqs), "items": items, "warnings": warnings})
 }
 
 func (h *Handler) apiPreviewIdeCache(w http.ResponseWriter, r *http.Request) {
@@ -3951,6 +4366,16 @@ func (h *Handler) apiGetLogs(w http.ResponseWriter, r *http.Request) {
 		"count":         len(logs),
 		"persistedPath": requestLogsPath,
 	})
+}
+
+func (h *Handler) apiGetAuditLogs(w http.ResponseWriter, r *http.Request) {
+	h.auditLogsMu.RLock()
+	logs := make([]AuditLog, len(h.auditLogs))
+	for i, e := range h.auditLogs {
+		logs[len(h.auditLogs)-1-i] = e
+	}
+	h.auditLogsMu.RUnlock()
+	json.NewEncoder(w).Encode(map[string]interface{}{"success": true, "logs": logs, "count": len(logs), "persistedPath": auditLogsPath})
 }
 
 func (h *Handler) apiClearLogs(w http.ResponseWriter, r *http.Request) {

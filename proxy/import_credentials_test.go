@@ -337,3 +337,53 @@ func TestApiImportCliJsonBatch(t *testing.T) {
 		t.Fatalf("expected 2 accounts persisted, got %d", len(accs))
 	}
 }
+
+func TestApiPreviewCredentialsExplainsExternalIdpWithoutLeakingSecrets(t *testing.T) {
+	cfgFile := t.TempDir() + "/config.json"
+	if err := config.Init(cfgFile); err != nil {
+		t.Fatalf("config init: %v", err)
+	}
+	h := &Handler{pool: accountpool.GetPool()}
+	body := `{"authMethod":"external_idp","clientId":"client-preview","refreshToken":"rt-secret","accessToken":"at-secret","tokenEndpoint":"https://login.microsoftonline.com/tenant/oauth2/v2.0/token","issuerUrl":"https://login.microsoftonline.com/tenant/v2.0","email":"preview@example.com"}`
+	req := httptest.NewRequest("POST", "/admin/api/import/credentials/preview", strings.NewReader(body))
+	rec := httptest.NewRecorder()
+
+	h.apiPreviewCredentials(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	if accs := config.GetAccounts(); len(accs) != 0 {
+		t.Fatalf("preview must not persist accounts, got %d", len(accs))
+	}
+	response := rec.Body.String()
+	if strings.Contains(response, "rt-secret") || strings.Contains(response, "at-secret") || strings.Contains(response, "client-preview") {
+		t.Fatalf("preview leaked credential material: %s", response)
+	}
+	if !strings.Contains(response, "preview@example.com") || !strings.Contains(response, "endpointAllowed") {
+		t.Fatalf("preview missing explain metadata: %s", response)
+	}
+}
+
+func TestExternalIDPDiagnosticsReportsStaticWarnings(t *testing.T) {
+	cfgFile := t.TempDir() + "/config.json"
+	if err := config.Init(cfgFile); err != nil {
+		t.Fatalf("config init: %v", err)
+	}
+	if err := config.AddAccount(config.Account{ID: "ext-1", Email: "ext@example.com", AuthMethod: "external_idp", Provider: "AzureAD", Region: "us-east-1", Enabled: true, RefreshToken: "rt", ClientID: "client", TokenEndpoint: "https://login.microsoftonline.com/tenant/oauth2/v2.0/token", IssuerURL: "https://login.microsoftonline.com/tenant/v2.0", ExpiresAt: time.Now().Add(2 * time.Minute).Unix()}); err != nil {
+		t.Fatalf("add account: %v", err)
+	}
+	h := &Handler{pool: accountpool.GetPool()}
+	req := httptest.NewRequest("GET", "/admin/api/accounts/external-idp-diagnostics", nil)
+	rec := httptest.NewRecorder()
+
+	h.apiGetExternalIDPDiagnostics(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	response := rec.Body.String()
+	if !strings.Contains(response, "totalExternalIdp") || !strings.Contains(response, "tokenRefreshDue") || !strings.Contains(response, "profile ARN is missing") {
+		t.Fatalf("diagnostics missing expected static checks: %s", response)
+	}
+}

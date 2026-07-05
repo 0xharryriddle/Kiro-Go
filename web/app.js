@@ -855,6 +855,24 @@
     renderAccounts();
   }
 
+  async function loadExternalIdpDiagnostics() {
+    const box = $('externalIdpDiagnosticsBody');
+    if (box) box.textContent = t('diag.loading');
+    const res = await api('/accounts/external-idp-diagnostics');
+    if (!res.ok) return;
+    const data = await res.json();
+    renderExternalIdpDiagnostics(data);
+  }
+
+  async function loadAuditLogs() {
+    const box = $('auditLogsBody');
+    if (box) box.textContent = t('diag.loading');
+    const res = await api('/audit-logs');
+    if (!res.ok) return;
+    const data = await res.json();
+    renderAuditLogs(data);
+  }
+
   function getFilteredAccounts() {
 
     return accountsData.filter(a => {
@@ -1085,6 +1103,62 @@
         '<span>' + escapeHtml(t('diag.cachedModels')) + ': ' + escapeHtml(String(d.cachedModelCount || 0)) + '</span>' +
         '</div>'
       ).join('') + '</div>';
+  }
+
+  function renderExternalIdpDiagnostics(data) {
+    const box = $('externalIdpDiagnosticsBody');
+    if (!box) return;
+    const summary = (data && data.summary) || {};
+    const items = (data && data.items) || [];
+    if (!items.length) {
+      box.innerHTML = '<div class="empty-state">' + escapeHtml(t('externalIdpDiag.empty')) + '</div>';
+      return;
+    }
+    box.innerHTML =
+      '<div class="diag-summary">' +
+      '<span>' + escapeHtml(t('externalIdpDiag.total')) + ': <strong>' + escapeHtml(String(summary.totalExternalIdp || 0)) + '</strong></span>' +
+      '<span>' + escapeHtml(t('externalIdpDiag.healthy')) + ': <strong>' + escapeHtml(String(summary.healthy || 0)) + '</strong></span>' +
+      '<span>' + escapeHtml(t('externalIdpDiag.warning')) + ': <strong>' + escapeHtml(String(summary.warning || 0)) + '</strong></span>' +
+      '<span>' + escapeHtml(t('externalIdpDiag.error')) + ': <strong>' + escapeHtml(String(summary.error || 0)) + '</strong></span>' +
+      '</div>' +
+      '<div class="diag-list">' + items.map(item => {
+        const messages = item.messages || [];
+        const cls = item.status === 'healthy' ? 'diag-chip--ok' : 'diag-chip--warn';
+        return '<div class="diag-chip ' + cls + '">' +
+          '<strong>' + escapeHtml(accountLabel(item.accountId, item.email)) + '</strong>' +
+          '<span>' + escapeHtml(item.status || '-') + '</span>' +
+          '<span>' + escapeHtml(t('externalIdpDiag.endpoint')) + ': ' + escapeHtml((item.safeMeta && item.safeMeta.tokenEndpoint) || '-') + '</span>' +
+          (messages.length ? '<span>' + messages.map(escapeHtml).join('<br>') + '</span>' : '') +
+          '<button class="btn btn-secondary btn-sm" data-action="externalIdpLiveCheck" data-id="' + escapeAttr(item.accountId || '') + '">' + escapeHtml(t('externalIdpDiag.liveCheck')) + '</button>' +
+          '</div>';
+      }).join('') + '</div>';
+  }
+
+  function renderAuditLogs(data) {
+    const box = $('auditLogsBody');
+    if (!box) return;
+    const logs = (data && data.logs) || [];
+    if (!logs.length) {
+      box.innerHTML = '<div class="empty-state">' + escapeHtml(t('audit.empty')) + '</div>';
+      return;
+    }
+    box.innerHTML = '<div class="diag-list">' + logs.slice(0, 100).map(log =>
+      '<div class="diag-chip ' + (log.status === 'success' ? 'diag-chip--ok' : 'diag-chip--warn') + '">' +
+      '<strong>' + escapeHtml(log.category || '-') + ' / ' + escapeHtml(log.action || '-') + '</strong>' +
+      '<span>' + escapeHtml(log.status || '-') + ' · ' + escapeHtml(formatDateTime(log.time)) + '</span>' +
+      '<span>' + escapeHtml(accountLabel(log.accountId, log.accountEmail)) + '</span>' +
+      (log.reason ? '<span>' + escapeHtml(log.reason) + '</span>' : '') +
+      '</div>'
+    ).join('') + '</div>';
+  }
+
+  async function runExternalIdpLiveCheck(accountId) {
+    if (!accountId) return;
+    const res = await api('/accounts/external-idp-diagnostics/live', { method: 'POST', body: JSON.stringify({ accountId }) });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok || data.success === false) return toastError((data && data.error) || t('common.failed'));
+    toast(t('externalIdpDiag.liveSuccess'), 'success');
+    await Promise.all([loadExternalIdpDiagnostics(), loadAccounts()]);
   }
 
   function renderAccounts() {
@@ -2780,15 +2854,22 @@
       box.textContent = t('recovery.previewEmpty');
       return;
     }
-    box.innerHTML = items.map(item =>
-      '<div class="recovery-preview-item">' +
-      '<strong>#' + escapeHtml(String(item.index || 1)) + ' ' + escapeHtml(item.email || t('common.unknownError')) + '</strong>' +
-      '<div>' + escapeHtml(item.authMethod || '-') + ' / ' + escapeHtml(item.provider || '-') + '</div>' +
-      '<div>' + escapeHtml(t('recovery.material')) + ': refresh=' + escapeHtml(String(!!item.hasRefreshToken)) + ', access=' + escapeHtml(String(!!item.hasAccessToken)) + ', clientId=' + escapeHtml(String(!!item.hasClientId)) + '</div>' +
-      (item.tokenEndpoint ? '<div>' + escapeHtml(t('recovery.tokenEndpoint')) + ': ' + escapeHtml(item.tokenEndpoint) + '</div>' : '') +
-      (item.willReplaceEmail ? '<div class="warning-text">' + escapeHtml(t('recovery.willReplace')) + '</div>' : '') +
-      '</div>'
-    ).join('');
+    box.innerHTML = items.map(item => {
+      const warnings = (item.warnings || []).concat((item.conflicts || []).map(c => c.message || c.type));
+      const errors = item.errors || [];
+      return '<div class="recovery-preview-item ' + (item.valid === false ? 'is-error' : '') + '">' +
+        '<strong>#' + escapeHtml(String(item.index || 1)) + ' ' + escapeHtml(item.email || t('common.unknownError')) + '</strong>' +
+        '<div>' + escapeHtml(item.authMethodNormalized || item.authMethod || '-') + ' / ' + escapeHtml(item.provider || '-') + ' · ' + escapeHtml(item.importMode || '-') + '</div>' +
+        '<div>' + escapeHtml(t('recovery.material')) + ': refresh=' + escapeHtml(String(!!item.hasRefreshToken)) + ', access=' + escapeHtml(String(!!item.hasAccessToken)) + ', clientId=' + escapeHtml(String(!!item.hasClientId)) + '</div>' +
+        (item.tokenEndpoint ? '<div>' + escapeHtml(t('recovery.tokenEndpoint')) + ': ' + escapeHtml(item.tokenEndpoint) + '</div>' : '') +
+        (item.issuerUrl ? '<div>' + escapeHtml(t('recovery.issuerUrl')) + ': ' + escapeHtml(item.issuerUrl) + '</div>' : '') +
+        (item.derived && item.derived.source ? '<div>' + escapeHtml(t('recovery.derivedFrom')) + ': ' + escapeHtml(item.derived.source) + '</div>' : '') +
+        (item.validation && item.validation.endpointReason ? '<div>' + escapeHtml(t('recovery.endpointValidation')) + ': ' + escapeHtml(item.validation.endpointReason) + '</div>' : '') +
+        (item.trustOnImport ? '<div class="warning-text">' + escapeHtml(t('recovery.trustOnImport')) + '</div>' : '') +
+        (warnings.length ? '<div class="warning-text">' + warnings.map(escapeHtml).join('<br>') + '</div>' : '') +
+        (errors.length ? '<div class="error-text">' + errors.map(escapeHtml).join('<br>') + '</div>' : '') +
+        '</div>';
+    }).join('');
   }
 
   async function previewIdeCache() {
@@ -3169,6 +3250,8 @@
     qsa('.tool-panel').forEach(panel => panel.classList.toggle('hidden', panel.id !== panelId));
     qsa('.tool-launch-btn').forEach(btn => btn.classList.toggle('active', btn.dataset.toolPanel === panelId));
     if (panelId === 'accountDiagnosticsCard') loadAccountDiagnostics();
+    if (panelId === 'externalIdpDiagnosticsCard') loadExternalIdpDiagnostics();
+    if (panelId === 'auditLogsCard') loadAuditLogs();
     const panel = $(panelId);
     if (panel) panel.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
   }
@@ -3625,6 +3708,15 @@
     bindTestEvents();
     const refreshDiagnosticsBtn = $('refreshDiagnosticsBtn');
     if (refreshDiagnosticsBtn) refreshDiagnosticsBtn.addEventListener('click', loadAccountDiagnostics);
+    const refreshExternalIdpDiagnosticsBtn = $('refreshExternalIdpDiagnosticsBtn');
+    if (refreshExternalIdpDiagnosticsBtn) refreshExternalIdpDiagnosticsBtn.addEventListener('click', loadExternalIdpDiagnostics);
+    const externalBody = $('externalIdpDiagnosticsBody');
+    if (externalBody) externalBody.addEventListener('click', e => {
+      const btn = e.target.closest('button[data-action="externalIdpLiveCheck"]');
+      if (btn) runExternalIdpLiveCheck(btn.dataset.id);
+    });
+    const refreshAuditLogsBtn = $('refreshAuditLogsBtn');
+    if (refreshAuditLogsBtn) refreshAuditLogsBtn.addEventListener('click', loadAuditLogs);
     const checkRoutingBtn = $('checkModelRoutingBtn');
     if (checkRoutingBtn) checkRoutingBtn.addEventListener('click', checkModelRouting);
     const routingInput = $('routingModelInput');

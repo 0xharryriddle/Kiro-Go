@@ -98,7 +98,7 @@ curl http://localhost:8080/v1/chat/completions \
 
 ## 运维
 
-生产健康检查、配置备份/恢复、凭据恢复、账号/模型诊断、请求回放 dry-run、日志、指标和部署验证步骤见 [docs/operator-runbook.md](docs/operator-runbook.md)。
+生产健康检查、配置备份/恢复、凭据恢复、账号/模型诊断、请求回放 dry-run、日志、指标和部署验证步骤见 [docs/operator-runbook.md](docs/operator-runbook.md)。外部 IdP 导入预览、冲突决策、诊断和审计行为见 [docs/external-idp-import.md](docs/external-idp-import.md)。
 
 ## 思考模式
 
