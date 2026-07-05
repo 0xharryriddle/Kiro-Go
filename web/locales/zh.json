@@ -668,5 +668,15 @@
   "settings.webhookURLHint": "可选。设置后，安全/警告事件（账号被封、检测到外部使用、自动禁用）将以 JSON POST 到该 URL（兼容 Slack/Discord）。仅发送安全字段，绝不包含令牌、密钥或提示内容。留空则禁用。",
   "settings.metricsEnabled": "Prometheus 指标端点",
   "settings.metricsEnabledHint": "对外暴露公开、免鉴权的 Prometheus /metrics 抓取端点。仅包含聚合运营指标（不含任何密钥）。仅在抓取路径已由网络策略保护时启用。",
-  "apiKeys.byModel": "按模型"
+  "apiKeys.byModel": "按模型",
+  "anomaly.title": "使用异常",
+  "anomaly.desc": "检测每个账号的使用峰值：最近 1 小时的请求速率与该账号自身 24 小时的基线对比。",
+  "anomaly.heuristicNote": "基于最近请求量与账号自身基线的启发式判断。它标记的是偏离既有历史的情况——属于早期信号，而非滥用的证据。",
+  "anomaly.empty": "没有可分析的账号。",
+  "anomaly.ratio": "最近/基线 比值",
+  "anomaly.recent": "最近（1 小时）",
+  "anomaly.baseline": "基线（24 小时）",
+  "anomaly.tier.normal": "正常",
+  "anomaly.tier.spike": "峰值",
+  "anomaly.tier.unknown": "未知"
 }

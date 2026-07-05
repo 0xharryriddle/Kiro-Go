@@ -668,5 +668,15 @@
   "settings.webhookURLHint": "Optional. When set, security/warning events (account banned, external usage detected, auto-disable) are POSTed to this URL (Slack/Discord-compatible). Only safe fields are sent — never tokens, secrets, or prompts. Leave empty to disable.",
   "settings.metricsEnabled": "Prometheus Metrics Endpoint",
   "settings.metricsEnabledHint": "Expose a public, unauthenticated Prometheus /metrics endpoint for scraping. Only aggregate operational gauges (no secrets). Enable only when the scrape path is protected by network policy.",
-  "apiKeys.byModel": "By model"
+  "apiKeys.byModel": "By model",
+  "anomaly.title": "Usage Anomaly",
+  "anomaly.desc": "Detects per-account usage spikes: recent 1h request rate vs the account's own 24h baseline.",
+  "anomaly.heuristicNote": "Heuristic over recent request volume vs the account's own baseline. It flags deviation from established history — an early signal, not proof of misuse.",
+  "anomaly.empty": "No accounts to analyze.",
+  "anomaly.ratio": "Recent/baseline ratio",
+  "anomaly.recent": "Recent (1h)",
+  "anomaly.baseline": "Baseline (24h)",
+  "anomaly.tier.normal": "Normal",
+  "anomaly.tier.spike": "Spike",
+  "anomaly.tier.unknown": "Unknown"
 }

@@ -1436,6 +1436,56 @@
     }).join('') + '</div>';
   }
 
+  async function loadUsageAnomaly() {
+    const box = $('usageAnomalyBody');
+    if (box) box.textContent = t('diag.loading');
+    const res = await api('/accounts/usage-anomaly');
+    if (!res.ok) return;
+    const data = await res.json();
+    renderUsageAnomaly(data);
+  }
+
+  function anomalyTierMeta(tier) {
+    switch (tier) {
+      case 'normal': return { cls: 'usage-badge--clean', label: t('anomaly.tier.normal') };
+      case 'spike': return { cls: 'usage-badge--strong', label: t('anomaly.tier.spike') };
+      default: return { cls: 'usage-badge--unknown', label: t('anomaly.tier.unknown') };
+    }
+  }
+
+  function renderUsageAnomaly(data) {
+    const summaryBox = $('usageAnomalySummary');
+    const box = $('usageAnomalyBody');
+    if (!box) return;
+    const summary = (data && data.summary) || {};
+    const items = (data && data.items) || [];
+    if (summaryBox) {
+      summaryBox.innerHTML =
+        '<span class="usage-badge usage-badge--strong">' + escapeHtml(t('anomaly.tier.spike')) + ': <strong>' + escapeHtml(String(summary.spike || 0)) + '</strong></span>' +
+        '<span class="usage-badge usage-badge--clean">' + escapeHtml(t('anomaly.tier.normal')) + ': <strong>' + escapeHtml(String(summary.normal || 0)) + '</strong></span>' +
+        '<span class="usage-badge usage-badge--unknown">' + escapeHtml(t('anomaly.tier.unknown')) + ': <strong>' + escapeHtml(String(summary.unknown || 0)) + '</strong></span>';
+    }
+    if (!items.length) {
+      box.innerHTML = '<div class="empty-state">' + escapeHtml(t('anomaly.empty')) + '</div>';
+      return;
+    }
+    box.innerHTML = '<div class="diag-list">' + items.map(item => {
+      const meta = anomalyTierMeta(item.tier);
+      const chipCls = item.tier === 'spike' ? 'diag-chip--warn' : 'diag-chip--ok';
+      const ratioStr = item.tier === 'unknown' ? '-' : (Number(item.ratio) || 0).toFixed(1) + 'x';
+      return '<div class="diag-chip ' + chipCls + '">' +
+        '<div class="usage-row-head">' +
+          '<strong>' + escapeHtml(accountLabel(item.accountId, item.email)) + '</strong>' +
+          '<span class="usage-badge ' + meta.cls + '">' + escapeHtml(meta.label) + '</span>' +
+          (item.enabled ? '' : '<span class="usage-flag">' + escapeHtml(t('forecast.disabled')) + '</span>') +
+        '</div>' +
+        '<span>' + escapeHtml(t('anomaly.ratio')) + ': <strong>' + escapeHtml(ratioStr) + '</strong></span>' +
+        '<span>' + escapeHtml(t('anomaly.recent')) + ': ' + escapeHtml(String(item.recentRequests || 0)) +
+          ' · ' + escapeHtml(t('anomaly.baseline')) + ': ' + escapeHtml(String(item.baselineRequests || 0)) + '</span>' +
+        '</div>';
+    }).join('') + '</div>';
+  }
+
   async function runExternalIdpLiveCheck(accountId) {
     if (!accountId) return;
     const res = await api('/accounts/external-idp-diagnostics/live', { method: 'POST', body: JSON.stringify({ accountId }) });
@@ -3567,6 +3617,7 @@
     if (panelId === 'fleetForecastCard') loadFleetForecast();
     if (panelId === 'accountHealthCard') loadAccountHealth();
     if (panelId === 'modelMatrixCard') loadModelMatrix();
+    if (panelId === 'usageAnomalyCard') loadUsageAnomaly();
     const panel = $(panelId);
     if (panel) panel.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
   }
@@ -4040,6 +4091,8 @@
     if (refreshAccountHealthBtn) refreshAccountHealthBtn.addEventListener('click', loadAccountHealth);
     const refreshModelMatrixBtn = $('refreshModelMatrixBtn');
     if (refreshModelMatrixBtn) refreshModelMatrixBtn.addEventListener('click', loadModelMatrix);
+    const refreshUsageAnomalyBtn = $('refreshUsageAnomalyBtn');
+    if (refreshUsageAnomalyBtn) refreshUsageAnomalyBtn.addEventListener('click', loadUsageAnomaly);
     const recheckUsageAuditBtn = $('recheckUsageAuditBtn');
     if (recheckUsageAuditBtn) recheckUsageAuditBtn.addEventListener('click', () => recheckUsageAudit());
     const usageAuditBody = $('usageAuditBody');

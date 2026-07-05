@@ -2542,6 +2542,8 @@ func (h *Handler) handleAdminAPI(w http.ResponseWriter, r *http.Request) {
 		h.apiGetAccountHealth(w, r)
 	case path == "/accounts/model-matrix" && r.Method == "GET":
 		h.apiGetModelMatrix(w, r)
+	case path == "/accounts/usage-anomaly" && r.Method == "GET":
+		h.apiGetUsageAnomaly(w, r)
 	// models/refresh 必须在通用 /refresh 前匹配，否则会被误拦截
 	case path == "/accounts/models/refresh" && r.Method == "POST":
 		h.apiRefreshAllAccountsModels(w, r)

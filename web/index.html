@@ -255,6 +255,7 @@
           <button type="button" class="btn btn-outline btn-sm tool-launch-btn" data-tool-panel="fleetForecastCard" data-i18n="forecast.title"></button>
           <button type="button" class="btn btn-outline btn-sm tool-launch-btn" data-tool-panel="accountHealthCard" data-i18n="health.title"></button>
           <button type="button" class="btn btn-outline btn-sm tool-launch-btn" data-tool-panel="modelMatrixCard" data-i18n="matrix.title"></button>
+          <button type="button" class="btn btn-outline btn-sm tool-launch-btn" data-tool-panel="usageAnomalyCard" data-i18n="anomaly.title"></button>
           <button type="button" class="btn btn-outline btn-sm tool-launch-btn" data-tool-panel="auditLogsCard" data-i18n="audit.title"></button>
         </div>
 
@@ -346,6 +347,17 @@
         <p class="muted-text" data-i18n="matrix.desc"></p>
         <div id="modelMatrixSummary" class="usage-audit-summary"></div>
         <div id="modelMatrixBody" class="diag-body muted-text" data-i18n="diag.loading"></div>
+      </div>
+
+      <div class="card tool-panel hidden" id="usageAnomalyCard">
+        <div class="card-header">
+          <span class="card-title" data-i18n="anomaly.title"></span>
+          <button class="btn btn-outline btn-sm" id="refreshUsageAnomalyBtn" data-i18n="common.refresh"></button>
+        </div>
+        <p class="muted-text" data-i18n="anomaly.desc"></p>
+        <div id="usageAnomalySummary" class="usage-audit-summary"></div>
+        <div id="usageAnomalyBody" class="diag-body muted-text" data-i18n="diag.loading"></div>
+        <p class="muted-text usage-audit-note" data-i18n="anomaly.heuristicNote"></p>
       </div>
 
       <div class="card tool-panel hidden" id="auditLogsCard">
