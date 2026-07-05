@@ -622,5 +622,7 @@
   "usageAudit.confidence.strongExternal": "Strong external",
   "usageAudit.confidence.unknown": "Unknown",
   "settings.quotaAwareRouting": "Quota-Aware Routing",
-  "settings.quotaAwareRoutingHint": "When enabled, requests are routed to the account with the most remaining period quota instead of blind round-robin. Falls back to round-robin when quota data is unavailable."
+  "settings.quotaAwareRoutingHint": "When enabled, requests are routed to the account with the most remaining period quota instead of blind round-robin. Falls back to round-robin when quota data is unavailable.",
+  "settings.externalUsageAutoDisable": "Auto-disable on external usage",
+  "settings.externalUsageAutoDisableHint": "When enabled, an account is automatically disabled for local routing the first time it is confirmed to be used outside this proxy (strong external usage). Reversible: re-enable it in Accounts. Does not affect the upstream Kiro account."
 }

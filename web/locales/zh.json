@@ -622,5 +622,7 @@
   "usageAudit.confidence.strongExternal": "强外部",
   "usageAudit.confidence.unknown": "未知",
   "settings.quotaAwareRouting": "配额感知路由",
-  "settings.quotaAwareRoutingHint": "开启后，请求将路由到剩余周期配额最多的账号，而非简单轮询。当配额数据不可用时回退到轮询。"
+  "settings.quotaAwareRoutingHint": "开启后，请求将路由到剩余周期配额最多的账号，而非简单轮询。当配额数据不可用时回退到轮询。",
+  "settings.externalUsageAutoDisable": "检测到外部使用时自动禁用",
+  "settings.externalUsageAutoDisableHint": "开启后，当账号首次被确认在本代理之外被使用（强外部使用）时，会自动停止本代理对其路由。可逆：可在账号列表中重新启用。不影响上游 Kiro 账号。"
 }

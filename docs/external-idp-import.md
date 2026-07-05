@@ -113,6 +113,21 @@ no upstream calls. `POST /admin/api/accounts/usage-audit/recheck` (optionally wi
 transition into `external`/`strong_external` emits a `security` /
 `external_usage_detected` audit event.
 
+### Auto-action (optional, off by default)
+
+When **external-usage auto-disable** is enabled in Settings, the first time an
+account crosses into the unambiguous `strong_external` tier (disabled for local
+routing yet upstream usage grew — third-party use we did not drive), the proxy
+auto-disables local routing for that account and emits an
+`external_usage_auto_disabled` audit event.
+
+- Only `strong_external` triggers this — never the softer `external` tier — to
+  avoid disabling on metering-lag noise.
+- The disable only stops **this proxy** from routing to the account; the upstream
+  Kiro account is untouched.
+- It is reversible: re-enable the account in the Accounts tab.
+- Default is off; the fleet behaves exactly as before unless you opt in.
+
 ## Audit Logs
 
 Audit logs record safe operational events for previews, imports, replacements,

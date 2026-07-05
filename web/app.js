@@ -1923,6 +1923,7 @@
     $('requireApiKey').checked = d.requireApiKey;
     $('allowOverUsage').checked = d.allowOverUsage || false;
     if ($('quotaAwareRouting')) $('quotaAwareRouting').checked = d.quotaAwareRouting || false;
+    if ($('externalUsageAutoDisable')) $('externalUsageAutoDisable').checked = d.externalUsageAutoDisable || false;
     await Promise.all([loadThinkingConfig(), loadEndpointConfig(), loadProxyConfig(), loadPromptFilter(), loadApiKeys(), loadConfigStatus()]);
     refreshCustomSelects();
   }
@@ -2029,7 +2030,8 @@
   async function saveOverUsageConfig() {
     const allowOverUsage = $('allowOverUsage').checked;
     const quotaAwareRouting = $('quotaAwareRouting') ? $('quotaAwareRouting').checked : false;
-    await api('/settings', { method: 'POST', body: JSON.stringify({ allowOverUsage, quotaAwareRouting }) });
+    const externalUsageAutoDisable = $('externalUsageAutoDisable') ? $('externalUsageAutoDisable').checked : false;
+    await api('/settings', { method: 'POST', body: JSON.stringify({ allowOverUsage, quotaAwareRouting, externalUsageAutoDisable }) });
     toast(t('settings.overUsageSaved'), 'success');
   }
   function formatDateTime(ts) {

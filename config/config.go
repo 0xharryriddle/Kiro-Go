@@ -209,6 +209,15 @@ type Config struct {
 	// quota data is stale or absent. Fully reversible via this toggle.
 	QuotaAwareRouting bool `json:"quotaAwareRouting,omitempty"`
 
+	// ExternalUsageAutoDisable, when enabled, auto-disables local routing for an
+	// account the first time it crosses into "strong_external" usage (disabled
+	// upstream growth we did not drive = unambiguous third-party use). Defaults to
+	// false. The disable is reversible (re-enable in Accounts); it only stops THIS
+	// proxy from routing, it does not touch the upstream Kiro account. Only the
+	// unambiguous strong_external tier triggers it, never the softer "external"
+	// tier, to avoid disabling on metering-lag noise.
+	ExternalUsageAutoDisable bool `json:"externalUsageAutoDisable,omitempty"`
+
 	// Proxy configuration: optional outbound proxy for Kiro API requests
 	// Format: "socks5://host:port", "socks5://user:pass@host:port",
 	//         "http://host:port",  "http://user:pass@host:port"
@@ -1224,6 +1233,26 @@ func UpdateQuotaAwareRouting(enabled bool) error {
 	cfgLock.Lock()
 	defer cfgLock.Unlock()
 	cfg.QuotaAwareRouting = enabled
+	return Save()
+}
+
+// GetExternalUsageAutoDisable returns whether auto-disable on strong_external
+// usage is enabled. Defaults to false.
+func GetExternalUsageAutoDisable() bool {
+	cfgLock.RLock()
+	defer cfgLock.RUnlock()
+	if cfg == nil {
+		return false
+	}
+	return cfg.ExternalUsageAutoDisable
+}
+
+// UpdateExternalUsageAutoDisable sets the external-usage auto-disable toggle and
+// persists it.
+func UpdateExternalUsageAutoDisable(enabled bool) error {
+	cfgLock.Lock()
+	defer cfgLock.Unlock()
+	cfg.ExternalUsageAutoDisable = enabled
 	return Save()
 }
 

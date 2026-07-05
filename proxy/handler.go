@@ -407,6 +407,35 @@ func (h *Handler) recomputeExternalUsage(accountID string, info *config.AccountI
 				"periodKey":       next.PeriodKey,
 			},
 		})
+
+		// F3: external-usage auto-action. When enabled, auto-disable local
+		// routing on the FIRST crossing into the unambiguous strong_external
+		// tier (account disabled upstream yet usage grew = third-party use we
+		// did not drive). Only strong_external triggers this, never the softer
+		// "external" tier, to avoid disabling on metering-lag noise. The disable
+		// only stops THIS proxy from routing; the upstream Kiro account is
+		// untouched and it is reversible by re-enabling in Accounts.
+		if next.Confidence == config.ExternalConfidenceStrongExternal &&
+			accOk && acc.Enabled && config.GetExternalUsageAutoDisable() {
+			if err := config.SetAccountBanStatus(accountID, "DISABLED", "auto-disabled: external usage detected"); err != nil {
+				logger.Warnf("[ExternalUsage] auto-disable failed for %s: %v", accountID, err)
+			} else {
+				logger.Warnf("[ExternalUsage] auto-disabled %s: strong external usage detected (%.2f external credits)", email, next.Estimate)
+				h.pool.Reload()
+				h.appendAuditLog(AuditLog{
+					Category:     "security",
+					Action:       "external_usage_auto_disabled",
+					Status:       "warning",
+					AccountID:    accountID,
+					AccountEmail: email,
+					Reason:       next.Confidence,
+					SafeDetails: map[string]string{
+						"externalCredits": strconv.FormatFloat(next.Estimate, 'f', 2, 64),
+						"periodKey":       next.PeriodKey,
+					},
+				})
+			}
+		}
 	}
 	return next
 }
@@ -4190,12 +4219,13 @@ func (h *Handler) apiGetStatus(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) apiGetSettings(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]interface{}{
-		"apiKey":            config.GetApiKey(),
-		"requireApiKey":     config.IsApiKeyRequired(),
-		"port":              config.GetPort(),
-		"host":              config.GetHost(),
-		"allowOverUsage":    config.GetAllowOverUsage(),
-		"quotaAwareRouting": config.GetQuotaAwareRouting(),
+		"apiKey":                   config.GetApiKey(),
+		"requireApiKey":            config.IsApiKeyRequired(),
+		"port":                     config.GetPort(),
+		"host":                     config.GetHost(),
+		"allowOverUsage":           config.GetAllowOverUsage(),
+		"quotaAwareRouting":        config.GetQuotaAwareRouting(),
+		"externalUsageAutoDisable": config.GetExternalUsageAutoDisable(),
 	})
 }
 
@@ -4282,11 +4312,12 @@ func (h *Handler) apiGetSecurityStatus(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) apiUpdateSettings(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		ApiKey            *string `json:"apiKey,omitempty"`
-		RequireApiKey     *bool   `json:"requireApiKey,omitempty"`
-		Password          string  `json:"password,omitempty"`
-		AllowOverUsage    *bool   `json:"allowOverUsage,omitempty"`
-		QuotaAwareRouting *bool   `json:"quotaAwareRouting,omitempty"`
+		ApiKey                   *string `json:"apiKey,omitempty"`
+		RequireApiKey            *bool   `json:"requireApiKey,omitempty"`
+		Password                 string  `json:"password,omitempty"`
+		AllowOverUsage           *bool   `json:"allowOverUsage,omitempty"`
+		QuotaAwareRouting        *bool   `json:"quotaAwareRouting,omitempty"`
+		ExternalUsageAutoDisable *bool   `json:"externalUsageAutoDisable,omitempty"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		w.WriteHeader(400)
@@ -4315,6 +4346,17 @@ func (h *Handler) apiUpdateSettings(w http.ResponseWriter, r *http.Request) {
 	// reads the toggle live on each selection.
 	if req.QuotaAwareRouting != nil {
 		if err := config.UpdateQuotaAwareRouting(*req.QuotaAwareRouting); err != nil {
+			w.WriteHeader(500)
+			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+	}
+
+	// Update external-usage auto-disable toggle. No pool rebuild needed — the
+	// action fires on the next external-usage recompute (background refresh or
+	// explicit recheck).
+	if req.ExternalUsageAutoDisable != nil {
+		if err := config.UpdateExternalUsageAutoDisable(*req.ExternalUsageAutoDisable); err != nil {
 			w.WriteHeader(500)
 			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
 			return
