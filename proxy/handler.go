@@ -23,16 +23,17 @@ const tokenRefreshSkewSeconds int64 = 120
 
 // RequestLog stores details about a single API request (success or failure).
 type RequestLog struct {
-	Time      int64   `json:"time"`      // Unix timestamp
-	Endpoint  string  `json:"endpoint"`  // endpoint type
-	Model     string  `json:"model"`     // model name
-	AccountID string  `json:"accountId"` // account ID used
-	Status    string  `json:"status"`    // success/error
-	Tokens    int     `json:"tokens"`    // estimated tokens
-	Credits   float64 `json:"credits"`   // credits used
-	Error     string  `json:"error,omitempty"`
-	ErrorType string  `json:"errorType,omitempty"`
-	Duration  int64   `json:"duration"` // duration in ms
+	Time         int64   `json:"time"`         // Unix timestamp
+	Endpoint     string  `json:"endpoint"`     // endpoint type
+	Model        string  `json:"model"`        // model name
+	AccountID    string  `json:"accountId"`    // account ID used
+	AccountEmail string  `json:"accountEmail"` // account email/label captured at request time
+	Status       string  `json:"status"`       // success/error
+	Tokens       int     `json:"tokens"`       // estimated tokens
+	Credits      float64 `json:"credits"`      // credits used
+	Error        string  `json:"error,omitempty"`
+	ErrorType    string  `json:"errorType,omitempty"`
+	Duration     int64   `json:"duration"` // duration in ms
 }
 
 type replayDiagnosticRequest struct {
@@ -964,6 +965,7 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 	startInputTokens := estimatedInputTokens
 	excluded := make(map[string]bool)
 	var lastErr error
+	var lastAccountID string
 	messageStarted := false
 	var messageStartUsage promptCacheUsage
 
@@ -992,6 +994,7 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 		if account == nil {
 			break
 		}
+		lastAccountID = account.ID
 		if err := h.ensureValidToken(account); err != nil {
 			lastErr = err
 			excluded[account.ID] = true
@@ -1384,7 +1387,7 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 		return
 	}
 
-	h.recordFailureWithDetails("claude", model, "", lastErr)
+	h.recordFailureWithDetails("claude", model, lastAccountID, lastErr)
 	status := statusForUpstreamError(lastErr)
 	applyRetryAfterHeader(w, lastErr)
 	h.sendClaudeError(w, status, "api_error", lastErr.Error())
@@ -1471,13 +1474,14 @@ func (h *Handler) recordFailureWithDetails(endpoint, model, accountID string, er
 	errType := classifyError(errMsg)
 
 	entry := RequestLog{
-		Time:      time.Now().Unix(),
-		Endpoint:  endpoint,
-		Model:     model,
-		AccountID: accountID,
-		Status:    "error",
-		Error:     errMsg,
-		ErrorType: errType,
+		Time:         time.Now().Unix(),
+		Endpoint:     endpoint,
+		Model:        model,
+		AccountID:    accountID,
+		AccountEmail: requestLogAccountEmail(accountID),
+		Status:       "error",
+		Error:        errMsg,
+		ErrorType:    errType,
 	}
 
 	h.appendRequestLog(entry)
@@ -1486,17 +1490,30 @@ func (h *Handler) recordFailureWithDetails(endpoint, model, accountID string, er
 // recordSuccessLog records a successful request in the request logs.
 func (h *Handler) recordSuccessLog(endpoint, model, accountID string, tokens int, credits float64, durationMs int64) {
 	entry := RequestLog{
-		Time:      time.Now().Unix(),
-		Endpoint:  endpoint,
-		Model:     model,
-		AccountID: accountID,
-		Status:    "success",
-		Tokens:    tokens,
-		Credits:   credits,
-		Duration:  durationMs,
+		Time:         time.Now().Unix(),
+		Endpoint:     endpoint,
+		Model:        model,
+		AccountID:    accountID,
+		AccountEmail: requestLogAccountEmail(accountID),
+		Status:       "success",
+		Tokens:       tokens,
+		Credits:      credits,
+		Duration:     durationMs,
 	}
 
 	h.appendRequestLog(entry)
+}
+
+func requestLogAccountEmail(accountID string) string {
+	if strings.TrimSpace(accountID) == "" {
+		return ""
+	}
+	for _, acc := range config.GetAccounts() {
+		if acc.ID == accountID {
+			return strings.TrimSpace(acc.Email)
+		}
+	}
+	return ""
 }
 
 func (h *Handler) appendRequestLog(entry RequestLog) {
@@ -1590,6 +1607,7 @@ func (h *Handler) getRequestLogs() []RequestLog {
 func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayload, model string, thinking bool, thinkingOpts claudeThinkingResponseOptions, estimatedInputTokens int, cacheProfile *promptCacheProfile, apiKeyID string) {
 	excluded := make(map[string]bool)
 	var lastErr error
+	var lastAccountID string
 	reqStart := time.Now()
 
 	for attempt := 0; attempt < maxAccountRetryAttempts; attempt++ {
@@ -1597,6 +1615,7 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayl
 		if account == nil {
 			break
 		}
+		lastAccountID = account.ID
 		if err := h.ensureValidToken(account); err != nil {
 			lastErr = err
 			excluded[account.ID] = true
@@ -1704,7 +1723,7 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayl
 		return
 	}
 
-	h.recordFailureWithDetails("claude", model, "", lastErr)
+	h.recordFailureWithDetails("claude", model, lastAccountID, lastErr)
 	status := statusForUpstreamError(lastErr)
 	applyRetryAfterHeader(w, lastErr)
 	h.sendClaudeError(w, status, "api_error", lastErr.Error())
@@ -1779,6 +1798,7 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 	chatID := "chatcmpl-" + uuid.New().String()
 	excluded := make(map[string]bool)
 	var lastErr error
+	var lastAccountID string
 	reqStart := time.Now()
 
 	for attempt := 0; attempt < maxAccountRetryAttempts; attempt++ {
@@ -1786,6 +1806,7 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 		if account == nil {
 			break
 		}
+		lastAccountID = account.ID
 		if err := h.ensureValidToken(account); err != nil {
 			lastErr = err
 			excluded[account.ID] = true
@@ -2148,7 +2169,7 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 		return
 	}
 
-	h.recordFailureWithDetails("openai", model, "", lastErr)
+	h.recordFailureWithDetails("openai", model, lastAccountID, lastErr)
 	status := statusForUpstreamError(lastErr)
 	applyRetryAfterHeader(w, lastErr)
 	h.sendOpenAIError(w, status, errorTypeForOpenAIStatus(status), lastErr.Error())
@@ -2158,6 +2179,7 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, payload *KiroPayload, model string, thinking bool, estimatedInputTokens int, apiKeyID string) {
 	excluded := make(map[string]bool)
 	var lastErr error
+	var lastAccountID string
 	reqStart := time.Now()
 
 	for attempt := 0; attempt < maxAccountRetryAttempts; attempt++ {
@@ -2165,6 +2187,7 @@ func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, payload *KiroPayl
 		if account == nil {
 			break
 		}
+		lastAccountID = account.ID
 		if err := h.ensureValidToken(account); err != nil {
 			lastErr = err
 			excluded[account.ID] = true
@@ -2234,7 +2257,7 @@ func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, payload *KiroPayl
 		return
 	}
 
-	h.recordFailureWithDetails("openai", model, "", lastErr)
+	h.recordFailureWithDetails("openai", model, lastAccountID, lastErr)
 	status := statusForUpstreamError(lastErr)
 	applyRetryAfterHeader(w, lastErr)
 	h.sendOpenAIError(w, status, errorTypeForOpenAIStatus(status), lastErr.Error())
@@ -3852,7 +3875,7 @@ func filterRequestLogs(logs []RequestLog, status, query string, limit int) []Req
 			continue
 		}
 		if query != "" {
-			haystack := strings.ToLower(strings.Join([]string{log.Endpoint, log.Model, log.AccountID, log.Status, log.ErrorType, log.Error}, " "))
+			haystack := strings.ToLower(strings.Join([]string{log.Endpoint, log.Model, log.AccountID, log.AccountEmail, log.Status, log.ErrorType, log.Error}, " "))
 			if !strings.Contains(haystack, query) {
 				continue
 			}
@@ -3873,10 +3896,10 @@ func (h *Handler) apiGetLogs(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/csv; charset=utf-8")
 		w.Header().Set("Content-Disposition", "attachment; filename=kiro-go-request-logs.csv")
 		cw := csv.NewWriter(w)
-		_ = cw.Write([]string{"time", "endpoint", "model", "accountId", "status", "errorType", "error", "tokens", "credits", "durationMs"})
+		_ = cw.Write([]string{"time", "endpoint", "model", "accountId", "accountEmail", "status", "errorType", "error", "tokens", "credits", "durationMs"})
 		for _, log := range logs {
 			_ = cw.Write([]string{
-				fmt.Sprintf("%d", log.Time), log.Endpoint, log.Model, log.AccountID, log.Status, log.ErrorType, log.Error,
+				fmt.Sprintf("%d", log.Time), log.Endpoint, log.Model, log.AccountID, log.AccountEmail, log.Status, log.ErrorType, log.Error,
 				fmt.Sprintf("%d", log.Tokens), fmt.Sprintf("%.6f", log.Credits), fmt.Sprintf("%d", log.Duration),
 			})
 		}

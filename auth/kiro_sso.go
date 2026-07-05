@@ -165,6 +165,10 @@ func StartKiroSsoLogin(region string) (*KiroSsoSession, string, error) {
 		region = "us-east-1"
 	}
 
+	// The redirect port is fixed; abandon stale sessions before rebinding so a
+	// second Start Login can recover from an interrupted browser flow immediately.
+	CancelAllKiroSsoLogins()
+
 	verifier := generateCodeVerifier()
 	challenge := generateCodeChallenge(verifier)
 	state := uuid.New().String()
@@ -365,6 +369,22 @@ func CancelKiroSsoLogin(sessionID string) {
 	}
 	session.close()
 	removeKiroSsoSession(sessionID)
+}
+
+// CancelAllKiroSsoLogins tears down every in-flight login immediately. This is
+// used before starting a new login because Kiro's redirect port is fixed at 3128.
+func CancelAllKiroSsoLogins() {
+	kiroSsoSessionsMu.RLock()
+	sessions := make(map[string]*KiroSsoSession, len(kiroSsoSessions))
+	for id, session := range kiroSsoSessions {
+		sessions[id] = session
+	}
+	kiroSsoSessionsMu.RUnlock()
+
+	for id, session := range sessions {
+		session.close()
+		removeKiroSsoSession(id)
+	}
 }
 
 // deliver pushes the first (and only) capture onto the result channel.
@@ -716,4 +736,3 @@ func removeKiroSsoSession(sessionID string) {
 	delete(kiroSsoSessions, sessionID)
 	kiroSsoSessionsMu.Unlock()
 }
-

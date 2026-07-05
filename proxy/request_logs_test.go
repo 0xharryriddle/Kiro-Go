@@ -47,8 +47,8 @@ func TestRequestLogsPersistAndReload(t *testing.T) {
 func TestApiGetLogsFiltersAndExportsCSV(t *testing.T) {
 	h := &Handler{}
 	h.requestLogs = []RequestLog{
-		{Time: 1, Endpoint: "openai", Model: "gpt", AccountID: "acc-ok", Status: "success", Tokens: 4},
-		{Time: 2, Endpoint: "claude", Model: "sonnet", AccountID: "acc-bad", Status: "error", ErrorType: "quota", Error: "quota exceeded"},
+		{Time: 1, Endpoint: "openai", Model: "gpt", AccountID: "acc-ok", AccountEmail: "ok@example.com", Status: "success", Tokens: 4},
+		{Time: 2, Endpoint: "claude", Model: "sonnet", AccountID: "acc-bad", AccountEmail: "bad@example.com", Status: "error", ErrorType: "quota", Error: "quota exceeded"},
 	}
 
 	rec := httptest.NewRecorder()
@@ -59,7 +59,7 @@ func TestApiGetLogsFiltersAndExportsCSV(t *testing.T) {
 		t.Fatalf("expected 200, got %d", rec.Code)
 	}
 	body := rec.Body.String()
-	if !strings.Contains(body, "quota exceeded") || strings.Contains(body, "acc-ok") {
+	if !strings.Contains(body, "quota exceeded") || !strings.Contains(body, "bad@example.com") || strings.Contains(body, "acc-ok") {
 		t.Fatalf("unexpected csv export: %s", body)
 	}
 	if got := rec.Header().Get("Content-Type"); !strings.Contains(got, "text/csv") {

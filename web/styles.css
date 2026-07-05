@@ -4001,3 +4001,5 @@ img.brand-icon {
     flex-direction: column;
   }
 }
+
+.account-local-routing-hint { margin-top: 0.35rem; color: var(--muted); font-size: 0.76rem; line-height: 1.35; max-width: 48rem; }

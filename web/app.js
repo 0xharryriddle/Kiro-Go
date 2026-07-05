@@ -701,13 +701,14 @@
       pad(d.getHours()) + ':' + pad(d.getMinutes()) + ':' + pad(d.getSeconds());
   }
 
-  function accountLabel(id) {
-    if (!id) return '-';
-    const acc = accountsData.find(a => a.id === id);
-    if (acc && acc.email) {
-      return privacyModeEnabled ? maskEmail(acc.email) : acc.email;
+  function accountLabel(id, capturedEmail) {
+    if (!id && !capturedEmail) return '-';
+    const acc = id ? accountsData.find(a => a.id === id) : null;
+    const email = (acc && acc.email) || capturedEmail || '';
+    if (email) {
+      return privacyModeEnabled ? maskEmail(email) : email;
     }
-    return id.slice(0, 8);
+    return id ? id.slice(0, 8) : '-';
   }
 
   async function loadLogs() {
@@ -791,7 +792,7 @@
         '<td>' + statusCell + '</td>' +
         '<td>' + escapeHtml(l.endpoint) + '</td>' +
         '<td>' + escapeHtml(l.model || '-') + '</td>' +
-        '<td>' + escapeHtml(accountLabel(l.accountId)) + '</td>' +
+        '<td>' + escapeHtml(accountLabel(l.accountId, l.accountEmail)) + '</td>' +
         '<td>' + (l.tokens ? formatNum(l.tokens) : '-') + '</td>' +
         '<td>' + (l.duration ? (l.duration + 'ms') : '-') + '</td>' +
         '<td>' + detailCell + '</td>' +
@@ -1107,7 +1108,7 @@
       const idAttr = escapeAttr(a.id);
       const displayEmail = getDisplayEmail(a.email, a.id);
       const selectLabel = t('accounts.selectAccount', displayEmail);
-
+      const localRoutingHint = t('accounts.localRoutingHint');
       const refreshSvg = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M23 4v6h-6M1 20v-6h6"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg>';
       const userSvg = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>';
       const copySvg = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>';
@@ -1127,6 +1128,7 @@
         '<span class="badge badge-info">' + escapeHtml(formatAuthMethod(a.provider || a.authMethod)) + '</span>' +
         getStatusBadge(a) +
         '</div>' +
+        '<div class="account-local-routing-hint">' + escapeHtml(localRoutingHint) + '</div>' +
         '</div>' +
         '</div>' +
         '<div class="account-actions">' +
@@ -1134,7 +1136,7 @@
         '<button class="btn btn-icon btn-sm btn-ghost" data-action="detail" data-id="' + idAttr + '" title="' + escapeAttr(t('accounts.detail')) + '">' + userSvg + '</button>' +
         '<button class="btn btn-icon btn-sm btn-ghost" data-action="copyJSON" data-id="' + idAttr + '" title="' + escapeAttr(t('accounts.copyJSON')) + '">' + copySvg + '</button>' +
         (banned ? '' :
-          '<button class="btn btn-sm ' + (a.enabled ? 'btn-outline' : 'btn-primary') + '" data-action="toggle" data-id="' + idAttr + '" data-enabled="' + (!a.enabled) + '">' +
+          '<button class="btn btn-sm ' + (a.enabled ? 'btn-outline' : 'btn-primary') + '" data-action="toggle" data-id="' + idAttr + '" data-enabled="' + (!a.enabled) + '" title="' + escapeAttr(localRoutingHint) + '">' +
           escapeHtml(a.enabled ? t('accounts.disable') : t('accounts.enable')) +
           '</button>') +
         '<button class="btn btn-sm btn-secondary" data-action="test" data-id="' + idAttr + '" id="test-' + idAttr + '">' + escapeHtml(t('accounts.test')) + '</button>' +
@@ -1179,7 +1181,14 @@
     if (card) card.classList.remove('loading');
   }
   async function toggleAccount(id, enabled) {
+    const ok = await confirmAction(enabled ? t('accounts.confirmEnableLocal') : t('accounts.confirmDisableLocal'), {
+      title: enabled ? t('accounts.enable') : t('accounts.disable'),
+      confirmText: enabled ? t('accounts.enable') : t('accounts.disable'),
+      variant: enabled ? 'primary' : 'warning'
+    });
+    if (!ok) return;
     await api('/accounts/' + id, { method: 'PUT', body: JSON.stringify({ enabled }) });
+    toast(enabled ? t('accounts.enabled') : t('accounts.disabled'), enabled ? 'success' : 'warning');
     loadAccounts();
   }
   async function deleteAccount(id) {
