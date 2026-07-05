@@ -121,7 +121,7 @@ func TestAuthenticateRejectsOverTokenLimit(t *testing.T) {
 	if err != nil {
 		t.Fatalf("seed: %v", err)
 	}
-	if err := config.RecordApiKeyUsage(created.ID, 100, 0); err != nil {
+	if err := config.RecordApiKeyUsage(created.ID, 100, 0, "test-model"); err != nil {
 		t.Fatalf("record usage: %v", err)
 	}
 	requireAuth(t)
@@ -152,7 +152,7 @@ func TestAuthenticateRejectsOverCreditLimit(t *testing.T) {
 	if err != nil {
 		t.Fatalf("seed: %v", err)
 	}
-	if err := config.RecordApiKeyUsage(created.ID, 0, 1.0); err != nil {
+	if err := config.RecordApiKeyUsage(created.ID, 0, 1.0, "test-model"); err != nil {
 		t.Fatalf("record usage: %v", err)
 	}
 	requireAuth(t)
@@ -243,7 +243,7 @@ func TestRouteWritesTooManyRequestsOpenAI(t *testing.T) {
 	if err != nil {
 		t.Fatalf("seed: %v", err)
 	}
-	if err := config.RecordApiKeyUsage(created.ID, 50, 0); err != nil {
+	if err := config.RecordApiKeyUsage(created.ID, 50, 0, "test-model"); err != nil {
 		t.Fatalf("record: %v", err)
 	}
 	requireAuth(t)
@@ -273,7 +273,7 @@ func TestRecordSuccessForApiKeyUpdatesEntry(t *testing.T) {
 	}
 
 	h := &Handler{}
-	h.recordSuccessForApiKey(created.ID, 25, 30, 0.75)
+	h.recordSuccessForApiKey(created.ID, 25, 30, 0.75, "test-model")
 
 	got := config.GetApiKeyEntry(created.ID)
 	if got == nil {
@@ -298,7 +298,7 @@ func TestRecordSuccessForApiKeyEmptyIDIsNoop(t *testing.T) {
 	}
 
 	h := &Handler{}
-	h.recordSuccessForApiKey("", 100, 100, 1)
+	h.recordSuccessForApiKey("", 100, 100, 1, "test-model")
 	got := config.GetApiKeyEntry(created.ID)
 	if got == nil {
 		t.Fatalf("entry missing")

@@ -179,6 +179,18 @@ type ApiKeyEntry struct {
 	TokensUsed    int64   `json:"tokensUsed,omitempty"`
 	CreditsUsed   float64 `json:"creditsUsed,omitempty"`
 	RequestsCount int64   `json:"requestsCount,omitempty"`
+
+	// Per-model cumulative usage breakdown (F10), keyed by model ID. Lets
+	// operators see which models a key spends on. Reset alongside the aggregate
+	// counters by ResetApiKeyUsage. omitempty keeps existing configs unchanged.
+	ModelUsage map[string]ApiKeyModelUsage `json:"modelUsage,omitempty"`
+}
+
+// ApiKeyModelUsage is one model's cumulative usage under an API key.
+type ApiKeyModelUsage struct {
+	Requests int64   `json:"requests"`
+	Tokens   int64   `json:"tokens"`
+	Credits  float64 `json:"credits"`
 }
 
 // Config represents the global application configuration.

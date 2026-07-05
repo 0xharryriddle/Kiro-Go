@@ -2363,6 +2363,18 @@
       const tokensLine = usageLine(t('apiKeys.tokens'), item.tokensUsed || 0, item.tokenLimit || 0);
       const creditsLine = usageLine(t('apiKeys.credits'), item.creditsUsed || 0, item.creditLimit || 0);
       const requestsLine = '<div class="text-xs muted-text">' + escapeHtml(t('apiKeys.requests')) + ': ' + escapeHtml(formatNumber(item.requestsCount || 0)) + '</div>';
+      let modelUsageLine = '';
+      if (item.modelUsage && Object.keys(item.modelUsage).length) {
+        const rows = Object.keys(item.modelUsage).sort().map(m => {
+          const mu = item.modelUsage[m] || {};
+          return '<span class="usage-badge usage-badge--unknown">' + escapeHtml(m) + ': ' +
+            escapeHtml(formatNumber(mu.requests || 0)) + ' ' + escapeHtml(t('apiKeys.requests')) +
+            ' · ' + escapeHtml(formatNumber(mu.tokens || 0)) + ' ' + escapeHtml(t('apiKeys.tokens')) +
+            ' · ' + escapeHtml(formatCredits(mu.credits || 0)) + ' ' + escapeHtml(t('apiKeys.credits')) + '</span>';
+        }).join(' ');
+        modelUsageLine = '<div class="text-xs muted-text">' + escapeHtml(t('apiKeys.byModel')) + ':</div>' +
+          '<div class="usage-audit-summary" style="margin:0.15rem 0 0;">' + rows + '</div>';
+      }
       return '<div class="card" data-apikey-id="' + id + '" style="margin-top:0.5rem;padding:0.75rem;">' +
         '<div class="flex items-center gap-2" style="flex-wrap:wrap;justify-content:space-between;">' +
           '<div class="flex items-center gap-2" style="flex-wrap:wrap;">' +
@@ -2385,6 +2397,7 @@
           tokensLine +
           creditsLine +
           requestsLine +
+          modelUsageLine +
         '</div>' +
       '</div>';
     }).join('');

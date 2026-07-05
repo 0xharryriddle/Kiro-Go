@@ -159,8 +159,9 @@ func HasApiKeys() bool {
 }
 
 // RecordApiKeyUsage atomically adds tokens and credits to the entry's counters,
-// updates LastUsedAt, increments RequestsCount, and persists.
-func RecordApiKeyUsage(id string, tokens int64, credits float64) error {
+// updates LastUsedAt, increments RequestsCount, attributes the usage to the given
+// model (F10; empty model is recorded under "unknown"), and persists.
+func RecordApiKeyUsage(id string, tokens int64, credits float64, model string) error {
 	cfgLock.Lock()
 	defer cfgLock.Unlock()
 	if cfg == nil {
@@ -176,6 +177,24 @@ func RecordApiKeyUsage(id string, tokens int64, credits float64) error {
 			}
 			cfg.ApiKeys[i].RequestsCount++
 			cfg.ApiKeys[i].LastUsedAt = time.Now().Unix()
+
+			// Per-model breakdown.
+			mk := strings.TrimSpace(model)
+			if mk == "" {
+				mk = "unknown"
+			}
+			if cfg.ApiKeys[i].ModelUsage == nil {
+				cfg.ApiKeys[i].ModelUsage = make(map[string]ApiKeyModelUsage)
+			}
+			mu := cfg.ApiKeys[i].ModelUsage[mk]
+			mu.Requests++
+			if tokens > 0 {
+				mu.Tokens += tokens
+			}
+			if credits > 0 {
+				mu.Credits += credits
+			}
+			cfg.ApiKeys[i].ModelUsage[mk] = mu
 			return saveLocked()
 		}
 	}
@@ -195,6 +214,7 @@ func ResetApiKeyUsage(id string) error {
 			cfg.ApiKeys[i].TokensUsed = 0
 			cfg.ApiKeys[i].CreditsUsed = 0
 			cfg.ApiKeys[i].RequestsCount = 0
+			cfg.ApiKeys[i].ModelUsage = nil
 			return saveLocked()
 		}
 	}

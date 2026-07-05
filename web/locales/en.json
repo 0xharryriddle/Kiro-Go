@@ -667,5 +667,6 @@
   "settings.webhookURL": "Event Webhook URL",
   "settings.webhookURLHint": "Optional. When set, security/warning events (account banned, external usage detected, auto-disable) are POSTed to this URL (Slack/Discord-compatible). Only safe fields are sent — never tokens, secrets, or prompts. Leave empty to disable.",
   "settings.metricsEnabled": "Prometheus Metrics Endpoint",
-  "settings.metricsEnabledHint": "Expose a public, unauthenticated Prometheus /metrics endpoint for scraping. Only aggregate operational gauges (no secrets). Enable only when the scrape path is protected by network policy."
+  "settings.metricsEnabledHint": "Expose a public, unauthenticated Prometheus /metrics endpoint for scraping. Only aggregate operational gauges (no secrets). Enable only when the scrape path is protected by network policy.",
+  "apiKeys.byModel": "By model"
 }

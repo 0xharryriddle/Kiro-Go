@@ -23,6 +23,8 @@ type apiKeyView struct {
 	TokensUsed    int64   `json:"tokensUsed"`
 	CreditsUsed   float64 `json:"creditsUsed"`
 	RequestsCount int64   `json:"requestsCount"`
+	// F10: per-model cumulative usage breakdown (nil/omitted when no usage yet).
+	ModelUsage map[string]config.ApiKeyModelUsage `json:"modelUsage,omitempty"`
 }
 
 func toApiKeyView(e config.ApiKeyEntry) apiKeyView {
@@ -41,6 +43,7 @@ func toApiKeyView(e config.ApiKeyEntry) apiKeyView {
 		TokensUsed:    e.TokensUsed,
 		CreditsUsed:   e.CreditsUsed,
 		RequestsCount: e.RequestsCount,
+		ModelUsage:    e.ModelUsage,
 	}
 }
 
