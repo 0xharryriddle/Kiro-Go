@@ -1392,6 +1392,50 @@
     }).join('') + '</div>';
   }
 
+  async function loadModelMatrix() {
+    const box = $('modelMatrixBody');
+    if (box) box.textContent = t('diag.loading');
+    const res = await api('/accounts/model-matrix');
+    if (!res.ok) return;
+    const data = await res.json();
+    renderModelMatrix(data);
+  }
+
+  function renderModelMatrix(data) {
+    const summaryBox = $('modelMatrixSummary');
+    const box = $('modelMatrixBody');
+    if (!box) return;
+    const items = (data && data.items) || [];
+    if (summaryBox) {
+      summaryBox.innerHTML =
+        '<span>' + escapeHtml(t('matrix.totalModels')) + ': <strong>' + escapeHtml(String(data.totalModels || 0)) + '</strong></span>' +
+        '<span>' + escapeHtml(t('matrix.accountsWithCache')) + ': <strong>' + escapeHtml(String(data.accountsWithCache || 0)) + '</strong></span>';
+    }
+    if (data.optimisticFallback) {
+      box.innerHTML = '<div class="empty-state">' + escapeHtml(t('matrix.optimistic')) + '</div>';
+      return;
+    }
+    if (!items.length) {
+      box.innerHTML = '<div class="empty-state">' + escapeHtml(t('matrix.empty')) + '</div>';
+      return;
+    }
+    box.innerHTML = '<div class="diag-list">' + items.map(item => {
+      const refs = item.accounts || [];
+      const chips = refs.map(a =>
+        '<span class="usage-badge ' + (a.enabled ? 'usage-badge--clean' : 'usage-badge--unknown') + '">' +
+        escapeHtml(accountLabel(a.accountId, a.email)) + '</span>'
+      ).join(' ');
+      const cls = item.capableCount > 0 ? 'diag-chip--ok' : 'diag-chip--warn';
+      return '<div class="diag-chip ' + cls + '">' +
+        '<div class="usage-row-head">' +
+          '<strong>' + escapeHtml(item.model) + '</strong>' +
+          '<span class="usage-badge usage-badge--external">' + escapeHtml(t('matrix.capable')) + ': ' + escapeHtml(String(item.capableCount || 0)) + '</span>' +
+        '</div>' +
+        (chips ? '<span>' + chips + '</span>' : '') +
+        '</div>';
+    }).join('') + '</div>';
+  }
+
   async function runExternalIdpLiveCheck(accountId) {
     if (!accountId) return;
     const res = await api('/accounts/external-idp-diagnostics/live', { method: 'POST', body: JSON.stringify({ accountId }) });
@@ -3499,6 +3543,7 @@
     if (panelId === 'usageAuditCard') loadUsageAudit();
     if (panelId === 'fleetForecastCard') loadFleetForecast();
     if (panelId === 'accountHealthCard') loadAccountHealth();
+    if (panelId === 'modelMatrixCard') loadModelMatrix();
     const panel = $(panelId);
     if (panel) panel.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
   }
@@ -3970,6 +4015,8 @@
     if (refreshFleetForecastBtn) refreshFleetForecastBtn.addEventListener('click', loadFleetForecast);
     const refreshAccountHealthBtn = $('refreshAccountHealthBtn');
     if (refreshAccountHealthBtn) refreshAccountHealthBtn.addEventListener('click', loadAccountHealth);
+    const refreshModelMatrixBtn = $('refreshModelMatrixBtn');
+    if (refreshModelMatrixBtn) refreshModelMatrixBtn.addEventListener('click', loadModelMatrix);
     const recheckUsageAuditBtn = $('recheckUsageAuditBtn');
     if (recheckUsageAuditBtn) recheckUsageAuditBtn.addEventListener('click', () => recheckUsageAudit());
     const usageAuditBody = $('usageAuditBody');

@@ -254,6 +254,7 @@
           <button type="button" class="btn btn-outline btn-sm tool-launch-btn" data-tool-panel="usageAuditCard" data-i18n="usageAudit.title"></button>
           <button type="button" class="btn btn-outline btn-sm tool-launch-btn" data-tool-panel="fleetForecastCard" data-i18n="forecast.title"></button>
           <button type="button" class="btn btn-outline btn-sm tool-launch-btn" data-tool-panel="accountHealthCard" data-i18n="health.title"></button>
+          <button type="button" class="btn btn-outline btn-sm tool-launch-btn" data-tool-panel="modelMatrixCard" data-i18n="matrix.title"></button>
           <button type="button" class="btn btn-outline btn-sm tool-launch-btn" data-tool-panel="auditLogsCard" data-i18n="audit.title"></button>
         </div>
 
@@ -335,6 +336,16 @@
         <div id="accountHealthSummary" class="usage-audit-summary"></div>
         <div id="accountHealthBody" class="diag-body muted-text" data-i18n="diag.loading"></div>
         <p class="muted-text usage-audit-note" data-i18n="health.heuristicNote"></p>
+      </div>
+
+      <div class="card tool-panel hidden" id="modelMatrixCard">
+        <div class="card-header">
+          <span class="card-title" data-i18n="matrix.title"></span>
+          <button class="btn btn-outline btn-sm" id="refreshModelMatrixBtn" data-i18n="common.refresh"></button>
+        </div>
+        <p class="muted-text" data-i18n="matrix.desc"></p>
+        <div id="modelMatrixSummary" class="usage-audit-summary"></div>
+        <div id="modelMatrixBody" class="diag-body muted-text" data-i18n="diag.loading"></div>
       </div>
 
       <div class="card tool-panel hidden" id="auditLogsCard">

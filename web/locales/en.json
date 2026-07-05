@@ -653,5 +653,12 @@
   "health.tier.healthy": "Healthy",
   "health.tier.degraded": "Degraded",
   "health.tier.critical": "Critical",
-  "health.tier.unknown": "Unknown"
+  "health.tier.unknown": "Unknown",
+  "matrix.title": "Model Availability Matrix",
+  "matrix.desc": "Which accounts can serve each model, read from each account's cached model list. Refresh account models to update.",
+  "matrix.totalModels": "Models",
+  "matrix.accountsWithCache": "Accounts with cache",
+  "matrix.capable": "Capable",
+  "matrix.optimistic": "No account has a cached model list yet — routing is optimistic (any account may serve any model). Refresh account models to populate the matrix.",
+  "matrix.empty": "No models cached."
 }

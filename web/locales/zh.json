@@ -653,5 +653,12 @@
   "health.tier.healthy": "健康",
   "health.tier.degraded": "下降",
   "health.tier.critical": "严重",
-  "health.tier.unknown": "未知"
+  "health.tier.unknown": "未知",
+  "matrix.title": "模型可用性矩阵",
+  "matrix.desc": "每个模型可由哪些账号提供，读取自各账号缓存的模型列表。刷新账号模型以更新。",
+  "matrix.totalModels": "模型数",
+  "matrix.accountsWithCache": "有缓存的账号",
+  "matrix.capable": "可用账号",
+  "matrix.optimistic": "尚无账号缓存模型列表——路由为乐观模式（任意账号可服务任意模型）。刷新账号模型以填充矩阵。",
+  "matrix.empty": "暂无缓存的模型。"
 }

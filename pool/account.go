@@ -4,6 +4,7 @@ package pool
 
 import (
 	"kiro-go/config"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -511,6 +512,46 @@ func (p *AccountPool) ModelRoutingFor(accounts []config.Account, model string) M
 		RouteableCount:     routeable,
 		Accounts:           items,
 	}
+}
+
+// ModelMatrixEntry describes one model's fleet-wide availability.
+type ModelMatrixEntry struct {
+	Model        string   `json:"model"`        // model ID
+	AccountIDs   []string `json:"accountIds"`   // accounts whose cache lists this model
+	CapableCount int      `json:"capableCount"` // len(AccountIDs)
+}
+
+// ModelMatrix returns the fleet model-availability grid: the union of every
+// account's cached model set, and for each model the accounts that serve it.
+// accountsWithCache is the number of accounts that have a non-empty model cache;
+// when zero, routing is optimistic (no cache yet) and the matrix is empty.
+// Models are returned sorted for stable UI ordering.
+func (p *AccountPool) ModelMatrix() (entries []ModelMatrixEntry, accountsWithCache int) {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+
+	modelToAccounts := make(map[string][]string)
+	for accountID, set := range p.modelLists {
+		if len(set) == 0 {
+			continue
+		}
+		accountsWithCache++
+		for modelID := range set {
+			modelToAccounts[modelID] = append(modelToAccounts[modelID], accountID)
+		}
+	}
+
+	entries = make([]ModelMatrixEntry, 0, len(modelToAccounts))
+	for modelID, ids := range modelToAccounts {
+		sort.Strings(ids)
+		entries = append(entries, ModelMatrixEntry{
+			Model:        modelID,
+			AccountIDs:   ids,
+			CapableCount: len(ids),
+		})
+	}
+	sort.Slice(entries, func(i, j int) bool { return entries[i].Model < entries[j].Model })
+	return entries, accountsWithCache
 }
 
 func (p *AccountPool) diagnosticsForLocked(accounts []config.Account, model string) []AccountDiagnostics {
