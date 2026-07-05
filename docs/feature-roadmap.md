@@ -1,18 +1,20 @@
 # Kiro-Go Feature Roadmap & Design
 
-Status: SHIPPED — all 11 features implemented, tested, and deployed. Author: engineering review pass.
+Status: SHIPPED — all 12 features (F1–F12) implemented, tested, and deployed. Author: engineering review pass.
 Scope: candidate features derived from a full codebase scan plus a review of the
 production LLM-gateway landscape (LiteLLM, Portkey, Helicone, 2025). This document
 originally existed to decide *what to build next*; it is retained as the design
 record now that the work is complete.
 
 Delivery summary (all merged to origin/harry, each with unit tests + admin UI + en/zh i18n):
-- F2 quota-aware routing · F3 external-usage auto-action · F4 fleet capacity forecast
-- F1 account health score · F8 model-availability matrix · F6 per-key RPM/TPM rate limits
-- F7 event webhook bus · F9 Prometheus /metrics exposition · F10 per-model cost attribution
-- F12 usage anomaly detection · F11 PII redaction in prompt filter
-All features that change routing, auto-disable accounts, expose /metrics, or POST to a
-webhook are config-gated and default OFF, preserving prior behaviour until opted in.
+- F1 account health score · F2 quota-aware routing · F3 external-usage auto-action
+- F4 fleet capacity forecast · F5 response cache (exact-match, opt-in) · F6 per-key RPM/TPM rate limits
+- F7 event webhook bus · F8 model-availability matrix · F9 Prometheus /metrics exposition
+- F10 per-model cost attribution · F11 PII redaction in prompt filter · F12 usage anomaly detection
+All features that change routing, auto-disable accounts, cache responses, expose /metrics,
+or POST to a webhook are config-gated and default OFF, preserving prior behaviour until
+opted in. F5 caches only non-streaming, tool-free, non-thinking requests, exact-match,
+in-memory, TTL-bounded — the conservative design from §3.
 
 ---
 

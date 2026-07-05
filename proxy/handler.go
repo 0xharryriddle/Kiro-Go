@@ -90,6 +90,8 @@ type Handler struct {
 	auditLogsMu   sync.RWMutex
 	// F6: per-API-key sliding-window RPM/TPM limiter (in-process).
 	rateLimiter *rateLimiter
+	// F5: in-process exact-match response cache (opt-in, non-stream only).
+	responseCache *responseCache
 }
 
 type thinkingStreamSource int
@@ -278,6 +280,7 @@ func NewHandler() *Handler {
 		stopStatsSaver:  make(chan struct{}),
 		promptCache:     newPromptCacheTracker(defaultPromptCacheTTL),
 		rateLimiter:     newRateLimiter(),
+		responseCache:   newResponseCache(),
 	}
 	h.loadRequestLogs()
 	h.loadAuditLogs()
@@ -1057,9 +1060,31 @@ func (h *Handler) handleClaudeMessagesInternal(w http.ResponseWriter, r *http.Re
 	apiKeyID := apiKeyIDFromContext(r.Context())
 	if req.Stream {
 		h.handleClaudeStream(w, kiroPayload, req.Model, thinking, thinkingResponseOpts, estimatedInputTokens, cacheProfile, apiKeyID)
-	} else {
-		h.handleClaudeNonStream(w, kiroPayload, req.Model, thinking, thinkingResponseOpts, estimatedInputTokens, cacheProfile, apiKeyID)
+		return
 	}
+
+	// F5: response cache (opt-in, exact-match, non-stream/tool-free/non-thinking).
+	var cacheKey string
+	if config.GetResponseCacheEnabled() && isCacheableClaudeRequest(&req, thinking) {
+		if norm, err := json.Marshal(&req); err == nil {
+			cacheKey = responseCacheKey("claude", norm)
+			if cached, ok := h.responseCache.Get(cacheKey, time.Now().Unix()); ok {
+				w.Header().Set("Content-Type", "application/json; charset=utf-8")
+				w.Header().Set("X-Kiro-Cache", "hit")
+				_, _ = w.Write(cached)
+				return
+			}
+		}
+	}
+	if cacheKey != "" {
+		cw := newCaptureWriter(w)
+		h.handleClaudeNonStream(cw, kiroPayload, req.Model, thinking, thinkingResponseOpts, estimatedInputTokens, cacheProfile, apiKeyID)
+		if cw.status == http.StatusOK && len(cw.buf) > 0 {
+			h.responseCache.Set(cacheKey, cw.buf, config.GetResponseCacheTTLSeconds(), time.Now().Unix())
+		}
+		return
+	}
+	h.handleClaudeNonStream(w, kiroPayload, req.Model, thinking, thinkingResponseOpts, estimatedInputTokens, cacheProfile, apiKeyID)
 }
 
 // handleClaudeStream Claude 流式响应
@@ -1956,9 +1981,32 @@ func (h *Handler) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
 	apiKeyID := apiKeyIDFromContext(r.Context())
 	if req.Stream {
 		h.handleOpenAIStream(w, kiroPayload, req.Model, thinking, estimatedInputTokens, apiKeyID)
-	} else {
-		h.handleOpenAINonStream(w, kiroPayload, req.Model, thinking, estimatedInputTokens, apiKeyID)
+		return
 	}
+
+	// F5: response cache (opt-in, exact-match, non-stream/tool-free/non-thinking).
+	// Serve a fresh cached body on hit; otherwise capture the response and store it.
+	var cacheKey string
+	if config.GetResponseCacheEnabled() && isCacheableOpenAIRequest(&req, thinking) {
+		if norm, err := json.Marshal(&req); err == nil {
+			cacheKey = responseCacheKey("openai", norm)
+			if cached, ok := h.responseCache.Get(cacheKey, time.Now().Unix()); ok {
+				w.Header().Set("Content-Type", "application/json; charset=utf-8")
+				w.Header().Set("X-Kiro-Cache", "hit")
+				_, _ = w.Write(cached)
+				return
+			}
+		}
+	}
+	if cacheKey != "" {
+		cw := newCaptureWriter(w)
+		h.handleOpenAINonStream(cw, kiroPayload, req.Model, thinking, estimatedInputTokens, apiKeyID)
+		if cw.status == http.StatusOK && len(cw.buf) > 0 {
+			h.responseCache.Set(cacheKey, cw.buf, config.GetResponseCacheTTLSeconds(), time.Now().Unix())
+		}
+		return
+	}
+	h.handleOpenAINonStream(w, kiroPayload, req.Model, thinking, estimatedInputTokens, apiKeyID)
 }
 
 // handleOpenAIStream OpenAI 流式响应
@@ -4255,6 +4303,8 @@ func (h *Handler) apiGetSettings(w http.ResponseWriter, r *http.Request) {
 		"externalUsageAutoDisable": config.GetExternalUsageAutoDisable(),
 		"webhookURL":               config.GetWebhookURL(),
 		"metricsEnabled":           config.GetMetricsEnabled(),
+		"responseCacheEnabled":     config.GetResponseCacheEnabled(),
+		"responseCacheTTLSeconds":  config.GetResponseCacheTTLSeconds(),
 	})
 }
 
@@ -4354,6 +4404,8 @@ func (h *Handler) apiUpdateSettings(w http.ResponseWriter, r *http.Request) {
 		ExternalUsageAutoDisable *bool   `json:"externalUsageAutoDisable,omitempty"`
 		WebhookURL               *string `json:"webhookURL,omitempty"`
 		MetricsEnabled           *bool   `json:"metricsEnabled,omitempty"`
+		ResponseCacheEnabled     *bool   `json:"responseCacheEnabled,omitempty"`
+		ResponseCacheTTLSeconds  *int    `json:"responseCacheTTLSeconds,omitempty"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		w.WriteHeader(400)
@@ -4418,6 +4470,20 @@ func (h *Handler) apiUpdateSettings(w http.ResponseWriter, r *http.Request) {
 	// F9: Prometheus /metrics toggle (public, unauthenticated when enabled).
 	if req.MetricsEnabled != nil {
 		if err := config.UpdateMetricsEnabled(*req.MetricsEnabled); err != nil {
+			w.WriteHeader(500)
+			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+	}
+
+	// F5: response cache toggle + TTL. Enabled state and TTL update together; a
+	// nil TTL leaves the stored value (falls back to the 300s default).
+	if req.ResponseCacheEnabled != nil {
+		ttl := 0
+		if req.ResponseCacheTTLSeconds != nil {
+			ttl = *req.ResponseCacheTTLSeconds
+		}
+		if err := config.UpdateResponseCacheConfig(*req.ResponseCacheEnabled, ttl); err != nil {
 			w.WriteHeader(500)
 			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
 			return

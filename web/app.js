@@ -2141,6 +2141,8 @@
     if ($('externalUsageAutoDisable')) $('externalUsageAutoDisable').checked = d.externalUsageAutoDisable || false;
     if ($('webhookURL')) $('webhookURL').value = d.webhookURL || '';
     if ($('metricsEnabled')) $('metricsEnabled').checked = d.metricsEnabled || false;
+    if ($('responseCacheEnabled')) $('responseCacheEnabled').checked = d.responseCacheEnabled || false;
+    if ($('responseCacheTTLSeconds')) $('responseCacheTTLSeconds').value = String(d.responseCacheTTLSeconds || 300);
     await Promise.all([loadThinkingConfig(), loadEndpointConfig(), loadProxyConfig(), loadPromptFilter(), loadApiKeys(), loadConfigStatus()]);
     refreshCustomSelects();
   }
@@ -2250,7 +2252,10 @@
     const externalUsageAutoDisable = $('externalUsageAutoDisable') ? $('externalUsageAutoDisable').checked : false;
     const webhookURL = $('webhookURL') ? $('webhookURL').value.trim() : '';
     const metricsEnabled = $('metricsEnabled') ? $('metricsEnabled').checked : false;
-    await api('/settings', { method: 'POST', body: JSON.stringify({ allowOverUsage, quotaAwareRouting, externalUsageAutoDisable, webhookURL, metricsEnabled }) });
+    const responseCacheEnabled = $('responseCacheEnabled') ? $('responseCacheEnabled').checked : false;
+    const ttlRaw = $('responseCacheTTLSeconds') ? parseInt($('responseCacheTTLSeconds').value, 10) : 0;
+    const responseCacheTTLSeconds = isNaN(ttlRaw) || ttlRaw < 0 ? 0 : ttlRaw;
+    await api('/settings', { method: 'POST', body: JSON.stringify({ allowOverUsage, quotaAwareRouting, externalUsageAutoDisable, webhookURL, metricsEnabled, responseCacheEnabled, responseCacheTTLSeconds }) });
     toast(t('settings.overUsageSaved'), 'success');
   }
   function formatDateTime(ts) {

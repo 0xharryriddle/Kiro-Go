@@ -458,6 +458,17 @@
             </label>
             <small data-i18n="settings.metricsEnabledHint"></small>
           </div>
+          <div class="form-group">
+            <label class="flex items-center gap-2">
+              <span class="switch"><input type="checkbox" id="responseCacheEnabled" /><span class="slider"></span></span>
+              <span data-i18n="settings.responseCache"></span>
+            </label>
+            <small data-i18n="settings.responseCacheHint"></small>
+          </div>
+          <div class="form-group">
+            <label data-i18n="settings.responseCacheTTL"></label>
+            <input type="number" id="responseCacheTTLSeconds" min="0" step="1" value="300" />
+          </div>
           <button class="btn btn-primary" id="saveOverUsageBtn" data-i18n="settings.saveUsage"></button>
         </div>
 

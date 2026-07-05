@@ -277,6 +277,18 @@ type Config struct {
 	// FilterStripBoundaries removes --- SYSTEM PROMPT --- / --- END SYSTEM PROMPT --- markers.
 	FilterStripBoundaries bool `json:"filterStripBoundaries,omitempty"`
 
+	// ResponseCacheEnabled turns on an in-process exact-match response cache for
+	// non-streaming, tool-free, non-thinking requests. Every cache hit saves an
+	// upstream call = a saved credit (the scarce resource). Defaults to false.
+	// Correctness-conservative by design: streaming, tool, and thinking requests
+	// are never cached, and the key includes the full normalized request so any
+	// prompt/param difference misses. In-memory only (single-instance).
+	ResponseCacheEnabled bool `json:"responseCacheEnabled,omitempty"`
+
+	// ResponseCacheTTLSeconds is how long a cached response stays fresh. Defaults
+	// to 300s (5 min) when unset and the cache is enabled.
+	ResponseCacheTTLSeconds int `json:"responseCacheTTLSeconds,omitempty"`
+
 	// FilterPII redacts common PII patterns (email addresses, credit-card-like
 	// numbers, US SSNs, IPv4 addresses, and bearer/API-key-like tokens) from the
 	// system prompt before it is sent upstream, replacing each match with a typed
@@ -1110,6 +1122,39 @@ func GetFilterPII() bool {
 		return false
 	}
 	return cfg.FilterPII
+}
+
+// GetResponseCacheEnabled returns whether the exact-match response cache is on.
+func GetResponseCacheEnabled() bool {
+	cfgLock.RLock()
+	defer cfgLock.RUnlock()
+	if cfg == nil {
+		return false
+	}
+	return cfg.ResponseCacheEnabled
+}
+
+// GetResponseCacheTTLSeconds returns the response-cache TTL in seconds, defaulting
+// to 300 when unset.
+func GetResponseCacheTTLSeconds() int {
+	cfgLock.RLock()
+	defer cfgLock.RUnlock()
+	if cfg == nil || cfg.ResponseCacheTTLSeconds <= 0 {
+		return 300
+	}
+	return cfg.ResponseCacheTTLSeconds
+}
+
+// UpdateResponseCacheConfig sets the response-cache toggle and TTL and persists.
+// A ttlSeconds <= 0 leaves the stored TTL untouched (falls back to the default).
+func UpdateResponseCacheConfig(enabled bool, ttlSeconds int) error {
+	cfgLock.Lock()
+	defer cfgLock.Unlock()
+	cfg.ResponseCacheEnabled = enabled
+	if ttlSeconds > 0 {
+		cfg.ResponseCacheTTLSeconds = ttlSeconds
+	}
+	return Save()
 }
 
 // PromptFilterConfig holds all prompt filter settings for API responses.
