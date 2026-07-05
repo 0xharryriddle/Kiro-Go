@@ -132,6 +132,7 @@ type Account struct {
 	// from a prior period is never miscounted as external.
 	ExternalPeriodKey       string  `json:"externalPeriodKey,omitempty"`       // Billing period being tracked (NextResetDate)
 	ExternalPeriodStart     float64 `json:"externalPeriodStart,omitempty"`     // Upstream CurrentUsage captured at period start
+	ExternalPeriodStartAt   int64   `json:"externalPeriodStartAt,omitempty"`   // Unix seconds when the period baseline was captured (burn-rate forecast)
 	ExternalPeriodOurCredit float64 `json:"externalPeriodOurCredit,omitempty"` // Credits WE metered within this period
 	ExternalCreditsEstimate float64 `json:"externalCreditsEstimate,omitempty"` // Last computed external credits (clamped >=0)
 	ExternalConfidence      string  `json:"externalConfidence,omitempty"`      // "clean" | "external" | "strong_external" | "unknown"
@@ -962,6 +963,7 @@ func GetExternalUsageState(id string) (ExternalUsageState, bool) {
 			return ExternalUsageState{
 				PeriodKey:       a.ExternalPeriodKey,
 				PeriodStart:     a.ExternalPeriodStart,
+				PeriodStartAt:   a.ExternalPeriodStartAt,
 				PeriodOurCredit: a.ExternalPeriodOurCredit,
 				Estimate:        a.ExternalCreditsEstimate,
 				Confidence:      a.ExternalConfidence,
@@ -980,6 +982,7 @@ func SetExternalUsageState(id string, st ExternalUsageState) error {
 		if a.ID == id {
 			cfg.Accounts[i].ExternalPeriodKey = st.PeriodKey
 			cfg.Accounts[i].ExternalPeriodStart = st.PeriodStart
+			cfg.Accounts[i].ExternalPeriodStartAt = st.PeriodStartAt
 			cfg.Accounts[i].ExternalPeriodOurCredit = st.PeriodOurCredit
 			cfg.Accounts[i].ExternalCreditsEstimate = st.Estimate
 			cfg.Accounts[i].ExternalConfidence = st.Confidence

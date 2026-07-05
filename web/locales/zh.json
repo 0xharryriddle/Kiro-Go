@@ -624,5 +624,22 @@
   "settings.quotaAwareRouting": "配额感知路由",
   "settings.quotaAwareRoutingHint": "开启后，请求将路由到剩余周期配额最多的账号，而非简单轮询。当配额数据不可用时回退到轮询。",
   "settings.externalUsageAutoDisable": "检测到外部使用时自动禁用",
-  "settings.externalUsageAutoDisableHint": "开启后，当账号首次被确认在本代理之外被使用（强外部使用）时，会自动停止本代理对其路由。可逆：可在账号列表中重新启用。不影响上游 Kiro 账号。"
+  "settings.externalUsageAutoDisableHint": "开启后，当账号首次被确认在本代理之外被使用（强外部使用）时，会自动停止本代理对其路由。可逆：可在账号列表中重新启用。不影响上游 Kiro 账号。",
+  "forecast.title": "账号容量预测",
+  "forecast.desc": "按观测到的消耗速率预测每个账号本周期剩余额度何时耗尽。只读，不改变路由。",
+  "forecast.creditsNote": "只读预测，单位为 AWS agentic-request 额度。消耗速率使用自周期基线以来的上游总消耗。账号在基线捕获约 10 分钟后才会给出预测。",
+  "forecast.empty": "没有可预测的账号。",
+  "forecast.projectable": "可预测",
+  "forecast.fleetRemaining": "账号池剩余",
+  "forecast.fleetBurn": "账号池消耗",
+  "forecast.soonest": "最快耗尽",
+  "forecast.remaining": "剩余",
+  "forecast.burn": "消耗速率",
+  "forecast.runway": "可用时长",
+  "forecast.exhaustsAt": "预计耗尽",
+  "forecast.disabled": "本地已禁用",
+  "forecast.confidence.ok": "已预测",
+  "forecast.confidence.idle": "空闲",
+  "forecast.confidence.depleted": "已耗尽",
+  "forecast.confidence.unknown": "未知"
 }

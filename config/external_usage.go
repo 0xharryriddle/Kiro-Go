@@ -49,6 +49,7 @@ type ExternalUsageInput struct {
 type ExternalUsageState struct {
 	PeriodKey       string
 	PeriodStart     float64
+	PeriodStartAt   int64 // Unix seconds when PeriodStart baseline was captured (for burn-rate forecast)
 	PeriodOurCredit float64
 	Estimate        float64
 	Confidence      string
@@ -79,6 +80,7 @@ func ComputeExternalUsage(prev ExternalUsageState, in ExternalUsageInput, now in
 	if prev.PeriodKey != in.PeriodKey || in.UpstreamCurrent < prev.PeriodStart {
 		out.PeriodKey = in.PeriodKey
 		out.PeriodStart = in.UpstreamCurrent
+		out.PeriodStartAt = now
 		out.PeriodOurCredit = 0
 		out.Estimate = 0
 		out.Confidence = ExternalConfidenceUnknown

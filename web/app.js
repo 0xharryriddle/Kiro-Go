@@ -1271,6 +1271,74 @@
     return n.toLocaleString();
   }
 
+  function formatHours(h) {
+    const n = Number(h) || 0;
+    if (n <= 0) return '-';
+    if (n < 1) return Math.round(n * 60) + 'm';
+    if (n < 48) return n.toFixed(1) + 'h';
+    return (n / 24).toFixed(1) + 'd';
+  }
+
+  async function loadFleetForecast() {
+    const box = $('fleetForecastBody');
+    if (box) box.textContent = t('diag.loading');
+    const res = await api('/accounts/fleet-forecast');
+    if (!res.ok) return;
+    const data = await res.json();
+    renderFleetForecast(data);
+  }
+
+  function forecastConfidenceMeta(conf) {
+    switch (conf) {
+      case 'ok': return { cls: 'usage-badge--external', label: t('forecast.confidence.ok') };
+      case 'idle': return { cls: 'usage-badge--clean', label: t('forecast.confidence.idle') };
+      case 'depleted': return { cls: 'usage-badge--strong', label: t('forecast.confidence.depleted') };
+      default: return { cls: 'usage-badge--unknown', label: t('forecast.confidence.unknown') };
+    }
+  }
+
+  function renderFleetForecast(data) {
+    const summaryBox = $('fleetForecastSummary');
+    const box = $('fleetForecastBody');
+    if (!box) return;
+    const summary = (data && data.summary) || {};
+    const items = (data && data.items) || [];
+    if (summaryBox) {
+      const soonest = Number(summary.soonestHoursToExhaust) || 0;
+      summaryBox.innerHTML =
+        '<span>' + escapeHtml(t('forecast.projectable')) + ': <strong>' + escapeHtml(String(summary.projectable || 0)) + '</strong></span>' +
+        '<span class="usage-badge usage-badge--clean">' + escapeHtml(t('forecast.confidence.idle')) + ': <strong>' + escapeHtml(String(summary.idle || 0)) + '</strong></span>' +
+        '<span class="usage-badge usage-badge--strong">' + escapeHtml(t('forecast.confidence.depleted')) + ': <strong>' + escapeHtml(String(summary.depleted || 0)) + '</strong></span>' +
+        '<span class="usage-badge usage-badge--unknown">' + escapeHtml(t('forecast.confidence.unknown')) + ': <strong>' + escapeHtml(String(summary.unknown || 0)) + '</strong></span>' +
+        '<span>' + escapeHtml(t('forecast.fleetRemaining')) + ': <strong>' + escapeHtml(formatCredits(summary.fleetRemainingCredits)) + '</strong></span>' +
+        '<span>' + escapeHtml(t('forecast.fleetBurn')) + ': <strong>' + escapeHtml(formatCredits(summary.fleetBurnPerHour)) + '/h</strong></span>' +
+        (soonest > 0 ? '<span class="usage-badge usage-badge--external">' + escapeHtml(t('forecast.soonest')) + ': <strong>' + escapeHtml(formatHours(soonest)) + '</strong></span>' : '');
+    }
+    if (!items.length) {
+      box.innerHTML = '<div class="empty-state">' + escapeHtml(t('forecast.empty')) + '</div>';
+      return;
+    }
+    box.innerHTML = '<div class="diag-list">' + items.map(item => {
+      const meta = forecastConfidenceMeta(item.confidence);
+      const chipCls = item.confidence === 'depleted' ? 'diag-chip--warn' : 'diag-chip--ok';
+      return '<div class="diag-chip ' + chipCls + '">' +
+        '<div class="usage-row-head">' +
+          '<strong>' + escapeHtml(accountLabel(item.accountId, item.email)) + '</strong>' +
+          '<span class="usage-badge ' + meta.cls + '">' + escapeHtml(meta.label) + '</span>' +
+          (item.enabled ? '' : '<span class="usage-flag">' + escapeHtml(t('forecast.disabled')) + '</span>') +
+        '</div>' +
+        '<span>' + escapeHtml(t('forecast.remaining')) + ': <strong>' + escapeHtml(formatCredits(item.remainingCredits)) + '</strong>' +
+          (item.usageLimit > 0 ? ' / ' + escapeHtml(formatCredits(item.usageLimit)) : '') + ' ' + escapeHtml(t('usageAudit.creditsUnit')) + '</span>' +
+        (item.confidence === 'ok'
+          ? '<span>' + escapeHtml(t('forecast.burn')) + ': ' + escapeHtml(formatCredits(item.burnPerHour)) + '/h</span>' +
+            '<span>' + escapeHtml(t('forecast.runway')) + ': <strong>' + escapeHtml(formatHours(item.hoursToExhaust)) + '</strong>' +
+              (item.exhaustsAt ? ' · ' + escapeHtml(t('forecast.exhaustsAt')) + ': ' + escapeHtml(formatDateTime(item.exhaustsAt)) : '') + '</span>'
+          : '') +
+        (item.nextResetDate ? '<span class="usage-drill">' + escapeHtml(t('usageAudit.nextReset')) + ': ' + escapeHtml(item.nextResetDate) + '</span>' : '') +
+        '</div>';
+    }).join('') + '</div>';
+  }
+
   async function runExternalIdpLiveCheck(accountId) {
     if (!accountId) return;
     const res = await api('/accounts/external-idp-diagnostics/live', { method: 'POST', body: JSON.stringify({ accountId }) });
@@ -3376,6 +3444,7 @@
     if (panelId === 'externalIdpDiagnosticsCard') loadExternalIdpDiagnostics();
     if (panelId === 'auditLogsCard') loadAuditLogs();
     if (panelId === 'usageAuditCard') loadUsageAudit();
+    if (panelId === 'fleetForecastCard') loadFleetForecast();
     const panel = $(panelId);
     if (panel) panel.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
   }
@@ -3843,6 +3912,8 @@
     if (refreshAuditLogsBtn) refreshAuditLogsBtn.addEventListener('click', loadAuditLogs);
     const refreshUsageAuditBtn = $('refreshUsageAuditBtn');
     if (refreshUsageAuditBtn) refreshUsageAuditBtn.addEventListener('click', loadUsageAudit);
+    const refreshFleetForecastBtn = $('refreshFleetForecastBtn');
+    if (refreshFleetForecastBtn) refreshFleetForecastBtn.addEventListener('click', loadFleetForecast);
     const recheckUsageAuditBtn = $('recheckUsageAuditBtn');
     if (recheckUsageAuditBtn) recheckUsageAuditBtn.addEventListener('click', () => recheckUsageAudit());
     const usageAuditBody = $('usageAuditBody');

@@ -624,5 +624,22 @@
   "settings.quotaAwareRouting": "Quota-Aware Routing",
   "settings.quotaAwareRoutingHint": "When enabled, requests are routed to the account with the most remaining period quota instead of blind round-robin. Falls back to round-robin when quota data is unavailable.",
   "settings.externalUsageAutoDisable": "Auto-disable on external usage",
-  "settings.externalUsageAutoDisableHint": "When enabled, an account is automatically disabled for local routing the first time it is confirmed to be used outside this proxy (strong external usage). Reversible: re-enable it in Accounts. Does not affect the upstream Kiro account."
+  "settings.externalUsageAutoDisableHint": "When enabled, an account is automatically disabled for local routing the first time it is confirmed to be used outside this proxy (strong external usage). Reversible: re-enable it in Accounts. Does not affect the upstream Kiro account.",
+  "forecast.title": "Fleet Capacity Forecast",
+  "forecast.desc": "Projects when each account's remaining period quota will be exhausted at its observed burn rate. Read-only; no routing changes.",
+  "forecast.creditsNote": "Read-only projection in AWS agentic-request credits. Burn rate uses total upstream consumption since the period baseline. Accounts show 'unknown' until ~10 minutes after a baseline is captured.",
+  "forecast.empty": "No accounts to forecast.",
+  "forecast.projectable": "Projectable",
+  "forecast.fleetRemaining": "Fleet remaining",
+  "forecast.fleetBurn": "Fleet burn",
+  "forecast.soonest": "Soonest exhaust",
+  "forecast.remaining": "Remaining",
+  "forecast.burn": "Burn rate",
+  "forecast.runway": "Runway",
+  "forecast.exhaustsAt": "Exhausts at",
+  "forecast.disabled": "disabled locally",
+  "forecast.confidence.ok": "Projected",
+  "forecast.confidence.idle": "Idle",
+  "forecast.confidence.depleted": "Depleted",
+  "forecast.confidence.unknown": "Unknown"
 }
