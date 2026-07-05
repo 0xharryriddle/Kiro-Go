@@ -508,6 +508,8 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.handleHealthz(w, r)
 	case path == "/readyz":
 		h.handleReadyz(w, r)
+	case path == "/metrics":
+		h.handleMetrics(w, r)
 	// API 端点（需要验证 API Key）
 	case path == "/v1/messages" || path == "/messages" || path == "/anthropic/v1/messages":
 		ar := h.authenticateForClaude(w, r)
@@ -4250,6 +4252,7 @@ func (h *Handler) apiGetSettings(w http.ResponseWriter, r *http.Request) {
 		"quotaAwareRouting":        config.GetQuotaAwareRouting(),
 		"externalUsageAutoDisable": config.GetExternalUsageAutoDisable(),
 		"webhookURL":               config.GetWebhookURL(),
+		"metricsEnabled":           config.GetMetricsEnabled(),
 	})
 }
 
@@ -4343,6 +4346,7 @@ func (h *Handler) apiUpdateSettings(w http.ResponseWriter, r *http.Request) {
 		QuotaAwareRouting        *bool   `json:"quotaAwareRouting,omitempty"`
 		ExternalUsageAutoDisable *bool   `json:"externalUsageAutoDisable,omitempty"`
 		WebhookURL               *string `json:"webhookURL,omitempty"`
+		MetricsEnabled           *bool   `json:"metricsEnabled,omitempty"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		w.WriteHeader(400)
@@ -4398,6 +4402,15 @@ func (h *Handler) apiUpdateSettings(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if err := config.UpdateWebhookURL(url); err != nil {
+			w.WriteHeader(500)
+			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+	}
+
+	// F9: Prometheus /metrics toggle (public, unauthenticated when enabled).
+	if req.MetricsEnabled != nil {
+		if err := config.UpdateMetricsEnabled(*req.MetricsEnabled); err != nil {
 			w.WriteHeader(500)
 			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
 			return

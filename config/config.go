@@ -227,6 +227,14 @@ type Config struct {
 	// tier, to avoid disabling on metering-lag noise.
 	ExternalUsageAutoDisable bool `json:"externalUsageAutoDisable,omitempty"`
 
+	// MetricsEnabled exposes a public, UNAUTHENTICATED Prometheus text-format
+	// endpoint at GET /metrics for standard scraping. Defaults to false because
+	// the endpoint is network-exposed without auth: enable it only when the
+	// scrape path is protected by network policy / a private interface. The
+	// exposition carries only aggregate operational gauges (request/token/credit
+	// counts, per-account usage and error counts) — never secrets or prompts.
+	MetricsEnabled bool `json:"metricsEnabled,omitempty"`
+
 	// WebhookURL, when set, receives a JSON POST for selected security/warning
 	// audit events (account banned, external usage detected, auto-disable). This
 	// is the ONLY feature that makes outbound requests to a third-party endpoint,
@@ -1291,6 +1299,25 @@ func UpdateWebhookURL(url string) error {
 	cfgLock.Lock()
 	defer cfgLock.Unlock()
 	cfg.WebhookURL = url
+	return Save()
+}
+
+// GetMetricsEnabled returns whether the public Prometheus /metrics endpoint is
+// enabled. Defaults to false.
+func GetMetricsEnabled() bool {
+	cfgLock.RLock()
+	defer cfgLock.RUnlock()
+	if cfg == nil {
+		return false
+	}
+	return cfg.MetricsEnabled
+}
+
+// UpdateMetricsEnabled sets the Prometheus metrics toggle and persists it.
+func UpdateMetricsEnabled(enabled bool) error {
+	cfgLock.Lock()
+	defer cfgLock.Unlock()
+	cfg.MetricsEnabled = enabled
 	return Save()
 }
 
