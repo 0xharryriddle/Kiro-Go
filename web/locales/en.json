@@ -678,5 +678,7 @@
   "anomaly.baseline": "Baseline (24h)",
   "anomaly.tier.normal": "Normal",
   "anomaly.tier.spike": "Spike",
-  "anomaly.tier.unknown": "Unknown"
+  "anomaly.tier.unknown": "Unknown",
+  "settings.filterPII": "Redact PII",
+  "settings.filterPIIHint": "Best-effort redaction of emails, SSNs, credit-card-like numbers, IPs, and API keys from the system prompt before it is sent upstream. May occasionally over-redact."
 }

@@ -277,6 +277,15 @@ type Config struct {
 	// FilterStripBoundaries removes --- SYSTEM PROMPT --- / --- END SYSTEM PROMPT --- markers.
 	FilterStripBoundaries bool `json:"filterStripBoundaries,omitempty"`
 
+	// FilterPII redacts common PII patterns (email addresses, credit-card-like
+	// numbers, US SSNs, IPv4 addresses, and bearer/API-key-like tokens) from the
+	// system prompt before it is sent upstream, replacing each match with a typed
+	// placeholder such as [REDACTED_EMAIL]. Defaults to false. This is a
+	// best-effort regex redaction, not a guarantee — it cannot catch every PII
+	// shape and may occasionally over-redact; enable it when the extra safety on
+	// outbound system prompts is worth that tradeoff.
+	FilterPII bool `json:"filterPII,omitempty"`
+
 	// PromptFilterRules is a list of user-defined prompt sanitization rules (regex or line-filter).
 	PromptFilterRules []PromptFilterRule `json:"promptFilterRules,omitempty"`
 
@@ -1093,11 +1102,22 @@ func GetFilterStripBoundaries() bool {
 	return cfg.FilterStripBoundaries
 }
 
+// GetFilterPII returns whether PII redaction of the system prompt is enabled.
+func GetFilterPII() bool {
+	cfgLock.RLock()
+	defer cfgLock.RUnlock()
+	if cfg == nil {
+		return false
+	}
+	return cfg.FilterPII
+}
+
 // PromptFilterConfig holds all prompt filter settings for API responses.
 type PromptFilterConfig struct {
 	FilterClaudeCode      bool               `json:"filterClaudeCode"`
 	FilterEnvNoise        bool               `json:"filterEnvNoise"`
 	FilterStripBoundaries bool               `json:"filterStripBoundaries"`
+	FilterPII             bool               `json:"filterPII"`
 	Rules                 []PromptFilterRule `json:"rules"`
 }
 
@@ -1114,17 +1134,19 @@ func GetPromptFilterConfig() PromptFilterConfig {
 		FilterClaudeCode:      cfg.FilterClaudeCode || cfg.SanitizeClaudeCodePrompt,
 		FilterEnvNoise:        cfg.FilterEnvNoise,
 		FilterStripBoundaries: cfg.FilterStripBoundaries,
+		FilterPII:             cfg.FilterPII,
 		Rules:                 rules,
 	}
 }
 
 // UpdatePromptFilterConfig saves all prompt filter settings atomically.
-func UpdatePromptFilterConfig(filterClaudeCode, filterEnvNoise, filterStripBoundaries bool, rules []PromptFilterRule) error {
+func UpdatePromptFilterConfig(filterClaudeCode, filterEnvNoise, filterStripBoundaries, filterPII bool, rules []PromptFilterRule) error {
 	cfgLock.Lock()
 	defer cfgLock.Unlock()
 	cfg.FilterClaudeCode = filterClaudeCode
 	cfg.FilterEnvNoise = filterEnvNoise
 	cfg.FilterStripBoundaries = filterStripBoundaries
+	cfg.FilterPII = filterPII
 	// Clear legacy flag to avoid double-applying after first save
 	cfg.SanitizeClaudeCodePrompt = false
 	if rules != nil {

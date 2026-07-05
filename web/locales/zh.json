@@ -678,5 +678,7 @@
   "anomaly.baseline": "基线（24 小时）",
   "anomaly.tier.normal": "正常",
   "anomaly.tier.spike": "峰值",
-  "anomaly.tier.unknown": "未知"
+  "anomaly.tier.unknown": "未知",
+  "settings.filterPII": "脱敏 PII",
+  "settings.filterPIIHint": "在系统提示词发送到上游前，尽力脱敏邮箱、社保号、类信用卡号、IP 和 API 密钥。可能偶尔过度脱敏。"
 }

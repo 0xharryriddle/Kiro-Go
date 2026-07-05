@@ -4267,6 +4267,7 @@ func (h *Handler) apiUpdatePromptFilter(w http.ResponseWriter, r *http.Request) 
 		FilterClaudeCode      *bool                      `json:"filterClaudeCode,omitempty"`
 		FilterEnvNoise        *bool                      `json:"filterEnvNoise,omitempty"`
 		FilterStripBoundaries *bool                      `json:"filterStripBoundaries,omitempty"`
+		FilterPII             *bool                      `json:"filterPII,omitempty"`
 		Rules                 *[]config.PromptFilterRule `json:"rules,omitempty"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -4280,6 +4281,7 @@ func (h *Handler) apiUpdatePromptFilter(w http.ResponseWriter, r *http.Request) 
 	fcc := current.FilterClaudeCode
 	fen := current.FilterEnvNoise
 	fsb := current.FilterStripBoundaries
+	fpii := current.FilterPII
 	rules := current.Rules
 	if req.FilterClaudeCode != nil {
 		fcc = *req.FilterClaudeCode
@@ -4290,10 +4292,13 @@ func (h *Handler) apiUpdatePromptFilter(w http.ResponseWriter, r *http.Request) 
 	if req.FilterStripBoundaries != nil {
 		fsb = *req.FilterStripBoundaries
 	}
+	if req.FilterPII != nil {
+		fpii = *req.FilterPII
+	}
 	if req.Rules != nil {
 		rules = *req.Rules
 	}
-	if err := config.UpdatePromptFilterConfig(fcc, fen, fsb, rules); err != nil {
+	if err := config.UpdatePromptFilterConfig(fcc, fen, fsb, fpii, rules); err != nil {
 		w.WriteHeader(500)
 		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
 		return

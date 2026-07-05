@@ -1,0 +1,13 @@
+[
+  {
+    "time": 1783278700,
+    "endpoint": "responses",
+    "model": "claude-sonnet-4.5",
+    "accountId": "test-account",
+    "accountEmail": "",
+    "status": "success",
+    "tokens": 6,
+    "credits": 0,
+    "duration": 0
+  }
+]

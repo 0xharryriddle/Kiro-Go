@@ -395,7 +395,43 @@ func applyPromptFilters(prompt string) string {
 		prompt = applyFilterRule(prompt, rule)
 	}
 
+	// 5. PII redaction — runs last so user rules act on the original text first.
+	if config.GetFilterPII() {
+		prompt = redactPII(prompt)
+	}
+
 	return strings.TrimSpace(prompt)
+}
+
+// piiPatterns are the compiled PII redaction rules, applied in order. Each maps a
+// regexp to a typed placeholder. Ordering matters: more specific patterns (API
+// keys, SSN) run before broader ones so a token is not partially eaten by a
+// looser rule. This is best-effort regex redaction, not a guarantee.
+var piiPatterns = []struct {
+	re          *regexp.Regexp
+	placeholder string
+}{
+	// Bearer / sk- style API keys and long opaque tokens (>= 20 word chars).
+	{regexp.MustCompile(`(?i)\b(?:sk|pk|rk)-[A-Za-z0-9_\-]{16,}\b`), "[REDACTED_API_KEY]"},
+	{regexp.MustCompile(`(?i)\bBearer\s+[A-Za-z0-9._\-]{16,}\b`), "Bearer [REDACTED_TOKEN]"},
+	// US SSN: 123-45-6789.
+	{regexp.MustCompile(`\b\d{3}-\d{2}-\d{4}\b`), "[REDACTED_SSN]"},
+	// Credit-card-like: 13-16 digits, optional space/dash groups.
+	{regexp.MustCompile(`\b(?:\d[ -]?){13,16}\b`), "[REDACTED_CC]"},
+	// Email addresses.
+	{regexp.MustCompile(`\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b`), "[REDACTED_EMAIL]"},
+	// IPv4 addresses.
+	{regexp.MustCompile(`\b(?:\d{1,3}\.){3}\d{1,3}\b`), "[REDACTED_IP]"},
+}
+
+// redactPII replaces common PII patterns with typed placeholders. Best-effort:
+// it cannot catch every PII shape and may occasionally over-redact. Applied only
+// when the FilterPII toggle is on.
+func redactPII(prompt string) string {
+	for _, p := range piiPatterns {
+		prompt = p.re.ReplaceAllString(prompt, p.placeholder)
+	}
+	return prompt
 }
 
 // applyFilterRule applies a single user-defined filter rule.
