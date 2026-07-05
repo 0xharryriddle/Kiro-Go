@@ -641,5 +641,17 @@
   "forecast.confidence.ok": "Projected",
   "forecast.confidence.idle": "Idle",
   "forecast.confidence.depleted": "Depleted",
-  "forecast.confidence.unknown": "Unknown"
+  "forecast.confidence.unknown": "Unknown",
+  "health.title": "Account Health",
+  "health.desc": "Rolling per-account health score from recent request outcomes. Spots a degrading credential (auth/suspended/profile errors) before it hard-bans. Benign quota errors are excluded.",
+  "health.heuristicNote": "Heuristic degradation score, not a validated ban predictor. AWS does not publish pre-ban signals; this scores observable failure patterns over the recent window.",
+  "health.empty": "No accounts to score.",
+  "health.score": "Score",
+  "health.windowRequests": "Window requests",
+  "health.dangerousErrors": "Dangerous errors",
+  "health.streak": "Consecutive",
+  "health.tier.healthy": "Healthy",
+  "health.tier.degraded": "Degraded",
+  "health.tier.critical": "Critical",
+  "health.tier.unknown": "Unknown"
 }

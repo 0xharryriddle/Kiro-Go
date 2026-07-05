@@ -2519,6 +2519,8 @@ func (h *Handler) handleAdminAPI(w http.ResponseWriter, r *http.Request) {
 		h.apiRecheckUsageAudit(w, r)
 	case path == "/accounts/fleet-forecast" && r.Method == "GET":
 		h.apiGetFleetForecast(w, r)
+	case path == "/accounts/health" && r.Method == "GET":
+		h.apiGetAccountHealth(w, r)
 	// models/refresh 必须在通用 /refresh 前匹配，否则会被误拦截
 	case path == "/accounts/models/refresh" && r.Method == "POST":
 		h.apiRefreshAllAccountsModels(w, r)

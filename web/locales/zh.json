@@ -641,5 +641,17 @@
   "forecast.confidence.ok": "已预测",
   "forecast.confidence.idle": "空闲",
   "forecast.confidence.depleted": "已耗尽",
-  "forecast.confidence.unknown": "未知"
+  "forecast.confidence.unknown": "未知",
+  "health.title": "账号健康度",
+  "health.desc": "基于近期请求结果的滚动账号健康评分。在账号被硬封禁前发现正在恶化的凭据（认证/停用/配置错误）。正常的配额错误已排除。",
+  "health.heuristicNote": "这是启发式恶化评分，不是经过验证的封禁预测器。AWS 不公开封禁前信号；此评分基于近期窗口内可观测的失败模式。",
+  "health.empty": "没有可评分的账号。",
+  "health.score": "评分",
+  "health.windowRequests": "窗口请求数",
+  "health.dangerousErrors": "危险错误",
+  "health.streak": "连续",
+  "health.tier.healthy": "健康",
+  "health.tier.degraded": "下降",
+  "health.tier.critical": "严重",
+  "health.tier.unknown": "未知"
 }

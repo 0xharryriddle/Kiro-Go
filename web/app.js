@@ -1339,6 +1339,59 @@
     }).join('') + '</div>';
   }
 
+  async function loadAccountHealth() {
+    const box = $('accountHealthBody');
+    if (box) box.textContent = t('diag.loading');
+    const res = await api('/accounts/health');
+    if (!res.ok) return;
+    const data = await res.json();
+    renderAccountHealth(data);
+  }
+
+  function healthTierMeta(tier) {
+    switch (tier) {
+      case 'healthy': return { cls: 'usage-badge--clean', label: t('health.tier.healthy') };
+      case 'degraded': return { cls: 'usage-badge--external', label: t('health.tier.degraded') };
+      case 'critical': return { cls: 'usage-badge--strong', label: t('health.tier.critical') };
+      default: return { cls: 'usage-badge--unknown', label: t('health.tier.unknown') };
+    }
+  }
+
+  function renderAccountHealth(data) {
+    const summaryBox = $('accountHealthSummary');
+    const box = $('accountHealthBody');
+    if (!box) return;
+    const summary = (data && data.summary) || {};
+    const items = (data && data.items) || [];
+    if (summaryBox) {
+      summaryBox.innerHTML =
+        '<span class="usage-badge usage-badge--clean">' + escapeHtml(t('health.tier.healthy')) + ': <strong>' + escapeHtml(String(summary.healthy || 0)) + '</strong></span>' +
+        '<span class="usage-badge usage-badge--external">' + escapeHtml(t('health.tier.degraded')) + ': <strong>' + escapeHtml(String(summary.degraded || 0)) + '</strong></span>' +
+        '<span class="usage-badge usage-badge--strong">' + escapeHtml(t('health.tier.critical')) + ': <strong>' + escapeHtml(String(summary.critical || 0)) + '</strong></span>' +
+        '<span class="usage-badge usage-badge--unknown">' + escapeHtml(t('health.tier.unknown')) + ': <strong>' + escapeHtml(String(summary.unknown || 0)) + '</strong></span>';
+    }
+    if (!items.length) {
+      box.innerHTML = '<div class="empty-state">' + escapeHtml(t('health.empty')) + '</div>';
+      return;
+    }
+    box.innerHTML = '<div class="diag-list">' + items.map(item => {
+      const meta = healthTierMeta(item.tier);
+      const chipCls = (item.tier === 'critical' || item.tier === 'degraded') ? 'diag-chip--warn' : 'diag-chip--ok';
+      const scoreStr = item.tier === 'unknown' ? '-' : String(item.score);
+      return '<div class="diag-chip ' + chipCls + '">' +
+        '<div class="usage-row-head">' +
+          '<strong>' + escapeHtml(accountLabel(item.accountId, item.email)) + '</strong>' +
+          '<span class="usage-badge ' + meta.cls + '">' + escapeHtml(meta.label) + '</span>' +
+          (item.enabled ? '' : '<span class="usage-flag">' + escapeHtml(t('forecast.disabled')) + '</span>') +
+        '</div>' +
+        '<span>' + escapeHtml(t('health.score')) + ': <strong>' + escapeHtml(scoreStr) + '</strong></span>' +
+        '<span>' + escapeHtml(t('health.windowRequests')) + ': ' + escapeHtml(String(item.windowRequests || 0)) +
+          ' · ' + escapeHtml(t('health.dangerousErrors')) + ': ' + escapeHtml(String(item.dangerousErrors || 0)) +
+          (item.consecutiveDangerous > 0 ? ' · ' + escapeHtml(t('health.streak')) + ': ' + escapeHtml(String(item.consecutiveDangerous)) : '') + '</span>' +
+        '</div>';
+    }).join('') + '</div>';
+  }
+
   async function runExternalIdpLiveCheck(accountId) {
     if (!accountId) return;
     const res = await api('/accounts/external-idp-diagnostics/live', { method: 'POST', body: JSON.stringify({ accountId }) });
@@ -3445,6 +3498,7 @@
     if (panelId === 'auditLogsCard') loadAuditLogs();
     if (panelId === 'usageAuditCard') loadUsageAudit();
     if (panelId === 'fleetForecastCard') loadFleetForecast();
+    if (panelId === 'accountHealthCard') loadAccountHealth();
     const panel = $(panelId);
     if (panel) panel.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
   }
@@ -3914,6 +3968,8 @@
     if (refreshUsageAuditBtn) refreshUsageAuditBtn.addEventListener('click', loadUsageAudit);
     const refreshFleetForecastBtn = $('refreshFleetForecastBtn');
     if (refreshFleetForecastBtn) refreshFleetForecastBtn.addEventListener('click', loadFleetForecast);
+    const refreshAccountHealthBtn = $('refreshAccountHealthBtn');
+    if (refreshAccountHealthBtn) refreshAccountHealthBtn.addEventListener('click', loadAccountHealth);
     const recheckUsageAuditBtn = $('recheckUsageAuditBtn');
     if (recheckUsageAuditBtn) recheckUsageAuditBtn.addEventListener('click', () => recheckUsageAudit());
     const usageAuditBody = $('usageAuditBody');

@@ -253,6 +253,7 @@
           <button type="button" class="btn btn-outline btn-sm tool-launch-btn" data-tool-panel="replayDiagnosticsCard" data-i18n="replay.title"></button>
           <button type="button" class="btn btn-outline btn-sm tool-launch-btn" data-tool-panel="usageAuditCard" data-i18n="usageAudit.title"></button>
           <button type="button" class="btn btn-outline btn-sm tool-launch-btn" data-tool-panel="fleetForecastCard" data-i18n="forecast.title"></button>
+          <button type="button" class="btn btn-outline btn-sm tool-launch-btn" data-tool-panel="accountHealthCard" data-i18n="health.title"></button>
           <button type="button" class="btn btn-outline btn-sm tool-launch-btn" data-tool-panel="auditLogsCard" data-i18n="audit.title"></button>
         </div>
 
@@ -323,6 +324,17 @@
         <div id="fleetForecastSummary" class="usage-audit-summary"></div>
         <div id="fleetForecastBody" class="diag-body muted-text" data-i18n="diag.loading"></div>
         <p class="muted-text usage-audit-note" data-i18n="forecast.creditsNote"></p>
+      </div>
+
+      <div class="card tool-panel hidden" id="accountHealthCard">
+        <div class="card-header">
+          <span class="card-title" data-i18n="health.title"></span>
+          <button class="btn btn-outline btn-sm" id="refreshAccountHealthBtn" data-i18n="common.refresh"></button>
+        </div>
+        <p class="muted-text" data-i18n="health.desc"></p>
+        <div id="accountHealthSummary" class="usage-audit-summary"></div>
+        <div id="accountHealthBody" class="diag-body muted-text" data-i18n="diag.loading"></div>
+        <p class="muted-text usage-audit-note" data-i18n="health.heuristicNote"></p>
       </div>
 
       <div class="card tool-panel hidden" id="auditLogsCard">
