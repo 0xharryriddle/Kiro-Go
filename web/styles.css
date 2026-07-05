@@ -28,6 +28,7 @@
   --success-foreground: #ffffff;
   --warning: #ffae04;
   --warning-foreground: #000000;
+  --warning-text: #8a5a00;
   --info: #2d62ef;
   --info-foreground: #ffffff;
   --brand-purple: #9148ff;
@@ -83,6 +84,7 @@
   --success-foreground: #001f1d;
   --warning: #ffae04;
   --warning-foreground: #000000;
+  --warning-text: #ffd166;
   --info: #2671f4;
   --info-foreground: #ffffff;
   --brand-purple: #b582ff;
@@ -3569,7 +3571,7 @@ img.brand-icon {
   color: var(--info);
 }
 .model-icon--alias {
-  color: var(--warning);
+  color: var(--warning-text);
 }
 .model-info {
   min-width: 0;
@@ -3801,7 +3803,7 @@ img.brand-icon {
 }
 
 .warning-text {
-  color: var(--warning);
+  color: var(--warning-text);
   font-weight: 600;
 }
 
@@ -3881,7 +3883,7 @@ img.brand-icon {
 
 .security-banner p {
   margin: 0.25rem 0 0;
-  color: var(--muted);
+  color: var(--foreground);
 }
 
 .security-banner-icon {
@@ -3890,8 +3892,8 @@ img.brand-icon {
   width: 2.5rem;
   height: 2.5rem;
   border-radius: 999px;
-  background: color-mix(in srgb, var(--warning) 22%, transparent);
-  color: var(--warning);
+  background: color-mix(in srgb, var(--warning) 22%, var(--card));
+  color: var(--warning-text);
 }
 
 .security-banner .btn {
@@ -4002,4 +4004,10 @@ img.brand-icon {
   }
 }
 
-.account-local-routing-hint { margin-top: 0.35rem; color: var(--muted); font-size: 0.76rem; line-height: 1.35; max-width: 48rem; }
+.account-local-routing-hint {
+  margin-top: 0.35rem;
+  color: var(--muted-foreground);
+  font-size: 0.76rem;
+  line-height: 1.35;
+  max-width: 48rem;
+}
