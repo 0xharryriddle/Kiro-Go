@@ -25,6 +25,9 @@ type importCredentialRequest struct {
 	IssuerURL     string
 	Scopes        string
 	ProfileArn    string
+	// Optional identity preservation when pasting a full account record.
+	ID     string
+	UserID string
 	// Label-only metadata (never used as an auth input).
 	Email    string
 	Nickname string
@@ -62,6 +65,8 @@ type rawCredential struct {
 	Provider string `json:"provider"`
 	IDP      string `json:"idp"`
 	Type     string `json:"type"`
+	ID       string `json:"id"`
+	UserID   string `json:"userId"`
 
 	// Label material — email may arrive as a token claim alias.
 	Email             string `json:"email"`
@@ -153,6 +158,8 @@ func normalizeRawCredential(rc rawCredential) importCredentialRequest {
 		IssuerURL:     issuerURL,
 		Scopes:        strings.TrimSpace(rc.Scopes),
 		ProfileArn:    profileArn,
+		ID:            strings.TrimSpace(rc.ID),
+		UserID:        strings.TrimSpace(rc.UserID),
 		Email:         firstNonEmpty(rc.Email, rc.PreferredUsername, rc.UPN),
 		Nickname:      strings.TrimSpace(rc.Nickname),
 	}

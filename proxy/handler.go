@@ -3327,6 +3327,7 @@ func (h *Handler) apiImportSsoToken(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) apiImportCredentials(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
 		w.WriteHeader(400)
@@ -3392,38 +3393,70 @@ func (h *Handler) importOne(req importCredentialRequest) (config.Account, error)
 	if req.Region == "" {
 		req.Region = "us-east-1"
 	}
-	if req.AuthMethod == "" {
-		req.AuthMethod = normalizeAuthMethod("", req.TokenEndpoint, req.ClientID, req.ClientSecret)
+	req.AuthMethod = normalizeAuthMethod(req.AuthMethod, req.TokenEndpoint, req.ClientID, req.ClientSecret)
+
+	derivedTE, derivedIss, derivedScopes := auth.DeriveExternalIdpEndpoints(req.UserID, req.ClientID, req.AccessToken)
+	if derivedTE != "" && auth.ValidateExternalIdpEndpoint(derivedTE) == nil && req.AuthMethod != "external_idp" {
+		req.AuthMethod = "external_idp"
 	}
-	// external_idp refreshes against the IdP token endpoint (refresh_token grant,
-	// public client). Without tokenEndpoint+clientId, refreshExternalIdpToken
-	// hard-fails with an opaque error; reject up front with an actionable message.
 	if req.AuthMethod == "external_idp" {
+		if req.TokenEndpoint == "" {
+			req.TokenEndpoint = derivedTE
+		}
+		if req.IssuerURL == "" {
+			req.IssuerURL = derivedIss
+		}
+		if req.Scopes == "" {
+			req.Scopes = derivedScopes
+		}
 		if strings.TrimSpace(req.TokenEndpoint) == "" || strings.TrimSpace(req.ClientID) == "" {
 			return config.Account{}, &importValidationError{
-				"external_idp import requires token_endpoint and client_id (mint them with kiro-login-helper.py)",
+				"external_idp import requires token_endpoint and client_id (or userId/accessToken to derive them)",
+			}
+		}
+		if err := auth.ValidateExternalIdpEndpoint(req.TokenEndpoint); err != nil {
+			return config.Account{}, &importValidationError{"external IdP endpoint rejected: " + err.Error()}
+		}
+		if req.IssuerURL != "" {
+			if err := auth.ValidateExternalIdpEndpoint(req.IssuerURL); err != nil {
+				return config.Account{}, &importValidationError{"external IdP issuer rejected: " + err.Error()}
 			}
 		}
 	}
 
-	// Mandatory refresh. Carry the external_idp material so the external branch in
-	// auth.RefreshToken actually succeeds.
-	tempAccount := &config.Account{
-		RefreshToken:  req.RefreshToken,
-		ClientID:      req.ClientID,
-		ClientSecret:  req.ClientSecret,
-		AuthMethod:    req.AuthMethod,
-		Region:        req.Region,
-		TokenEndpoint: req.TokenEndpoint,
-		IssuerURL:     req.IssuerURL,
-		Scopes:        req.Scopes,
+	var (
+		accessToken     string
+		expiresAt       int64
+		newProfileArn   string
+		newRefreshToken string
+		refreshErr      error
+	)
+	if req.AuthMethod == "external_idp" && req.AccessToken != "" {
+		if exp := auth.ExpFromAccessTokenJWT(req.AccessToken); exp > 0 {
+			accessToken = req.AccessToken
+			expiresAt = exp
+		}
 	}
-	accessToken, newRefreshToken, expiresAt, newProfileArn, err := auth.RefreshToken(tempAccount)
-	if err != nil {
-		return config.Account{}, &importValidationError{"Token refresh failed: " + err.Error()}
-	}
-	if newRefreshToken != "" {
-		req.RefreshToken = newRefreshToken
+	if accessToken == "" {
+		// Mandatory refresh unless a trustworthy external_idp access token with exp
+		// was pasted. Carry external_idp material so auth.RefreshToken succeeds.
+		tempAccount := &config.Account{
+			RefreshToken:  req.RefreshToken,
+			ClientID:      req.ClientID,
+			ClientSecret:  req.ClientSecret,
+			AuthMethod:    req.AuthMethod,
+			Region:        req.Region,
+			TokenEndpoint: req.TokenEndpoint,
+			IssuerURL:     req.IssuerURL,
+			Scopes:        req.Scopes,
+		}
+		accessToken, newRefreshToken, expiresAt, newProfileArn, refreshErr = auth.RefreshToken(tempAccount)
+		if refreshErr != nil {
+			return config.Account{}, &importValidationError{"Token refresh failed: " + refreshErr.Error()}
+		}
+		if newRefreshToken != "" {
+			req.RefreshToken = newRefreshToken
+		}
 	}
 
 	// Email: prefer the request-supplied label; else best-effort from the token.
@@ -3435,8 +3468,12 @@ func (h *Handler) importOne(req importCredentialRequest) (config.Account, error)
 		email = emailFromJWT(accessToken)
 	}
 
+	accountID := strings.TrimSpace(req.ID)
+	if accountID == "" || config.AccountIDExists(accountID) {
+		accountID = auth.GenerateAccountID()
+	}
 	account := config.Account{
-		ID:            auth.GenerateAccountID(),
+		ID:            accountID,
 		Email:         email,
 		Nickname:      req.Nickname,
 		AccessToken:   accessToken,

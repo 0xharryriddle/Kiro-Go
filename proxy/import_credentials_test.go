@@ -164,6 +164,8 @@ func TestApiImportCredentialsExternalIdpHappyPath(t *testing.T) {
 		fmt.Fprintf(w, `{"access_token":%q,"refresh_token":"rt-idp-rotated","expires_in":%d}`, importedAccessToken, upstreamExpiresIn)
 	}))
 	defer idp.Close()
+	restoreValidator := auth.SetExternalIdpValidatorForTest(func(string) error { return nil })
+	defer auth.SetExternalIdpValidatorForTest(restoreValidator)
 
 	h := &Handler{pool: accountpool.GetPool()}
 
@@ -304,6 +306,8 @@ func TestApiImportCliJsonBatch(t *testing.T) {
 		fmt.Fprint(w, `{"access_token":"at","refresh_token":"rt2","expires_in":3600}`)
 	}))
 	defer idp.Close()
+	restoreValidator := auth.SetExternalIdpValidatorForTest(func(string) error { return nil })
+	defer auth.SetExternalIdpValidatorForTest(restoreValidator)
 
 	h := &Handler{pool: accountpool.GetPool()}
 

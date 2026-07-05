@@ -59,6 +59,8 @@ func TestImportWatcherProcessesValidFile(t *testing.T) {
 
 	idp := newExternalIdpTokenServer(t)
 	defer idp.Close()
+	restoreValidator := auth.SetExternalIdpValidatorForTest(func(string) error { return nil })
+	defer auth.SetExternalIdpValidatorForTest(restoreValidator)
 
 	dir := t.TempDir()
 	writeHelperFile(t, dir, "CLIProxyAPI_user.json", idp.URL, "rt-watch", "user@example.com")
@@ -138,6 +140,8 @@ func TestImportWatcherSkipsDuplicate(t *testing.T) {
 
 	idp := newExternalIdpTokenServer(t)
 	defer idp.Close()
+	restoreValidator := auth.SetExternalIdpValidatorForTest(func(string) error { return nil })
+	defer auth.SetExternalIdpValidatorForTest(restoreValidator)
 
 	dir := t.TempDir()
 	writeHelperFile(t, dir, "dup.json", idp.URL, "rt-dup", "dup@example.com")
