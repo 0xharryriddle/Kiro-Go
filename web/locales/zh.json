@@ -579,27 +579,21 @@
   "errors.typeOverage": "超额",
   "errors.typeProfile": "配置",
   "errors.typeUnknown": "未知",
-  "externalIdpDiag": {
-    "title": "外部 IdP 诊断",
-    "desc": "对已导入的外部 IdP 账号执行静态检查。此面板不会触发实时刷新。",
-    "empty": "未找到外部 IdP 账号。",
-    "total": "外部 IdP",
-    "healthy": "健康",
-    "warning": "警告",
-    "error": "错误",
-    "endpoint": "令牌端点",
-    "liveCheck": "实时刷新检查",
-    "liveSuccess": "外部 IdP 实时刷新检查通过"
-  },
-  "recovery": {
-    "issuerUrl": "签发者 URL",
-    "derivedFrom": "推导来源",
-    "endpointValidation": "端点校验",
-    "trustOnImport": "正在使用粘贴的访问令牌过期时间，未实时刷新；导入后请运行诊断。"
-  },
-  "audit": {
-    "title": "审计日志",
-    "desc": "导入、诊断和恢复操作的安全事件记录。不会记录密钥。",
-    "empty": "暂无审计事件。"
-  }
+  "externalIdpDiag.title": "外部 IdP 诊断",
+  "externalIdpDiag.desc": "检查已导入的外部 IdP 账号。实时检查只会在你点击后执行。",
+  "externalIdpDiag.total": "外部 IdP 账号",
+  "externalIdpDiag.healthy": "健康",
+  "externalIdpDiag.warning": "警告",
+  "externalIdpDiag.error": "错误",
+  "externalIdpDiag.empty": "未找到外部 IdP 账号。",
+  "externalIdpDiag.endpoint": "令牌端点",
+  "externalIdpDiag.liveCheck": "实时刷新检查",
+  "externalIdpDiag.liveSuccess": "外部 IdP 实时刷新检查通过",
+  "audit.title": "审计日志",
+  "audit.desc": "导入、诊断和恢复操作的安全事件记录。不会记录密钥。",
+  "audit.empty": "暂无审计事件。",
+  "recovery.issuerUrl": "签发方 URL",
+  "recovery.endpointValidation": "端点验证",
+  "recovery.derivedFrom": "派生来源",
+  "recovery.trustOnImport": "导入时信任"
 }

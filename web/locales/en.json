@@ -579,27 +579,21 @@
   "errors.typeOverage": "Overage",
   "errors.typeProfile": "Profile",
   "errors.typeUnknown": "Unknown",
-  "externalIdpDiag": {
-    "title": "External IdP Diagnostics",
-    "desc": "Static checks for imported external IdP accounts. No live refresh is attempted from this panel.",
-    "empty": "No external IdP accounts found.",
-    "total": "External IdP",
-    "healthy": "Healthy",
-    "warning": "Warnings",
-    "error": "Errors",
-    "endpoint": "Token endpoint",
-    "liveCheck": "Live refresh check",
-    "liveSuccess": "External IdP live refresh check passed"
-  },
-  "recovery": {
-    "issuerUrl": "Issuer URL",
-    "derivedFrom": "Derived from",
-    "endpointValidation": "Endpoint validation",
-    "trustOnImport": "Using pasted access token expiry without live refresh; run diagnostics after import."
-  },
-  "audit": {
-    "title": "Audit Logs",
-    "desc": "Safe operational events for imports, diagnostics, and recovery actions. Secrets are not recorded.",
-    "empty": "No audit events yet."
-  }
+  "externalIdpDiag.title": "External IdP Diagnostics",
+  "externalIdpDiag.desc": "Static checks for imported external IdP accounts. Live checks run only when you click them.",
+  "externalIdpDiag.total": "External IdP accounts",
+  "externalIdpDiag.healthy": "Healthy",
+  "externalIdpDiag.warning": "Warnings",
+  "externalIdpDiag.error": "Errors",
+  "externalIdpDiag.empty": "No external IdP accounts found.",
+  "externalIdpDiag.endpoint": "Token endpoint",
+  "externalIdpDiag.liveCheck": "Live refresh check",
+  "externalIdpDiag.liveSuccess": "External IdP live refresh check passed",
+  "audit.title": "Audit Logs",
+  "audit.desc": "Safe operational events for imports, diagnostics, and recovery actions. Secrets are not recorded.",
+  "audit.empty": "No audit events yet.",
+  "recovery.issuerUrl": "Issuer URL",
+  "recovery.endpointValidation": "Endpoint validation",
+  "recovery.derivedFrom": "Derived from",
+  "recovery.trustOnImport": "Trust-on-import"
 }

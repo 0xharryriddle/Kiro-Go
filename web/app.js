@@ -106,10 +106,20 @@
     }
     return dict[lang];
   }
+  function lookupLocaleValue(locale, key) {
+    if (!locale) return '';
+    if (locale[key]) return locale[key];
+    let node = locale;
+    for (const part of String(key).split('.')) {
+      if (!node || typeof node !== 'object' || !(part in node)) return '';
+      node = node[part];
+    }
+    return typeof node === 'string' ? node : '';
+  }
   function t(key, ...args) {
     const active = dict[currentLang] || {};
-    const fallback = dict.zh || {};
-    let text = active[key] || fallback[key] || key;
+    const fallback = dict.en || dict.zh || {};
+    let text = lookupLocaleValue(active, key) || lookupLocaleValue(fallback, key) || key;
     args.forEach((arg, idx) => { text = text.replace('{' + idx + '}', arg); });
     return text;
   }
