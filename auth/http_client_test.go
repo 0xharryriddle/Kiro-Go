@@ -6,6 +6,13 @@ import (
 	"testing"
 )
 
+func TestBuildAuthTransportDirectUsesNoProxy(t *testing.T) {
+	transport := buildAuthTransport("direct")
+	if transport.Proxy != nil {
+		t.Fatalf("direct auth transport should not use a proxy")
+	}
+}
+
 func TestBuildAuthTransportUsesExplicitProxyURL(t *testing.T) {
 	transport := buildAuthTransport("http://proxy.local:8080")
 	req := &http.Request{URL: mustParseURL(t, "https://oidc.us-east-1.amazonaws.com")}

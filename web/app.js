@@ -1964,7 +1964,7 @@
   }
   async function saveProxyURL(id) {
     const url = $('proxyURLInput').value.trim();
-    if (url && !/^(socks5|socks5h|http|https):\/\//.test(url)) {
+    if (url && !/^(socks5|socks5h|http|https):\/\//.test(url) && !/^(direct|none|off|no_proxy|noproxy)$/i.test(url)) {
       toast(t('detail.proxyFormatError'), 'warning'); return;
     }
     await putAccount(id, { proxyURL: url }, t('detail.proxySaved'));

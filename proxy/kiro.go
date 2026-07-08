@@ -22,11 +22,13 @@ import (
 )
 
 // Endpoint configuration (auto-fallback on quota exhaustion).
+const directProxyOptOut = "direct"
+
 type kiroEndpoint struct {
+	Name      string
 	URL       string
 	Origin    string
 	AmzTarget string
-	Name      string
 }
 
 var kiroEndpoints = []kiroEndpoint{
@@ -103,7 +105,7 @@ func ResolveAccountProxyURL(account *config.Account) string {
 		// Per-account opt-out: imported IDE credentials often need to mirror the IDE's
 		// direct network path even when Kiro-Go has a global proxy configured.
 		if isDirectProxyOptOut(account.ProxyURL) {
-			return ""
+			return directProxyOptOut
 		}
 		return normalizeOutboundProxyURL(account.ProxyURL)
 	}
@@ -121,8 +123,11 @@ func isDirectProxyOptOut(raw string) bool {
 
 func normalizeOutboundProxyURL(raw string) string {
 	raw = strings.TrimSpace(raw)
-	if raw == "" || isDirectProxyOptOut(raw) {
+	if raw == "" {
 		return ""
+	}
+	if isDirectProxyOptOut(raw) {
+		return directProxyOptOut
 	}
 	if !strings.Contains(raw, "://") {
 		return "http://" + raw
@@ -138,6 +143,9 @@ func buildKiroTransport(proxyURL string) *http.Transport {
 		IdleConnTimeout:     90 * time.Second,
 		DisableCompression:  false,
 		ForceAttemptHTTP2:   true,
+	}
+	if isDirectProxyOptOut(proxyURL) {
+		return t
 	}
 	if proxyURL != "" {
 		if u, err := url.Parse(proxyURL); err == nil {

@@ -25,7 +25,9 @@ var socialTokenURL = func() string {
 // RefreshToken 刷新 access token
 // Returns: accessToken, refreshToken, expiresAt, profileArn, error
 func RefreshToken(account *config.Account) (string, string, int64, string, error) {
-	// Resolve per-account proxy: account.ProxyURL > global config
+	// Resolve per-account proxy: account.ProxyURL > global config. A direct opt-out
+	// must not fall back to the global proxy; imported IDE accounts may need to
+	// mirror the IDE's no-proxy path while other accounts still use global proxy.
 	proxyURL := account.ProxyURL
 	if proxyURL == "" {
 		proxyURL = config.GetProxyURL()

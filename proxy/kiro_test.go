@@ -181,8 +181,15 @@ func TestNormalizeOutboundProxyURLPreservesCredentials(t *testing.T) {
 }
 
 func TestResolveAccountProxyURLPerAccountDirectOptOut(t *testing.T) {
-	if got := ResolveAccountProxyURL(&config.Account{ProxyURL: "direct"}); got != "" {
+	if got := ResolveAccountProxyURL(&config.Account{ProxyURL: "direct"}); got != directProxyOptOut {
 		t.Fatalf("direct per-account proxy should bypass global proxy, got %q", got)
+	}
+}
+
+func TestBuildKiroTransportDirectUsesNoProxy(t *testing.T) {
+	transport := buildKiroTransport("direct")
+	if transport.Proxy != nil {
+		t.Fatalf("direct transport should not use a proxy")
 	}
 }
 

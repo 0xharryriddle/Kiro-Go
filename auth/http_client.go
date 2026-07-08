@@ -4,6 +4,7 @@ package auth
 import (
 	"net/http"
 	"net/url"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -22,6 +23,15 @@ func httpClient() *http.Client {
 
 func init() {
 	InitHttpClient("")
+}
+
+func IsDirectProxyOptOut(proxyURL string) bool {
+	switch strings.ToLower(strings.TrimSpace(proxyURL)) {
+	case "direct", "none", "no_proxy", "noproxy", "off":
+		return true
+	default:
+		return false
+	}
 }
 
 // GetAuthClientForProxy returns an auth HTTP client for the given proxy URL.
@@ -49,6 +59,9 @@ func buildAuthTransport(proxyURL string) *http.Transport {
 		IdleConnTimeout:     90 * time.Second,
 		DisableCompression:  false,
 		ForceAttemptHTTP2:   true,
+	}
+	if IsDirectProxyOptOut(proxyURL) {
+		return t
 	}
 	if proxyURL != "" {
 		if u, err := url.Parse(proxyURL); err == nil {
