@@ -21,7 +21,11 @@ import (
 // upstream response, never a stale cached timestamp.
 
 // defaultIdeCacheRelPath is the IDE credential cache location relative to $HOME.
-const defaultIdeCacheRelPath = ".aws/sso/cache/kiro-auth-token.json"
+const (
+	defaultIdeCacheRelPath    = ".aws/sso/cache/kiro-auth-token.json"
+	defaultIdeProfileRelPath  = ".config/Kiro/User/globalStorage/kiro.kiroagent/profile.json"
+	kiroProfileArnJSONMaxSize = 1 << 20 // 1 MiB guard for local companion metadata.
+)
 
 // ideCachePath resolves the Kiro IDE credential cache path. An explicit argument
 // wins; then the KIRO_IDE_CACHE env var; then ~/.aws/sso/cache/kiro-auth-token.json.
@@ -89,7 +93,71 @@ func readIdeCacheCredential(path string) (importCredentialRequest, error) {
 				"tokenEndpoint/clientId; cannot build a refreshable credential",
 		}
 	}
+	if strings.TrimSpace(req.ProfileArn) == "" {
+		if profileArn := readKiroIdeProfileArn(); profileArn != "" {
+			req.ProfileArn = profileArn
+			if region := regionFromProfileArn(profileArn); region != "" {
+				req.Region = region
+			}
+		}
+	}
 	return req, nil
+}
+
+func readKiroIdeProfileArn() string {
+	if p := strings.TrimSpace(os.Getenv("KIRO_IDE_PROFILE")); p != "" {
+		if arn := readProfileArnJSONFile(p); arn != "" {
+			return arn
+		}
+	}
+	home, err := os.UserHomeDir()
+	if err != nil || strings.TrimSpace(home) == "" {
+		return ""
+	}
+	return readProfileArnJSONFile(filepath.Join(home, defaultIdeProfileRelPath))
+}
+
+func readProfileArnJSONFile(path string) string {
+	info, err := os.Stat(path)
+	if err != nil || info.IsDir() || info.Size() > kiroProfileArnJSONMaxSize {
+		return ""
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return ""
+	}
+	var v interface{}
+	if err := json.Unmarshal(raw, &v); err != nil {
+		return ""
+	}
+	return findProfileArnValue(v)
+}
+
+func findProfileArnValue(v interface{}) string {
+	switch x := v.(type) {
+	case string:
+		if strings.HasPrefix(strings.TrimSpace(x), "arn:aws:codewhisperer:") {
+			return strings.TrimSpace(x)
+		}
+	case []interface{}:
+		for _, item := range x {
+			if arn := findProfileArnValue(item); arn != "" {
+				return arn
+			}
+		}
+	case map[string]interface{}:
+		for _, key := range []string{"arn", "profileArn", "profile_arn"} {
+			if arn := findProfileArnValue(x[key]); arn != "" {
+				return arn
+			}
+		}
+		for _, item := range x {
+			if arn := findProfileArnValue(item); arn != "" {
+				return arn
+			}
+		}
+	}
+	return ""
 }
 
 func emailFromJWT(token string) string {

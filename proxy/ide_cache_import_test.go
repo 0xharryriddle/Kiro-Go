@@ -115,6 +115,45 @@ func TestReadIdeCacheCredentialExternalIdpMissingEndpoint(t *testing.T) {
 }
 
 // TestIdeCachePathPrecedence verifies explicit > env > default resolution.
+func TestReadProfileArnJSONFile(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "profile.json")
+	want := "arn:aws:codewhisperer:us-east-1:123456789012:profile/ABCDEF"
+	if err := os.WriteFile(path, []byte(`{"arn":"`+want+`","name":"KiroProfile-us-east-1"}`), 0o600); err != nil {
+		t.Fatalf("write profile: %v", err)
+	}
+	if got := readProfileArnJSONFile(path); got != want {
+		t.Fatalf("profileArn = %q, want %q", got, want)
+	}
+}
+
+func TestReadIdeCacheCredentialUsesCompanionProfileFile(t *testing.T) {
+	dir := t.TempDir()
+	profilePath := filepath.Join(dir, "profile.json")
+	want := "arn:aws:codewhisperer:eu-central-1:123456789012:profile/ABCDEF"
+	if err := os.WriteFile(profilePath, []byte(`{"arn":"`+want+`"}`), 0o600); err != nil {
+		t.Fatalf("write profile: %v", err)
+	}
+	t.Setenv("KIRO_IDE_PROFILE", profilePath)
+	path := writeTempCache(t, `{
+	  "accessToken": "at-ide",
+	  "refreshToken": "rt-ide",
+	  "authMethod": "external_idp",
+	  "tokenEndpoint": "https://login.microsoftonline.com/tenant/oauth2/v2.0/token",
+	  "clientId": "azure-client-123"
+	}`)
+	req, err := readIdeCacheCredential(path)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if req.ProfileArn != want {
+		t.Fatalf("profileArn = %q, want %q", req.ProfileArn, want)
+	}
+	if req.Region != "eu-central-1" {
+		t.Fatalf("region = %q, want profile region", req.Region)
+	}
+}
+
 func TestIdeCachePathPrecedence(t *testing.T) {
 	if got := ideCachePath("/explicit/path.json"); got != "/explicit/path.json" {
 		t.Fatalf("explicit arg should win, got %q", got)

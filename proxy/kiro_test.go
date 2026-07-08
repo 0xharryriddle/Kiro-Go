@@ -166,6 +166,26 @@ func TestHandleToolUseEventReplacesGeneratedIDWhenRealIDArrives(t *testing.T) {
 	}
 }
 
+func TestNormalizeOutboundProxyURLAddsDefaultScheme(t *testing.T) {
+	got := normalizeOutboundProxyURL("proxy.local:8080")
+	if got != "http://proxy.local:8080" {
+		t.Fatalf("expected http scheme default, got %q", got)
+	}
+}
+
+func TestNormalizeOutboundProxyURLPreservesCredentials(t *testing.T) {
+	got := normalizeOutboundProxyURL("user:pass@proxy.local:8080")
+	if got != "http://user:pass@proxy.local:8080" {
+		t.Fatalf("expected credentials preserved with default scheme, got %q", got)
+	}
+}
+
+func TestResolveAccountProxyURLPerAccountDirectOptOut(t *testing.T) {
+	if got := ResolveAccountProxyURL(&config.Account{ProxyURL: "direct"}); got != "" {
+		t.Fatalf("direct per-account proxy should bypass global proxy, got %q", got)
+	}
+}
+
 func TestBuildKiroTransportUsesExplicitProxyURL(t *testing.T) {
 	transport := buildKiroTransport("http://proxy.local:8080")
 	req := &http.Request{URL: mustParseURL(t, "https://q.us-east-1.amazonaws.com")}

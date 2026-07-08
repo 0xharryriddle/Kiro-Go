@@ -99,10 +99,35 @@ func GetRestClientForProxy(proxyURL string) *http.Client {
 // ResolveAccountProxyURL returns the effective proxy URL for an account.
 // Falls back to global config.GetProxyURL() if the account has no per-account proxy.
 func ResolveAccountProxyURL(account *config.Account) string {
-	if account != nil && account.ProxyURL != "" {
-		return account.ProxyURL
+	if account != nil && strings.TrimSpace(account.ProxyURL) != "" {
+		// Per-account opt-out: imported IDE credentials often need to mirror the IDE's
+		// direct network path even when Kiro-Go has a global proxy configured.
+		if isDirectProxyOptOut(account.ProxyURL) {
+			return ""
+		}
+		return normalizeOutboundProxyURL(account.ProxyURL)
 	}
-	return config.GetProxyURL()
+	return normalizeOutboundProxyURL(config.GetProxyURL())
+}
+
+func isDirectProxyOptOut(raw string) bool {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "direct", "none", "no_proxy", "noproxy", "off":
+		return true
+	default:
+		return false
+	}
+}
+
+func normalizeOutboundProxyURL(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" || isDirectProxyOptOut(raw) {
+		return ""
+	}
+	if !strings.Contains(raw, "://") {
+		return "http://" + raw
+	}
+	return raw
 }
 
 // buildKiroTransport constructs an HTTP Transport with optional outbound proxy support.
