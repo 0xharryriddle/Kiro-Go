@@ -75,6 +75,37 @@ func TestReadIdeCacheCredentialEmailFromJWT(t *testing.T) {
 	}
 }
 
+func TestReadIdeCacheCredentialLoadsClientRegistrationFromHash(t *testing.T) {
+	dir := t.TempDir()
+	cachePath := filepath.Join(dir, "kiro-auth-token.json")
+	clientHash := "340407800f4a70bd2b49d3e50dffdf92cbad9276"
+	if err := os.WriteFile(filepath.Join(dir, clientHash+".json"), []byte(`{
+	  "clientId": "idc-client",
+	  "clientSecret": "idc-secret"
+	}`), 0o600); err != nil {
+		t.Fatalf("write client registration: %v", err)
+	}
+	if err := os.WriteFile(cachePath, []byte(`{
+	  "accessToken": "at-ide",
+	  "refreshToken": "rt-ide",
+	  "authMethod": "IdC",
+	  "provider": "Enterprise",
+	  "clientIdHash": "`+clientHash+`"
+	}`), 0o600); err != nil {
+		t.Fatalf("write cache: %v", err)
+	}
+	req, err := readIdeCacheCredential(cachePath)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if req.AuthMethod != "idc" {
+		t.Fatalf("authMethod = %q, want idc", req.AuthMethod)
+	}
+	if req.ClientID != "idc-client" || req.ClientSecret != "idc-secret" {
+		t.Fatalf("client registration not loaded: clientId=%q secret=%q", req.ClientID, req.ClientSecret)
+	}
+}
+
 // TestReadIdeCacheCredentialMissingFile returns an actionable error, not a panic.
 func TestReadIdeCacheCredentialMissingFile(t *testing.T) {
 	_, err := readIdeCacheCredential(filepath.Join(t.TempDir(), "nope.json"))

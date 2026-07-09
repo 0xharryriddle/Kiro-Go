@@ -66,11 +66,25 @@ func readIdeCacheCredential(path string) (importCredentialRequest, error) {
 	}
 
 	// The IDE cache is a single flat camelCase object; decodeImportRequest already
-	// accepts that casing (and snake_case), so reuse it verbatim.
+	// accepts that casing (and snake_case), so reuse it verbatim. Some Kiro IDE
+	// Enterprise caches store only clientIdHash here and put clientId/clientSecret
+	// in a sibling ~/.aws/sso/cache/<clientIdHash>.json file; preserve that hash
+	// so we can stitch the refreshable IdC credential back together.
 	req, err := decodeImportRequest(raw)
 	if err != nil {
 		return importCredentialRequest{}, &importValidationError{
 			"Kiro IDE cache " + path + " is not valid JSON: " + err.Error(),
+		}
+	}
+	var ideMeta struct {
+		ClientIDHash string `json:"clientIdHash"`
+	}
+	_ = json.Unmarshal(raw, &ideMeta)
+	if strings.TrimSpace(req.ClientID) == "" && strings.TrimSpace(ideMeta.ClientIDHash) != "" {
+		if clientID, clientSecret := readIdeClientRegistration(path, ideMeta.ClientIDHash); clientID != "" || clientSecret != "" {
+			req.ClientID = clientID
+			req.ClientSecret = clientSecret
+			req.AuthMethod = normalizeAuthMethod(req.AuthMethod, req.TokenEndpoint, req.ClientID, req.ClientSecret)
 		}
 	}
 
@@ -102,6 +116,26 @@ func readIdeCacheCredential(path string) (importCredentialRequest, error) {
 		}
 	}
 	return req, nil
+}
+
+func readIdeClientRegistration(cachePath, clientIDHash string) (string, string) {
+	clientIDHash = strings.TrimSpace(clientIDHash)
+	if clientIDHash == "" || strings.ContainsAny(clientIDHash, `/\\`) {
+		return "", ""
+	}
+	path := filepath.Join(filepath.Dir(cachePath), clientIDHash+".json")
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return "", ""
+	}
+	var client struct {
+		ClientID     string `json:"clientId"`
+		ClientSecret string `json:"clientSecret"`
+	}
+	if err := json.Unmarshal(raw, &client); err != nil {
+		return "", ""
+	}
+	return strings.TrimSpace(client.ClientID), strings.TrimSpace(client.ClientSecret)
 }
 
 func readKiroIdeProfileArn() string {

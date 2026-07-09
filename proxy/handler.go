@@ -4167,11 +4167,20 @@ type ideCacheImportOptions struct {
 
 func applyIdeCacheImportOptions(req importCredentialRequest, opts ideCacheImportOptions) importCredentialRequest {
 	if strings.EqualFold(strings.TrimSpace(opts.Mode), "enterprise_m365") {
-		req.AuthMethod = "external_idp"
-		if strings.TrimSpace(opts.ForceProvider) != "" {
-			req.Provider = strings.TrimSpace(opts.ForceProvider)
-		} else {
-			req.Provider = "AzureAD"
+		// Kiro IDE has emitted two Enterprise cache shapes in the wild:
+		// external_idp with tokenEndpoint+clientId, and IdC with clientIdHash plus a
+		// sibling client registration. Only force AzureAD/external_idp when the cache
+		// actually has external-IdP refresh material; otherwise keep the valid IdC
+		// credential instead of turning it into an unrefreshable external_idp account.
+		if strings.TrimSpace(req.TokenEndpoint) != "" && strings.TrimSpace(req.ClientID) != "" {
+			req.AuthMethod = "external_idp"
+			if strings.TrimSpace(opts.ForceProvider) != "" {
+				req.Provider = strings.TrimSpace(opts.ForceProvider)
+			} else {
+				req.Provider = "AzureAD"
+			}
+		} else if req.AuthMethod == "idc" && strings.TrimSpace(req.Provider) == "" {
+			req.Provider = "Enterprise"
 		}
 	}
 	if opts.DirectProxy == nil || *opts.DirectProxy {
