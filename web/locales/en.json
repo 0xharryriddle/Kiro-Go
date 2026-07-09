@@ -683,5 +683,9 @@
   "usageAudit.rechecking": "Rechecking upstream...",
   "usageAudit.title": "Account Usage Audit",
   "usageAudit.total": "Accounts",
-  "usageAudit.upstream": "Upstream (period)"
+  "usageAudit.upstream": "Upstream (period)",
+  "common.or": "or",
+  "iam.ideM365Note": "Already signed in to Kiro IDE with Microsoft 365 / Entra ID on this host? Import that local IDE credential directly as an Enterprise SSO account. This also sets the account proxy to direct so it mirrors the IDE path instead of the global proxy.",
+  "iam.importIdeM365": "Import from Kiro IDE as Enterprise SSO - Microsoft 365",
+  "iam.importIdeM365Success": "Imported Microsoft 365 Enterprise SSO from Kiro IDE"
 }

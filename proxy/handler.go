@@ -3847,6 +3847,7 @@ func (h *Handler) importOne(req importCredentialRequest) (config.Account, error)
 		// the helper-provided ARN. If both empty, ResolveProfileArn discovers it
 		// lazily on first use (incl. the cross-region probe for external_idp).
 		ProfileArn: pickProfileArn(newProfileArn, req.ProfileArn),
+		ProxyURL:   strings.TrimSpace(req.ProxyURL),
 		ExpiresAt:  expiresAt,
 		Enabled:    true,
 		MachineId:  config.GenerateMachineId(),
@@ -4157,10 +4158,30 @@ func (h *Handler) apiPreviewCliJson(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]interface{}{"success": true, "count": len(reqs), "items": items, "warnings": warnings})
 }
 
-func (h *Handler) apiPreviewIdeCache(w http.ResponseWriter, r *http.Request) {
-	var body struct {
-		Path string `json:"path"`
+type ideCacheImportOptions struct {
+	Path          string `json:"path"`
+	Mode          string `json:"mode"`
+	DirectProxy   *bool  `json:"directProxy,omitempty"`
+	ForceProvider string `json:"forceProvider,omitempty"`
+}
+
+func applyIdeCacheImportOptions(req importCredentialRequest, opts ideCacheImportOptions) importCredentialRequest {
+	if strings.EqualFold(strings.TrimSpace(opts.Mode), "enterprise_m365") {
+		req.AuthMethod = "external_idp"
+		if strings.TrimSpace(opts.ForceProvider) != "" {
+			req.Provider = strings.TrimSpace(opts.ForceProvider)
+		} else {
+			req.Provider = "AzureAD"
+		}
 	}
+	if opts.DirectProxy == nil || *opts.DirectProxy {
+		req.ProxyURL = directProxyOptOut
+	}
+	return req
+}
+
+func (h *Handler) apiPreviewIdeCache(w http.ResponseWriter, r *http.Request) {
+	var body ideCacheImportOptions
 	_ = json.NewDecoder(r.Body).Decode(&body)
 	path := ideCachePath(body.Path)
 	req, err := readIdeCacheCredential(path)
@@ -4169,6 +4190,7 @@ func (h *Handler) apiPreviewIdeCache(w http.ResponseWriter, r *http.Request) {
 		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
 		return
 	}
+	req = applyIdeCacheImportOptions(req, body)
 	json.NewEncoder(w).Encode(map[string]interface{}{"success": true, "source": path, "count": 1, "items": previewImportRequests([]importCredentialRequest{req})})
 }
 
@@ -4244,9 +4266,7 @@ func (h *Handler) apiImportCliJson(w http.ResponseWriter, r *http.Request) {
 // importOne core as every other import path, so the persisted account is
 // identical to an interactive Enterprise SSO login.
 func (h *Handler) apiImportIdeCache(w http.ResponseWriter, r *http.Request) {
-	var body struct {
-		Path string `json:"path"`
-	}
+	var body ideCacheImportOptions
 	// Body is optional; ignore a decode error (including an empty body).
 	_ = json.NewDecoder(r.Body).Decode(&body)
 
@@ -4257,6 +4277,7 @@ func (h *Handler) apiImportIdeCache(w http.ResponseWriter, r *http.Request) {
 		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
 		return
 	}
+	req = applyIdeCacheImportOptions(req, body)
 
 	account, err := h.importOne(req)
 	if err != nil {
@@ -4274,6 +4295,9 @@ func (h *Handler) apiImportIdeCache(w http.ResponseWriter, r *http.Request) {
 			"id":         account.ID,
 			"email":      account.Email,
 			"authMethod": account.AuthMethod,
+			"provider":   account.Provider,
+			"profileArn": account.ProfileArn,
+			"proxyURL":   account.ProxyURL,
 		},
 	})
 }

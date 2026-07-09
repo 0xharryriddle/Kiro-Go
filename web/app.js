@@ -2807,6 +2807,10 @@
     title.textContent = t('modal.iamTitle');
     body.innerHTML =
       '<p class="help-block">' + escapeHtml(t('modal.iamDesc')) + '</p>' +
+      '<div class="message message-info"><p class="text-xs">' + escapeHtml(t('iam.ideM365Note')) + '</p>' +
+      '<button class="btn btn-sm btn-outline mt-2" id="iamIdeM365Btn" type="button">' + escapeHtml(t('iam.importIdeM365')) + '</button>' +
+      '</div>' +
+      '<div class="divider-text mt-4 mb-2"><span>' + escapeHtml(t('common.or')) + '</span></div>' +
       '<div class="form-group"><label>' + escapeHtml(t('iam.startUrl')) + '</label><input type="text" id="iamStartUrl" placeholder="https://xxx.awsapps.com/start" /></div>' +
       '<div class="form-group"><label>' + escapeHtml(t('detail.region')) + '</label><input type="text" id="iamRegion" value="us-east-1" /></div>' +
       '<div id="iamStep2" class="hidden">' +
@@ -2824,6 +2828,7 @@
       '<button class="btn btn-secondary" data-modal-goto="add" type="button">' + escapeHtml(t('common.back')) + '</button>' +
       '<button class="btn btn-primary" id="iamBtn" type="button">' + escapeHtml(t('builderid.startLogin')) + '</button>' +
       '</div>';
+    $('iamIdeM365Btn').addEventListener('click', () => importIdeCache({ enterpriseM365: true }));
     $('iamBtn').addEventListener('click', startIamSso);
   }
   function modalSso(title, body) {
@@ -3268,12 +3273,17 @@
     await Promise.all([loadAccounts(), loadStats(), loadConfigStatus()]);
   }
 
-  async function importIdeCache() {
-    const res = await api('/auth/import-ide-cache', { method: 'POST', body: JSON.stringify({}) });
+  async function importIdeCache(options = {}) {
+    const payload = options.enterpriseM365
+      ? { mode: 'enterprise_m365', directProxy: true, forceProvider: 'AzureAD' }
+      : { directProxy: true };
+    const res = await api('/auth/import-ide-cache', { method: 'POST', body: JSON.stringify(payload) });
     const d = await res.json();
     if (d.success) {
       closeModal(); loadAccounts(); loadStats();
-      toastPrimary(t('builderid.success') + ': ' + (d.account?.email || d.account?.id));
+      const label = options.enterpriseM365 ? t('iam.importIdeM365Success') : t('builderid.success');
+      const proxy = d.account?.proxyURL ? ' · ' + t('detail.proxyURL') + ': ' + d.account.proxyURL : '';
+      toastPrimary(label + ': ' + (d.account?.email || d.account?.id) + proxy);
       autoRefreshNewAccount(d.account?.id);
     } else {
       toastError(t('common.failed') + ': ' + (d.error || ''));

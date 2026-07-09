@@ -25,6 +25,7 @@ type importCredentialRequest struct {
 	IssuerURL     string
 	Scopes        string
 	ProfileArn    string
+	ProxyURL      string
 	// Optional identity preservation when pasting a full account record.
 	ID     string
 	UserID string
