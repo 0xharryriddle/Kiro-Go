@@ -219,6 +219,24 @@ func ListAvailableModels(account *config.Account) ([]ModelInfo, error) {
 		return nil, fmt.Errorf("resolve profileArn: %w", err)
 	}
 
+	models, err := listAvailableModelsOnce(account)
+	if err == nil {
+		return models, nil
+	}
+	// Self-heal a poisoned cached profile: a not-in-plan profile (e.g. the
+	// account's us-east-1 profile) can be cached ahead of the in-plan one, which
+	// makes ListAvailableModels 403 with "not authorized to make this call". This
+	// is the same class of failure the usage path self-heals; re-resolve to a
+	// usable profile (preferring the in-plan one) and retry once before giving up.
+	if isProfileOrPlanAuthzError(err.Error()) {
+		if _, ok := reresolveProfileArn(account); ok {
+			return listAvailableModelsOnce(account)
+		}
+	}
+	return nil, err
+}
+
+func listAvailableModelsOnce(account *config.Account) ([]ModelInfo, error) {
 	url := fmt.Sprintf("%s/ListAvailableModels?origin=AI_EDITOR&maxResults=50", kiroRestAPIBase)
 	url = regionalizeURL(url, account)
 	url = withProfileArnQuery(url, account)
@@ -513,18 +531,36 @@ func retryUsageWithReresolvedProfile(account *config.Account, origErr error) (*U
 	if strings.Contains(origErr.Error(), "TEMPORARILY_SUSPENDED") {
 		return nil, false
 	}
+	if _, ok := reresolveProfileArn(account); !ok {
+		return nil, false
+	}
+	usage, err := GetUsageLimits(account)
+	if err != nil {
+		return nil, false
+	}
+	return usage, true
+}
+
+// reresolveProfileArn forces a fresh, plan-aware cross-region profile probe,
+// ignoring the account's currently-cached ARN. When it finds a DIFFERENT usable
+// profile it persists the corrected ARN (and its region) on the account and
+// returns (newArn, true). Otherwise it returns ("", false) and leaves the account
+// untouched. This is the shared primitive both the usage path and the model-list
+// path use to recover from a poisoned cached profile (e.g. a not-in-plan
+// us-east-1 profile cached ahead of an in-plan eu-central-1 profile).
+func reresolveProfileArn(account *config.Account) (string, bool) {
+	if account == nil {
+		return "", false
+	}
 	oldArn := strings.TrimSpace(account.ProfileArn)
 
-	// Force a fresh probe: clear the cached ARN so resolveProfileArnAcrossRegions
-	// re-enumerates every region's profiles and prefers an in-plan one.
 	probe := *account
 	probe.ProfileArn = ""
 	newArn, err := resolveProfileArnAcrossRegions(&probe)
 	if err != nil || strings.TrimSpace(newArn) == "" || newArn == oldArn {
-		return nil, false
+		return "", false
 	}
 
-	// Persist the corrected profile ARN and retry usage against it.
 	if updateErr := config.UpdateAccountProfileArn(account.ID, newArn); updateErr != nil {
 		logger.Warnf("[ProfileArn] Failed to cache corrected profile ARN for %s: %v", account.Email, updateErr)
 	}
@@ -532,13 +568,9 @@ func retryUsageWithReresolvedProfile(account *config.Account, origErr error) (*U
 	if r := regionFromProfileArn(newArn); r != "" {
 		account.Region = r
 	}
-	usage, err := GetUsageLimits(account)
-	if err != nil {
-		return nil, false
-	}
 	logger.Infof("[ProfileArn] Self-healed profile for %s: %s -> %s (previous profile was not usable)",
 		account.Email, oldArn, newArn)
-	return usage, true
+	return newArn, true
 }
 
 // listAvailableProfilesWithRetryInRegion calls ListAvailableProfiles against a

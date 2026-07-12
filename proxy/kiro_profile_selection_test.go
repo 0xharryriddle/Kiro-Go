@@ -152,6 +152,78 @@ func TestRefreshAccountInfoDoesNotBanOnPlan403(t *testing.T) {
 	}
 }
 
+// TestListAvailableModelsSelfHealsPoisonedProfile verifies that when the cached
+// profile is the not-in-plan one, ListAvailableModels re-resolves to the in-plan
+// profile and retries — this is the exact path the re-enable/ModelsCache refresh
+// hits, which previously 403'd with "not authorized to make this call" and never
+// recovered.
+func TestListAvailableModelsSelfHealsPoisonedProfile(t *testing.T) {
+	configPath := filepath.Join(t.TempDir(), "config.json")
+	if err := config.Init(configPath); err != nil {
+		t.Fatalf("init config: %v", err)
+	}
+	const (
+		usEastArn = "arn:aws:codewhisperer:us-east-1:155119901513:profile/USEASTNOTINPLAN"
+		euArn     = "arn:aws:codewhisperer:eu-central-1:155119901513:profile/INPLAN"
+	)
+	account := config.Account{
+		ID:          "models-heal-1",
+		Email:       "petros@example.com",
+		AccessToken: "access-token",
+		AuthMethod:  "external_idp",
+		Region:      "us-east-1",
+		// Poisoned: the not-in-plan us-east-1 profile is already cached.
+		ProfileArn: usEastArn,
+		Enabled:    true,
+	}
+	if err := config.AddAccount(account); err != nil {
+		t.Fatalf("add account: %v", err)
+	}
+
+	kiroRestHttpStore.Store(&http.Client{
+		Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			isEU := strings.Contains(req.URL.Host, "eu-central-1")
+			switch req.URL.Path {
+			case "/ListAvailableModels":
+				// The not-in-plan (us-east-1) profile is rejected; the in-plan
+				// (eu-central-1) profile serves the model list.
+				if strings.Contains(req.URL.RawQuery, "USEASTNOTINPLAN") {
+					return jsonResp(http.StatusForbidden, `{"message":"Your account is not authorized to make this call."}`), nil
+				}
+				return jsonResp(http.StatusOK, `{"models":[{"modelId":"claude-sonnet-4"}]}`), nil
+			case "/ListAvailableProfiles":
+				arn := usEastArn
+				if isEU {
+					arn = euArn
+				}
+				return jsonResp(http.StatusOK, `{"profiles":[{"arn":"`+arn+`"}]}`), nil
+			case "/getUsageLimits":
+				// selectUsableProfile probe: not-in-plan fails, in-plan succeeds.
+				if strings.Contains(req.URL.RawQuery, "USEASTNOTINPLAN") {
+					return jsonResp(http.StatusForbidden, `{"message":"profile has no active subscription"}`), nil
+				}
+				return jsonResp(http.StatusOK, `{"subscriptionInfo":{"subscriptionTitle":"Kiro Power"}}`), nil
+			default:
+				t.Fatalf("unexpected path %s", req.URL.Path)
+				return nil, nil
+			}
+		}),
+	})
+	t.Cleanup(func() { InitKiroHttpClient("") })
+
+	req := account
+	models, err := ListAvailableModels(&req)
+	if err != nil {
+		t.Fatalf("expected self-heal to recover model list, got %v", err)
+	}
+	if len(models) != 1 || models[0].ModelId != "claude-sonnet-4" {
+		t.Fatalf("expected recovered model list, got %+v", models)
+	}
+	if req.ProfileArn != euArn {
+		t.Fatalf("expected profile self-healed to in-plan %q, got %q", euArn, req.ProfileArn)
+	}
+}
+
 func jsonResp(status int, body string) *http.Response {
 	return &http.Response{
 		StatusCode: status,
