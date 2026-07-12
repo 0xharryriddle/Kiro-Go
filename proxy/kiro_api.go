@@ -358,6 +358,45 @@ func isProfileArnResolutionSuppressed(account *config.Account) bool {
 	return true
 }
 
+// isProfileOrPlanAuthzError reports whether an upstream error string is about the
+// PROFILE or SUBSCRIPTION PLAN rather than the credential itself. These 403s mean
+// "this profile/plan can't do this" (wrong profile selected, no active plan,
+// resource not authorized for the profile) — the token is still valid, so the
+// account must NOT be flipped to BANNED. Genuine token-invalid/expired 401/403s
+// deliberately fall through to the auth-ban branch instead.
+//
+// It only fires for 403s (plan/authorization denials); a 401 is always a token
+// problem, never a plan problem, so 401 is excluded here on purpose.
+func isProfileOrPlanAuthzError(errMsg string) bool {
+	if !strings.Contains(errMsg, "403") {
+		return false
+	}
+	// A 403 that also carries explicit token-invalidity wording is a real auth
+	// failure, not a plan issue — let it reach the ban branch.
+	lower := strings.ToLower(errMsg)
+	if strings.Contains(lower, "invalid") || strings.Contains(lower, "expired") ||
+		strings.Contains(lower, "token") {
+		return false
+	}
+	for _, marker := range []string{
+		"not authorized",
+		"not subscribed",
+		"no active subscription",
+		"subscription",
+		"accessdenied",
+		"access denied",
+		"profile",
+		"not entitled",
+		"entitlement",
+		"resourcenotfound",
+	} {
+		if strings.Contains(lower, marker) {
+			return true
+		}
+	}
+	return false
+}
+
 func isProfileArnResolutionSkippedError(err error) bool {
 	return err != nil && strings.Contains(err.Error(), "profile ARN resolution skipped")
 }
@@ -397,19 +436,109 @@ func ensureRestProfileArn(account *config.Account) error {
 // short-circuits the probe rather than repeating per region.
 func resolveProfileArnAcrossRegions(account *config.Account) (string, error) {
 	var lastErr error
+	var found []string
+	seen := make(map[string]bool)
 	for _, region := range kiroProfileRegionCandidates(account) {
-		arn, probeErr := listAvailableProfilesWithRetryInRegion(account, region)
-		if probeErr == nil && strings.TrimSpace(arn) != "" {
-			return arn, nil
-		}
+		arns, probeErr := listAllAvailableProfilesWithRetryInRegion(account, region)
 		if probeErr != nil {
 			lastErr = probeErr
 			if isBuilderIDProfileUnsupportedError(account, probeErr) {
 				return "", probeErr
 			}
+			continue
+		}
+		for _, arn := range arns {
+			if !seen[arn] {
+				seen[arn] = true
+				found = append(found, arn)
+			}
 		}
 	}
-	return "", lastErr
+	if len(found) == 0 {
+		if lastErr != nil {
+			return "", lastErr
+		}
+		return "", fmt.Errorf("empty profile list")
+	}
+	if len(found) == 1 {
+		return found[0], nil
+	}
+	// Multiple profiles across regions (e.g. a not-in-plan KiroProfile-us-east-1 plus
+	// an in-plan KiroProfile-eu-central-1). Prefer the one that is actually in a
+	// subscription plan rather than blindly taking the first region's profile — that
+	// "first wins" bug is what selected the not-in-plan profile and made getUsageLimits
+	// 403, which was then misclassified as a ban.
+	if usable := selectUsableProfile(account, found); usable != "" {
+		return usable, nil
+	}
+	// None verified usable (e.g. every getUsageLimits probe failed transiently) — fall
+	// back to the first discovered profile to preserve prior behavior.
+	return found[0], nil
+}
+
+// selectUsableProfile returns the first profile ARN whose getUsageLimits call
+// succeeds — i.e. the profile is actually attached to a subscription plan. It is
+// only used to disambiguate when an account owns more than one profile, so the
+// common single-profile path never pays for the extra calls.
+func selectUsableProfile(account *config.Account, arns []string) string {
+	for _, arn := range arns {
+		probe := *account
+		probe.ProfileArn = arn
+		if r := regionFromProfileArn(arn); r != "" {
+			probe.Region = r
+		}
+		if _, err := GetUsageLimits(&probe); err == nil {
+			return arn
+		}
+	}
+	return ""
+}
+
+// retryUsageWithReresolvedProfile handles the case where a getUsageLimits call
+// failed with a cached profile ARN that turns out to be the wrong one (e.g. an
+// account owns a not-in-plan us-east-1 profile AND an in-plan eu-central-1
+// profile, and the not-in-plan one was cached). It re-runs the cross-region,
+// plan-aware profile probe, and if it discovers a DIFFERENT, usable profile it
+// persists that ARN and retries getUsageLimits once. Returns (usage, true) only
+// when the retry succeeds; otherwise (nil, false) so the caller falls through to
+// its normal error/ban classification.
+//
+// It deliberately does not fire for genuine suspensions — those must still reach
+// the ban classifier — so it skips re-resolution when the error is a temporary
+// suspension signal.
+func retryUsageWithReresolvedProfile(account *config.Account, origErr error) (*UsageLimitsResponse, bool) {
+	if account == nil || origErr == nil {
+		return nil, false
+	}
+	if strings.Contains(origErr.Error(), "TEMPORARILY_SUSPENDED") {
+		return nil, false
+	}
+	oldArn := strings.TrimSpace(account.ProfileArn)
+
+	// Force a fresh probe: clear the cached ARN so resolveProfileArnAcrossRegions
+	// re-enumerates every region's profiles and prefers an in-plan one.
+	probe := *account
+	probe.ProfileArn = ""
+	newArn, err := resolveProfileArnAcrossRegions(&probe)
+	if err != nil || strings.TrimSpace(newArn) == "" || newArn == oldArn {
+		return nil, false
+	}
+
+	// Persist the corrected profile ARN and retry usage against it.
+	if updateErr := config.UpdateAccountProfileArn(account.ID, newArn); updateErr != nil {
+		logger.Warnf("[ProfileArn] Failed to cache corrected profile ARN for %s: %v", account.Email, updateErr)
+	}
+	account.ProfileArn = newArn
+	if r := regionFromProfileArn(newArn); r != "" {
+		account.Region = r
+	}
+	usage, err := GetUsageLimits(account)
+	if err != nil {
+		return nil, false
+	}
+	logger.Infof("[ProfileArn] Self-healed profile for %s: %s -> %s (previous profile was not usable)",
+		account.Email, oldArn, newArn)
+	return usage, true
 }
 
 // listAvailableProfilesWithRetryInRegion calls ListAvailableProfiles against a
@@ -438,6 +567,34 @@ func listAvailableProfilesWithRetryInRegion(account *config.Account, region stri
 	return "", lastErr
 }
 
+// listAllAvailableProfilesWithRetryInRegion is the multi-profile variant of
+// listAvailableProfilesWithRetryInRegion: it returns every profile ARN a region
+// exposes (not just the first), retrying transient failures the same way. This is
+// what lets resolveProfileArnAcrossRegions disambiguate an account that owns more
+// than one profile (e.g. a not-in-plan us-east-1 profile plus an in-plan
+// eu-central-1 profile).
+func listAllAvailableProfilesWithRetryInRegion(account *config.Account, region string) ([]string, error) {
+	const maxAttempts = 3
+	backoff := 200 * time.Millisecond
+
+	var lastErr error
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		profileArns, err := listAllAvailableProfilesInRegion(account, region)
+		if err == nil {
+			return profileArns, nil
+		}
+		lastErr = err
+		if !isTransientProfileFetchError(err) || attempt == maxAttempts {
+			return nil, err
+		}
+		logger.Debugf("[ProfileArn] ListAvailableProfiles transient failure for %s in %s (attempt %d/%d): %v",
+			account.Email, region, attempt, maxAttempts, err)
+		time.Sleep(backoff)
+		backoff *= 2
+	}
+	return nil, lastErr
+}
+
 // isTransientProfileFetchError reports whether a ListAvailableProfiles error
 // is worth retrying. Network errors and upstream 5xx/429 are transient; other
 // HTTP errors and an empty profile list are not.
@@ -462,23 +619,35 @@ func isTransientProfileFetchError(err error) bool {
 // stored one — is what makes cross-region detection possible: the same credential is
 // probed against each candidate region until one returns a profile.
 func listAvailableProfilesInRegion(account *config.Account, region string) (string, error) {
+	arns, err := listAllAvailableProfilesInRegion(account, region)
+	if err != nil {
+		return "", err
+	}
+	return arns[0], nil
+}
+
+// listAllAvailableProfilesInRegion returns every non-empty profile ARN the region
+// exposes for the account. Same request/host semantics as the single-profile
+// helper; it just does not discard the profiles after the first one, so callers
+// can disambiguate multi-profile accounts.
+func listAllAvailableProfilesInRegion(account *config.Account, region string) ([]string, error) {
 	endpoint := regionalizeURLForRegion(fmt.Sprintf("%s/ListAvailableProfiles", kiroRestAPIBase), region)
 	req, err := http.NewRequest("POST", endpoint, strings.NewReader(`{"maxResults":10}`))
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 	setKiroHeaders(req, account)
 	req.Header.Set("Content-Type", "application/json")
 
 	resp, err := GetRestClientForProxy(ResolveAccountProxyURL(account)).Do(req)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != 200 {
 		body, _ := io.ReadAll(resp.Body)
-		return "", fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(body))
+		return nil, fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(body))
 	}
 
 	var result struct {
@@ -487,14 +656,18 @@ func listAvailableProfilesInRegion(account *config.Account, region string) (stri
 		} `json:"profiles"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return "", err
+		return nil, err
 	}
+	var arns []string
 	for _, profile := range result.Profiles {
 		if profileArn := strings.TrimSpace(profile.Arn); profileArn != "" {
-			return profileArn, nil
+			arns = append(arns, profileArn)
 		}
 	}
-	return "", fmt.Errorf("empty profile list")
+	if len(arns) == 0 {
+		return nil, fmt.Errorf("empty profile list")
+	}
+	return arns, nil
 }
 
 func withProfileArnQuery(rawURL string, account *config.Account) string {
@@ -528,6 +701,16 @@ func RefreshAccountInfo(account *config.Account) (*config.AccountInfo, error) {
 	// 获取使用量和订阅信息
 	usage, err := GetUsageLimits(account)
 	if err != nil {
+		// Self-heal a stale/wrong cached profile before treating the failure as a
+		// ban. An account that owns more than one profile (e.g. a not-in-plan
+		// us-east-1 profile plus an in-plan eu-central-1 profile) may have cached the
+		// not-in-plan one, which makes getUsageLimits fail. Re-resolve across all
+		// profiles (preferring the in-plan one) and retry once before classifying.
+		if healedUsage, healed := retryUsageWithReresolvedProfile(account, err); healed {
+			usage, err = healedUsage, nil
+		}
+	}
+	if err != nil {
 		// 检测封禁状态
 		errMsg := err.Error()
 		if strings.Contains(errMsg, "TEMPORARILY_SUSPENDED") {
@@ -547,6 +730,14 @@ func RefreshAccountInfo(account *config.Account) (*config.AccountInfo, error) {
 			}
 
 			return nil, fmt.Errorf("Account suspended: %w", err)
+		} else if isProfileOrPlanAuthzError(errMsg) {
+			// A 403 that is about the PROFILE/PLAN (wrong profile, no active
+			// subscription, resource not authorized) is NOT a token ban. Auto-banning
+			// here is exactly what wrongly disabled a valid account whose in-plan
+			// profile simply had not been selected. Self-heal already tried to switch
+			// to a usable profile above; if it still fails, surface the error without
+			// flipping the account to BANNED.
+			logger.Warnf("[RefreshAccountInfo] Profile/plan authorization error for %s (not treated as ban): %v", account.Email, err)
 		} else if strings.Contains(errMsg, "403") || strings.Contains(errMsg, "401") ||
 			strings.Contains(errMsg, "invalid") || strings.Contains(errMsg, "expired") {
 			// Token 相关错误，可能需要重新认证
