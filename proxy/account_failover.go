@@ -158,6 +158,15 @@ func (h *Handler) handleAccountFailure(account *config.Account, err error) {
 		// Treat as a soft failure: short cooldown so the next request rotates account,
 		// but never auto-disable — operators can still investigate via warn logs.
 		h.pool.RecordError(account.ID, false)
+	case isProfileOrPlanAuthzError(errMsg):
+		// A 403 about the PROFILE/PLAN — e.g. "User is not authorized to make this
+		// call" when the profileArn is missing or points at a not-in-plan profile —
+		// is NOT a token ban. Permanently disabling here is exactly what wrongly
+		// banned a valid Enterprise-IdP account whose profile simply had not resolved
+		// yet. Treat it as a soft failure (short cooldown, no disable); the profile
+		// resolver / self-heal recovers the correct profile on a subsequent call.
+		logger.Warnf("[AccountFailover] Profile/plan authorization error for %s (not banning): %v", account.Email, err)
+		h.pool.RecordError(account.ID, false)
 	case isAuthErrorMessage(errMsg):
 		h.disableAccount(account, "BANNED", "Authentication failed - token invalid or expired")
 	default:

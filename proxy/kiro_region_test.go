@@ -108,6 +108,23 @@ func TestKiroProfileRegionCandidatesEnvOverride(t *testing.T) {
 	assertOrder(t, got, []string{"us-east-1"})
 }
 
+// TestKiroProfileRegionCandidatesEnterpriseIdC checks that a Kiro IDE
+// "Enterprise" import (authMethod idc, provider Enterprise) probes fallback
+// regions too. Its credential cache stores the SSO/auth region, which is NOT
+// necessarily where the profile lives (observed: cache region eu-central-1 but
+// the actual profile in us-east-1), so it must behave like external_idp and not
+// be pinned to its single cached region.
+func TestKiroProfileRegionCandidatesEnterpriseIdC(t *testing.T) {
+	got := kiroProfileRegionCandidates(&config.Account{AuthMethod: "idc", Provider: "Enterprise", Region: "eu-central-1"})
+	assertOrder(t, got, []string{"eu-central-1", "us-east-1"})
+
+	// A plain idc account with a non-Enterprise provider stays single-region.
+	got = kiroProfileRegionCandidates(&config.Account{AuthMethod: "idc", Provider: "BuilderId", Region: "eu-central-1"})
+	if len(got) != 1 || got[0] != "eu-central-1" {
+		t.Fatalf("non-Enterprise idc should stay single-region, got %v", got)
+	}
+}
+
 func assertOrder(t *testing.T, got, want []string) {
 	t.Helper()
 	if len(got) != len(want) {

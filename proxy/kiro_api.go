@@ -144,7 +144,22 @@ func shouldProbeFallbackRegions(account *config.Account) bool {
 	if strings.TrimSpace(account.Region) == "" {
 		return true
 	}
-	return strings.EqualFold(strings.TrimSpace(account.AuthMethod), "external_idp")
+	// external_idp (Azure-tenant) logins default to us-east-1 and carry no reliable
+	// home region, so their profile can live in a different region.
+	if strings.EqualFold(strings.TrimSpace(account.AuthMethod), "external_idp") {
+		return true
+	}
+	// Kiro IDE "Enterprise" imports (authMethod idc, provider Enterprise) store the
+	// SSO/auth region in their credential cache, which is NOT necessarily where the
+	// profile lives (observed: cache region eu-central-1 but the actual profile is in
+	// us-east-1). Their region is therefore just as unreliable as external_idp's, so
+	// probe fallback regions too — otherwise ListAvailableProfiles returns an empty
+	// list in the (wrong) cached region and the account fails with "no available Kiro
+	// profile" even though a usable profile exists in another region.
+	if strings.EqualFold(strings.TrimSpace(account.Provider), "Enterprise") {
+		return true
+	}
+	return false
 }
 
 // GetUsageLimits 获取账户使用量和订阅信息

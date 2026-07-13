@@ -27,6 +27,30 @@ func TestAccountFailureClassifiers(t *testing.T) {
 	}
 }
 
+// TestProfileAuthz403NotClassifiedAsTokenBan locks in that the live Kiro IDE
+// error string — "HTTP 403 ... User is not authorized to make this call." — is
+// treated as a profile/plan authorization error (soft, no ban) and NOT as a
+// token auth failure. handleAccountFailure checks isProfileOrPlanAuthzError
+// BEFORE isAuthErrorMessage, so a missing/unresolved profile no longer
+// permanently bans an otherwise-valid Enterprise account.
+func TestProfileAuthz403NotClassifiedAsTokenBan(t *testing.T) {
+	const liveMsg = `HTTP 403 from Kiro IDE: {"message":"User is not authorized to make this call.","reason":null}`
+	if !isProfileOrPlanAuthzError(liveMsg) {
+		t.Fatalf("expected profile/plan authz classification for %q", liveMsg)
+	}
+	// isAuthErrorMessage also matches it (it contains "403"), which is exactly
+	// why ordering in handleAccountFailure matters — the profile-authz case must
+	// come first so this does not fall through to the permanent-ban branch.
+	if !isAuthErrorMessage(liveMsg) {
+		t.Fatalf("sanity: expected the broad auth classifier to also match %q", liveMsg)
+	}
+	// A genuine token failure must still NOT be swallowed by the profile-authz
+	// discriminator (so it still reaches the ban branch).
+	if isProfileOrPlanAuthzError("HTTP 403: token invalid or expired") {
+		t.Fatal("token-invalid 403 must not be classified as a profile/plan error")
+	}
+}
+
 func TestStatusForUpstreamErrorMapsQuotaTo429(t *testing.T) {
 	status := statusForUpstreamError(errors.New("HTTP 429 from Kiro IDE: quota exhausted"))
 	if status != http.StatusTooManyRequests {
