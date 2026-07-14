@@ -102,8 +102,17 @@ func (rl *rateLimiter) Admit(keyID string, rpmLimit, tpmLimit, estTokens, now in
 	if rpmLimit > 0 && reqs+1 > rpmLimit {
 		return rateDecision{Allowed: false, Reason: "rpm", RetryAfter: retryAfter()}
 	}
-	if tpmLimit > 0 && estTokens > 0 && tokens+estTokens > tpmLimit {
-		return rateDecision{Allowed: false, Reason: "tpm", RetryAfter: retryAfter()}
+	if tpmLimit > 0 {
+		// Two independent TPM rejections:
+		//  1. The window is ALREADY at/over budget (actual tokens folded back via
+		//     RecordTokens after prior responses). This must fire even when the
+		//     admission estimate is 0 — otherwise an exhausted key keeps getting
+		//     admitted, which was the real-path bypass (authenticate passes
+		//     estTokens=0, so the old `estTokens > 0` guard never rejected).
+		//  2. This request's estimate would push the window over budget.
+		if tokens >= tpmLimit || (estTokens > 0 && tokens+estTokens > tpmLimit) {
+			return rateDecision{Allowed: false, Reason: "tpm", RetryAfter: retryAfter()}
+		}
 	}
 
 	st.events = append(st.events, rateEvent{at: now, tokens: estTokens})

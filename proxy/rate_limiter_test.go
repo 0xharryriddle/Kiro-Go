@@ -70,6 +70,26 @@ func TestRateLimiterTpmRejectsWhenOver(t *testing.T) {
 	}
 }
 
+// TestRateLimiterTpmRejectsExhaustedWindowWithZeroEstimate locks in the real-path
+// fix: authenticate() calls Admit with estTokens=0, so an already-exhausted TPM
+// window MUST still be rejected. Before the fix the `estTokens > 0` guard let an
+// over-budget key keep getting admitted indefinitely.
+func TestRateLimiterTpmRejectsExhaustedWindowWithZeroEstimate(t *testing.T) {
+	rl := newRateLimiter()
+	now := int64(1000)
+	// Admit one request, then fold in tokens that meet/exceed the TPM=1000 budget.
+	rl.Admit("k", 0, 1000, 0, now)
+	rl.RecordTokens("k", 1000, now)
+	// Next admission with estTokens=0 (the real authenticate path) must reject.
+	dec := rl.Admit("k", 0, 1000, 0, now)
+	if dec.Allowed {
+		t.Fatalf("expected TPM rejection when window is already at budget, even with estTokens=0")
+	}
+	if dec.Reason != "tpm" {
+		t.Fatalf("expected tpm reason, got %q", dec.Reason)
+	}
+}
+
 func TestRateLimiterTpmAllowsUnderBudget(t *testing.T) {
 	rl := newRateLimiter()
 	now := int64(1000)
