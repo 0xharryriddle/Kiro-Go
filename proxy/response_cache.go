@@ -11,14 +11,17 @@ package proxy
 //     params misses. No fuzzy/semantic matching.
 //   - Never caches streaming, tool, or thinking requests — those are gated out by
 //     the caller before we are consulted (isCacheableRequest).
-//   - The cache is keyed by request content only, NOT by API key or account, so a
-//     cached response is a pure function of the request. It contains only model
-//     output that any identical request would receive — no per-user secrets.
+//   - The cache is keyed by the authenticated API-key identity in ADDITION to the
+//     request content, so one API key's cached response can never be served to a
+//     different key (tenant isolation). Requests with no API key (auth disabled or
+//     the legacy single-key path) share the empty-identity namespace, which is the
+//     same trust boundary they already share.
 //   - TTL-bounded and in-memory only (single-instance); nothing is persisted.
 
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"net/http"
 	"sync"
 )
@@ -39,11 +42,16 @@ func newResponseCache() *responseCache {
 	return &responseCache{entries: make(map[string]cachedResponse)}
 }
 
-// responseCacheKey derives the cache key from the endpoint tag and the raw,
-// already-normalized request body. Pure and unit-testable. The endpoint tag keeps
-// the openai/claude/responses namespaces separate even if two bodies coincide.
-func responseCacheKey(endpoint string, body []byte) string {
+// responseCacheKey derives the cache key from the authenticated API-key identity,
+// the endpoint tag, and the raw, already-normalized request body. Pure and
+// unit-testable. The endpoint tag keeps the openai/claude/responses namespaces
+// separate even if two bodies coincide; the apiKeyID prefix keeps one tenant's
+// cached responses from ever being served to another key (an empty apiKeyID is
+// its own namespace, shared by auth-disabled and legacy single-key requests).
+func responseCacheKey(apiKeyID, endpoint string, body []byte) string {
 	h := sha256.New()
+	h.Write([]byte(apiKeyID))
+	h.Write([]byte{0})
 	h.Write([]byte(endpoint))
 	h.Write([]byte{0})
 	h.Write(body)
@@ -81,6 +89,32 @@ func (c *responseCache) Set(key string, body []byte, ttlSeconds int, now int64) 
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.entries[key] = cachedResponse{body: cp, expiresAt: now + int64(ttlSeconds)}
+}
+
+// usageFromCachedOpenAIBody parses the prompt/completion token counts out of a
+// cached OpenAI chat-completions response body so a cache hit can be attributed
+// to the tenant's usage. Returns (0, 0) on any parse failure — a cache hit must
+// never fail the request just because its usage could not be re-derived.
+func usageFromCachedOpenAIBody(body []byte) (inputTokens, outputTokens int) {
+	var parsed struct {
+		Usage OpenAIUsage `json:"usage"`
+	}
+	if err := json.Unmarshal(body, &parsed); err != nil {
+		return 0, 0
+	}
+	return parsed.Usage.PromptTokens, parsed.Usage.CompletionTokens
+}
+
+// usageFromCachedClaudeBody parses the input/output token counts out of a cached
+// Claude messages response body. Returns (0, 0) on any parse failure.
+func usageFromCachedClaudeBody(body []byte) (inputTokens, outputTokens int) {
+	var parsed struct {
+		Usage ClaudeUsage `json:"usage"`
+	}
+	if err := json.Unmarshal(body, &parsed); err != nil {
+		return 0, 0
+	}
+	return parsed.Usage.InputTokens, parsed.Usage.OutputTokens
 }
 
 // isCacheableClaudeRequest reports whether a Claude request may be cached: not

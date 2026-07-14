@@ -43,6 +43,15 @@ const ThinkingModePrompt = `<thinking_mode>enabled</thinking_mode>
 <max_thinking_length>200000</max_thinking_length>`
 
 const minimalFallbackUserContent = "."
+
+// assistantPrefillContinuation is the synthetic current-message content used when
+// the final non-system message is an EMPTY assistant prefill (no text, no tool
+// calls). Hermes core appends such an assistant turn for reasoning/-thinking
+// models to coax visible output; Kiro's API has no assistant-prefill concept
+// (CurrentMessage must be a UserInputMessage), so the trailing assistant is folded
+// into history and we generate against an explicit continuation nudge rather than
+// a bare ".", which would otherwise make Kiro answer the literal period.
+const assistantPrefillContinuation = "Continue."
 const toolResultsContinuationPrefix = "Tool results:"
 const toolResultImagePlaceholder = "[Tool returned an image; the image is attached to this message.]"
 
@@ -196,6 +205,26 @@ type ClaudeUsage struct {
 
 const maxToolDescLen = 10237
 
+// isTrailingEmptyAssistantPrefillClaude reports whether the last message is an
+// EMPTY assistant prefill: role "assistant", no visible text, and no tool uses.
+// Mirrors isTrailingEmptyAssistantPrefill for the Claude route. A trailing
+// assistant with real content or tool uses is a replayed final turn, not a
+// prefill, and keeps the bare "." fallback.
+func isTrailingEmptyAssistantPrefillClaude(messages []ClaudeMessage) bool {
+	if len(messages) == 0 {
+		return false
+	}
+	last := messages[len(messages)-1]
+	if strings.TrimSpace(last.Role) != "assistant" {
+		return false
+	}
+	content, toolUses := extractClaudeAssistantContent(last.Content)
+	if len(toolUses) > 0 {
+		return false
+	}
+	return strings.TrimSpace(content) == ""
+}
+
 func ClaudeToKiro(req *ClaudeRequest, thinking bool) *KiroPayload {
 	modelID := MapModel(req.Model)
 	origin := "AI_EDITOR"
@@ -298,6 +327,11 @@ func ClaudeToKiro(req *ClaudeRequest, thinking bool) *KiroPayload {
 		finalContent = normalizeUserContent("", true)
 	} else if len(currentToolResults) > 0 {
 		finalContent = buildToolResultsContinuation(currentToolResults)
+	} else if isTrailingEmptyAssistantPrefillClaude(req.Messages) {
+		// Empty assistant prefill tail (reasoning/-thinking continuation shape):
+		// the assistant turn is already folded into history above, so generate
+		// against an explicit continuation nudge rather than a bare ".".
+		finalContent = assistantPrefillContinuation
 	} else {
 		finalContent = minimalFallbackUserContent
 	}
@@ -1123,6 +1157,26 @@ type OpenAIUsage struct {
 
 // ==================== OpenAI -> Kiro 转换 ====================
 
+// isTrailingEmptyAssistantPrefill reports whether the last non-system message is
+// an EMPTY assistant prefill: role "assistant", no visible text content, and no
+// tool calls. This is the reasoning/-thinking continuation shape Hermes core
+// appends to coax visible output from a reasoning model. A trailing assistant
+// that carries real content or tool calls is NOT a prefill — it is a replayed
+// final turn, for which the bare "." fallback is preserved.
+func isTrailingEmptyAssistantPrefill(nonSystemMessages []OpenAIMessage) bool {
+	if len(nonSystemMessages) == 0 {
+		return false
+	}
+	last := nonSystemMessages[len(nonSystemMessages)-1]
+	if strings.TrimSpace(last.Role) != "assistant" {
+		return false
+	}
+	if len(last.ToolCalls) > 0 {
+		return false
+	}
+	return strings.TrimSpace(extractOpenAIMessageText(last.Content)) == ""
+}
+
 func OpenAIToKiro(req *OpenAIRequest, thinking bool) *KiroPayload {
 	modelID := MapModel(req.Model)
 	origin := "AI_EDITOR"
@@ -1281,6 +1335,11 @@ func OpenAIToKiro(req *OpenAIRequest, thinking bool) *KiroPayload {
 			finalContent = normalizeUserContent("", true)
 		} else if len(currentToolResults) > 0 {
 			finalContent = buildToolResultsContinuation(currentToolResults)
+		} else if isTrailingEmptyAssistantPrefill(nonSystemMessages) {
+			// Empty assistant prefill tail (reasoning/-thinking continuation shape):
+			// the assistant turn is already folded into history above, so generate
+			// against an explicit continuation nudge rather than a bare ".".
+			finalContent = assistantPrefillContinuation
 		} else {
 			finalContent = minimalFallbackUserContent
 		}

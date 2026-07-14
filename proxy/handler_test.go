@@ -170,7 +170,7 @@ func TestThinkingSourceSameSourceRemainsAllowed(t *testing.T) {
 	}
 }
 
-func TestValidateOpenAIRequestShapeRejectsAssistantPrefill(t *testing.T) {
+func TestValidateOpenAIRequestShapeAllowsAssistantPrefill(t *testing.T) {
 	req := &OpenAIRequest{
 		Messages: []OpenAIMessage{
 			{Role: "user", Content: "hello"},
@@ -178,8 +178,55 @@ func TestValidateOpenAIRequestShapeRejectsAssistantPrefill(t *testing.T) {
 		},
 	}
 
+	// A trailing assistant is now representable (folded into history by the
+	// translator), so validation must accept it rather than 400.
+	if msg := validateOpenAIRequestShape(req); msg != "" {
+		t.Fatalf("expected trailing-assistant array to be accepted, got %q", msg)
+	}
+}
+
+func TestValidateOpenAIRequestShapeRejectsNoUserContext(t *testing.T) {
+	// An assistant-only array (no user context at all) is still invalid.
+	req := &OpenAIRequest{
+		Messages: []OpenAIMessage{
+			{Role: "assistant", Content: "prefill"},
+		},
+	}
 	if msg := validateOpenAIRequestShape(req); msg == "" {
-		t.Fatalf("expected assistant-prefill final message to be rejected")
+		t.Fatalf("expected array with no user context to be rejected")
+	}
+}
+
+func TestOpenAIToKiroFoldsTrailingEmptyAssistantPrefill(t *testing.T) {
+	req := &OpenAIRequest{
+		Messages: []OpenAIMessage{
+			{Role: "user", Content: "hello"},
+			{Role: "assistant", Content: ""},
+		},
+	}
+	payload := OpenAIToKiro(req, false)
+	// The empty assistant prefill folds into history; the current message is the
+	// continuation nudge, not a bare ".".
+	if got := payload.ConversationState.CurrentMessage.UserInputMessage.Content; got != assistantPrefillContinuation {
+		t.Fatalf("expected continuation nudge %q, got %q", assistantPrefillContinuation, got)
+	}
+	if len(payload.ConversationState.History) == 0 {
+		t.Fatalf("expected trailing assistant to be folded into history")
+	}
+}
+
+func TestOpenAIToKiroTrailingContentAssistantKeepsDotFallback(t *testing.T) {
+	req := &OpenAIRequest{
+		Messages: []OpenAIMessage{
+			{Role: "user", Content: "hello"},
+			{Role: "assistant", Content: "real reply"},
+		},
+	}
+	payload := OpenAIToKiro(req, false)
+	// A substantive trailing assistant is a replayed final turn, not a prefill;
+	// preserve the bare "." fallback for the synthetic current message.
+	if got := payload.ConversationState.CurrentMessage.UserInputMessage.Content; got != minimalFallbackUserContent {
+		t.Fatalf("expected bare %q fallback for content-bearing tail, got %q", minimalFallbackUserContent, got)
 	}
 }
 
@@ -207,7 +254,7 @@ func TestValidateOpenAIRequestShapeAllowsToolResultFinalTurn(t *testing.T) {
 	}
 }
 
-func TestValidateClaudeRequestShapeRejectsAssistantPrefill(t *testing.T) {
+func TestValidateClaudeRequestShapeAllowsAssistantPrefill(t *testing.T) {
 	req := &ClaudeRequest{
 		Messages: []ClaudeMessage{
 			{Role: "user", Content: "hello"},
@@ -215,8 +262,36 @@ func TestValidateClaudeRequestShapeRejectsAssistantPrefill(t *testing.T) {
 		},
 	}
 
+	// Trailing assistant is representable on the Claude route too.
+	if msg := validateClaudeRequestShape(req); msg != "" {
+		t.Fatalf("expected trailing-assistant array to be accepted, got %q", msg)
+	}
+}
+
+func TestValidateClaudeRequestShapeRejectsNoUserContext(t *testing.T) {
+	req := &ClaudeRequest{
+		Messages: []ClaudeMessage{
+			{Role: "assistant", Content: "prefill"},
+		},
+	}
 	if msg := validateClaudeRequestShape(req); msg == "" {
-		t.Fatalf("expected assistant-prefill final message to be rejected")
+		t.Fatalf("expected array with no user context to be rejected")
+	}
+}
+
+func TestClaudeToKiroFoldsTrailingEmptyAssistantPrefill(t *testing.T) {
+	req := &ClaudeRequest{
+		Messages: []ClaudeMessage{
+			{Role: "user", Content: "hello"},
+			{Role: "assistant", Content: ""},
+		},
+	}
+	payload := ClaudeToKiro(req, false)
+	if got := payload.ConversationState.CurrentMessage.UserInputMessage.Content; got != assistantPrefillContinuation {
+		t.Fatalf("expected continuation nudge %q, got %q", assistantPrefillContinuation, got)
+	}
+	if len(payload.ConversationState.History) == 0 {
+		t.Fatalf("expected trailing assistant to be folded into history")
 	}
 }
 

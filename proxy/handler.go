@@ -146,12 +146,14 @@ func validateClaudeRequestShape(req *ClaudeRequest) string {
 		}
 	}
 
-	if lastRole == "assistant" {
-		return "assistant-prefill final message is not supported; last message must be user"
-	}
+	// A trailing assistant message (reasoning/-thinking prefill or a replayed
+	// final turn) is representable: the translator folds it into history and
+	// generates against a continuation nudge / synthetic user turn. Only reject
+	// shapes the translator cannot represent (no user context at all).
 	if !hasUserContext {
 		return "at least one non-empty user message is required"
 	}
+	_ = lastRole
 	return ""
 }
 
@@ -254,12 +256,14 @@ func validateOpenAIRequestShape(req *OpenAIRequest) string {
 	if !hasNonSystem {
 		return "at least one non-system message is required"
 	}
-	if lastRole == "assistant" {
-		return "assistant-prefill final message is not supported; last message must be user or tool"
-	}
+	// A trailing assistant message (reasoning/-thinking prefill or a replayed
+	// final turn) is representable: the translator folds it into history and
+	// generates against a continuation nudge / synthetic user turn. Only reject
+	// shapes the translator cannot represent (no user context at all).
 	if !hasUserContext {
 		return "at least one non-empty user message is required"
 	}
+	_ = lastRole
 	return ""
 }
 
@@ -1067,11 +1071,18 @@ func (h *Handler) handleClaudeMessagesInternal(w http.ResponseWriter, r *http.Re
 	var cacheKey string
 	if config.GetResponseCacheEnabled() && isCacheableClaudeRequest(&req, thinking) {
 		if norm, err := json.Marshal(&req); err == nil {
-			cacheKey = responseCacheKey("claude", norm)
+			// Namespace the cache by API-key identity so one tenant's cached
+			// response is never served to a different key.
+			cacheKey = responseCacheKey(apiKeyID, "claude", norm)
 			if cached, ok := h.responseCache.Get(cacheKey, time.Now().Unix()); ok {
 				w.Header().Set("Content-Type", "application/json; charset=utf-8")
 				w.Header().Set("X-Kiro-Cache", "hit")
 				_, _ = w.Write(cached)
+				// A cache hit still consumes the tenant's quota: attribute the
+				// cached response's usage to the key so cache hits cannot bypass
+				// token/credit accounting or the RPM/TPM windows.
+				in, out := usageFromCachedClaudeBody(cached)
+				h.recordSuccessForApiKey(apiKeyID, in, out, 0, req.Model)
 				return
 			}
 		}
@@ -1989,11 +2000,18 @@ func (h *Handler) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
 	var cacheKey string
 	if config.GetResponseCacheEnabled() && isCacheableOpenAIRequest(&req, thinking) {
 		if norm, err := json.Marshal(&req); err == nil {
-			cacheKey = responseCacheKey("openai", norm)
+			// Namespace the cache by API-key identity so one tenant's cached
+			// response is never served to a different key.
+			cacheKey = responseCacheKey(apiKeyID, "openai", norm)
 			if cached, ok := h.responseCache.Get(cacheKey, time.Now().Unix()); ok {
 				w.Header().Set("Content-Type", "application/json; charset=utf-8")
 				w.Header().Set("X-Kiro-Cache", "hit")
 				_, _ = w.Write(cached)
+				// A cache hit still consumes the tenant's quota: attribute the
+				// cached response's usage to the key so cache hits cannot bypass
+				// token/credit accounting or the RPM/TPM windows.
+				in, out := usageFromCachedOpenAIBody(cached)
+				h.recordSuccessForApiKey(apiKeyID, in, out, 0, req.Model)
 				return
 			}
 		}
