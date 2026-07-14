@@ -31,7 +31,7 @@ func toApiKeyView(e config.ApiKeyEntry) apiKeyView {
 	return apiKeyView{
 		ID:            e.ID,
 		Name:          e.Name,
-		KeyMasked:     config.MaskApiKey(e.Key),
+		KeyMasked:     config.ApiKeyDisplayMask(e),
 		Enabled:       e.Enabled,
 		Migrated:      e.Migrated,
 		CreatedAt:     e.CreatedAt,

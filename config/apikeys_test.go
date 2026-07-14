@@ -39,8 +39,16 @@ func TestApiKeyMigrationFromLegacyField(t *testing.T) {
 		t.Fatalf("expected one migrated key, got %d", len(keys))
 	}
 	migrated := keys[0]
-	if migrated.Key != "legacy-secret" {
-		t.Fatalf("expected migrated key value, got %q", migrated.Key)
+	// Plaintext is never stored: the legacy secret is migrated to a hash, and
+	// the entry must authenticate against the original value via the hash.
+	if migrated.Key != "" {
+		t.Fatalf("expected plaintext key to be cleared at rest, got %q", migrated.Key)
+	}
+	if migrated.KeyHash != HashApiKey("legacy-secret") {
+		t.Fatalf("expected migrated key hash to match legacy secret")
+	}
+	if FindApiKeyByValue("legacy-secret") == nil {
+		t.Fatalf("expected migrated key to authenticate by its original value")
 	}
 	if !migrated.Migrated {
 		t.Fatalf("expected migrated flag to be true")
@@ -146,8 +154,13 @@ func TestApiKeyCRUD(t *testing.T) {
 	if got.TokenLimit != 2000 || got.CreditLimit != 5.5 {
 		t.Fatalf("expected limits to be updated, got token=%d credit=%v", got.TokenLimit, got.CreditLimit)
 	}
-	if got.Key != "sk-alpha" {
-		t.Fatalf("expected key value to remain unchanged when patch.Key is empty, got %q", got.Key)
+	// Plaintext is never stored; an empty patch.Key must leave the hash intact
+	// so the original value still authenticates.
+	if got.Key != "" {
+		t.Fatalf("expected plaintext key to be cleared at rest, got %q", got.Key)
+	}
+	if got.KeyHash != HashApiKey("sk-alpha") {
+		t.Fatalf("expected key hash to remain unchanged when patch.Key is empty")
 	}
 
 	if found := FindApiKeyByValue("sk-alpha"); found == nil || found.ID != created.ID {
@@ -244,10 +257,10 @@ func TestResetApiKeyUsage(t *testing.T) {
 
 func TestApiKeyOverLimit(t *testing.T) {
 	tests := []struct {
-		name        string
-		entry       ApiKeyEntry
-		wantToken   bool
-		wantCredit  bool
+		name       string
+		entry      ApiKeyEntry
+		wantToken  bool
+		wantCredit bool
 	}{
 		{"unlimited", ApiKeyEntry{TokensUsed: 100, CreditsUsed: 5}, false, false},
 		{"under token limit", ApiKeyEntry{TokenLimit: 200, TokensUsed: 100}, false, false},

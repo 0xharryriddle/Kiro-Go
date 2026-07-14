@@ -155,9 +155,20 @@ type PromptFilterRule struct {
 // Limits with value 0 are treated as "no limit". Counters are cumulative and never reset
 // automatically; operators can use the admin endpoint to manually reset them.
 type ApiKeyEntry struct {
-	ID         string `json:"id"`                 // Unique identifier (UUID)
-	Name       string `json:"name,omitempty"`     // Human-readable label
-	Key        string `json:"key"`                // The actual key value clients send
+	ID   string `json:"id"`             // Unique identifier (UUID)
+	Name string `json:"name,omitempty"` // Human-readable label
+	// Key is the cleartext secret clients send. It is NEVER persisted: it is
+	// populated transiently on input (create/update) and on the one-time create
+	// response, then cleared before the entry is written to disk. Legacy config
+	// files that still carry a plaintext "key" deserialize into this field and are
+	// migrated to KeyHash/KeyMask on first load (after which "key" is dropped).
+	Key string `json:"key,omitempty"`
+	// KeyHash is the hex SHA-256 of the secret — the only credential material at
+	// rest. Lookups hash the provided value and constant-time compare against it.
+	KeyHash string `json:"keyHash,omitempty"`
+	// KeyMask is the display-only masked form (first6****last4), computed once at
+	// create/update so the admin UI can identify a key without the plaintext.
+	KeyMask    string `json:"keyMask,omitempty"`
 	Enabled    bool   `json:"enabled"`            // Whether this key may authenticate
 	Migrated   bool   `json:"migrated,omitempty"` // True if migrated from legacy single ApiKey field
 	CreatedAt  int64  `json:"createdAt"`          // Creation timestamp (Unix seconds)
@@ -386,11 +397,39 @@ func Load() error {
 		cfg.ApiKeys = append(cfg.ApiKeys, ApiKeyEntry{
 			ID:        newUUID(),
 			Name:      "legacy",
-			Key:       cfg.ApiKey,
+			KeyHash:   HashApiKey(cfg.ApiKey),
+			KeyMask:   MaskApiKey(cfg.ApiKey),
 			Enabled:   cfg.RequireApiKey,
 			Migrated:  true,
 			CreatedAt: time.Now().Unix(),
 		})
+		// Drop the legacy plaintext single key now that it lives as a hash in
+		// ApiKeys; the legacy auth path is unreachable once HasApiKeys() is true,
+		// so this removes the last plaintext credential from config/backups.
+		cfg.ApiKey = ""
+		if err := saveLocked(); err != nil {
+			return err
+		}
+	}
+
+	// Migration: hash any API key entry still carrying a plaintext "key" at rest
+	// (configs written before hashed-at-rest storage). Derive KeyHash/KeyMask and
+	// drop the plaintext so it is never re-serialized. Idempotent: entries that
+	// already have KeyHash and no plaintext are left untouched.
+	apiKeysHashMigrated := false
+	for i := range cfg.ApiKeys {
+		if cfg.ApiKeys[i].Key != "" {
+			if cfg.ApiKeys[i].KeyHash == "" {
+				cfg.ApiKeys[i].KeyHash = HashApiKey(cfg.ApiKeys[i].Key)
+			}
+			if cfg.ApiKeys[i].KeyMask == "" {
+				cfg.ApiKeys[i].KeyMask = MaskApiKey(cfg.ApiKeys[i].Key)
+			}
+			cfg.ApiKeys[i].Key = ""
+			apiKeysHashMigrated = true
+		}
+	}
+	if apiKeysHashMigrated {
 		if err := saveLocked(); err != nil {
 			return err
 		}

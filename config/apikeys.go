@@ -2,11 +2,36 @@ package config
 
 import (
 	"crypto/rand"
+	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/hex"
 	"errors"
 	"strings"
 	"time"
 )
+
+// HashApiKey returns the hex SHA-256 of the (trimmed) secret. This is the only
+// credential material stored at rest; plaintext keys are never persisted. SHA-256
+// is appropriate here (not bcrypt/argon2) because API keys are high-entropy random
+// 32-byte tokens, not low-entropy user passwords — a fast hash with constant-time
+// comparison defeats both extraction-from-disk and timing attacks.
+func HashApiKey(key string) string {
+	key = strings.TrimSpace(key)
+	if key == "" {
+		return ""
+	}
+	sum := sha256.Sum256([]byte(key))
+	return hex.EncodeToString(sum[:])
+}
+
+// apiKeyHashMatches constant-time compares a provided key's hash against a stored
+// hash, avoiding a timing side-channel on the credential.
+func apiKeyHashMatches(providedKey, storedHash string) bool {
+	if storedHash == "" {
+		return false
+	}
+	return subtle.ConstantTimeCompare([]byte(HashApiKey(providedKey)), []byte(storedHash)) == 1
+}
 
 // ListApiKeys returns a snapshot of all configured API key entries.
 func ListApiKeys() []ApiKeyEntry {
@@ -48,8 +73,10 @@ func AddApiKey(entry ApiKeyEntry) (ApiKeyEntry, error) {
 	if entry.Key == "" {
 		return ApiKeyEntry{}, errors.New("api key value must not be empty")
 	}
+	// Derive hash + display mask; the plaintext is never persisted.
+	newHash := HashApiKey(entry.Key)
 	for _, existing := range cfg.ApiKeys {
-		if existing.Key == entry.Key {
+		if existing.KeyHash == newHash {
 			return ApiKeyEntry{}, errors.New("api key already exists")
 		}
 	}
@@ -59,12 +86,19 @@ func AddApiKey(entry ApiKeyEntry) (ApiKeyEntry, error) {
 	if entry.CreatedAt == 0 {
 		entry.CreatedAt = time.Now().Unix()
 	}
+	plaintext := entry.Key
+	entry.KeyHash = newHash
+	entry.KeyMask = MaskApiKey(plaintext)
+	entry.Key = "" // never store plaintext at rest
 	cfg.ApiKeys = append(cfg.ApiKeys, entry)
 	if err := saveLocked(); err != nil {
 		// Roll back the in-memory append so we don't leave inconsistent state.
 		cfg.ApiKeys = cfg.ApiKeys[:len(cfg.ApiKeys)-1]
 		return ApiKeyEntry{}, err
 	}
+	// Return the plaintext to the caller (one-time create response); the stored
+	// copy has it cleared.
+	entry.Key = plaintext
 	return entry, nil
 }
 
@@ -95,13 +129,16 @@ func UpdateApiKey(id string, patch ApiKeyEntry) error {
 	}
 	if patch.Key != "" {
 		newKey := strings.TrimSpace(patch.Key)
-		// Reject duplicates against any other entry.
+		newHash := HashApiKey(newKey)
+		// Reject duplicates against any other entry (compare hashes at rest).
 		for j := range cfg.ApiKeys {
-			if j != idx && cfg.ApiKeys[j].Key == newKey {
+			if j != idx && cfg.ApiKeys[j].KeyHash == newHash {
 				return errors.New("api key value collides with existing entry")
 			}
 		}
-		cfg.ApiKeys[idx].Key = newKey
+		cfg.ApiKeys[idx].KeyHash = newHash
+		cfg.ApiKeys[idx].KeyMask = MaskApiKey(newKey)
+		cfg.ApiKeys[idx].Key = "" // never store plaintext at rest
 	}
 	cfg.ApiKeys[idx].Enabled = patch.Enabled
 	cfg.ApiKeys[idx].TokenLimit = patch.TokenLimit
@@ -131,8 +168,9 @@ func DeleteApiKey(id string) error {
 	return nil
 }
 
-// FindApiKeyByValue returns a copy of the entry whose Key matches the given value,
-// or nil if no match. O(n) linear scan.
+// FindApiKeyByValue returns a copy of the entry whose stored hash matches the
+// hash of the given value, or nil if no match. Comparison is constant-time to
+// avoid a timing side-channel. O(n) linear scan.
 func FindApiKeyByValue(key string) *ApiKeyEntry {
 	cfgLock.RLock()
 	defer cfgLock.RUnlock()
@@ -140,7 +178,7 @@ func FindApiKeyByValue(key string) *ApiKeyEntry {
 		return nil
 	}
 	for i := range cfg.ApiKeys {
-		if cfg.ApiKeys[i].Key == key {
+		if apiKeyHashMatches(key, cfg.ApiKeys[i].KeyHash) {
 			cp := cfg.ApiKeys[i]
 			return &cp
 		}
@@ -226,6 +264,20 @@ func GenerateApiKeyValue() string {
 	buf := make([]byte, 32)
 	_, _ = rand.Read(buf)
 	return "sk-" + hex.EncodeToString(buf)
+}
+
+// ApiKeyDisplayMask returns the masked form to show in admin views. It prefers
+// the stored KeyMask (set at create/update); for a legacy entry still carrying a
+// plaintext Key (not yet migrated) it masks that as a fallback. Returns "" when
+// neither is available.
+func ApiKeyDisplayMask(e ApiKeyEntry) string {
+	if e.KeyMask != "" {
+		return e.KeyMask
+	}
+	if e.Key != "" {
+		return MaskApiKey(e.Key)
+	}
+	return ""
 }
 
 // MaskApiKey produces a display-friendly masked version: keeps first 6 and last 4
