@@ -561,12 +561,14 @@ func parseEventStream(body io.Reader, callback *KiroStreamCallback) error {
 			if text, ok := event["text"].(string); ok && text != "" {
 				normalized := normalizeChunk(text, &lastReasoningContent)
 				if normalized != "" && callback.OnText != nil {
-					// Withhold reasoning while the cumulative buffer is still a
-					// pure redaction placeholder ("..."). As soon as one real
-					// character arrives, isPlaceholderReasoning fails and this
-					// (and every later) delta is emitted. Disabled by config toggle.
-					if suppressPlaceholderReasoning && isPlaceholderReasoning(lastReasoningContent) {
-						// placeholder-only reasoning carries no information — skip
+					// Suppress ONLY the individual redaction-placeholder deltas
+					// ("...", signature-block markers). This is a per-chunk
+					// decision, not a cumulative-buffer one: every real reasoning
+					// delta flows through, so extended-thinking text is never lost
+					// even when it is interleaved with redacted "..." markers.
+					// Disabled by config toggle.
+					if suppressPlaceholderReasoning && isPlaceholderReasoning(normalized) {
+						// placeholder-only delta carries no information — skip
 					} else {
 						callback.OnText(normalized, true)
 					}

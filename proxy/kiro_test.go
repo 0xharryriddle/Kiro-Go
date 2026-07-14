@@ -356,6 +356,42 @@ func TestParseEventStreamPassesRealReasoning(t *testing.T) {
 	}
 }
 
+// Regression: reasoning streams interleave a redacted "..." placeholder block
+// (Anthropic extended-thinking with an encrypted signature) with real readable
+// reasoning deltas. Suppression must drop ONLY the "..." delta and still emit
+// every real reasoning chunk — the per-chunk decision, not a cumulative-buffer
+// one that would poison the whole stream once "..." appeared first.
+func TestParseEventStreamSuppressesPlaceholderButKeepsInterleavedRealReasoning(t *testing.T) {
+	stream := bytes.NewReader(bytes.Join([][]byte{
+		// Redacted block arrives first (this is the common ordering upstream).
+		awsEventStreamFrame(t, "reasoningContentEvent", map[string]interface{}{"text": "..."}),
+		// Real reasoning text follows, streamed as cumulative snapshots.
+		awsEventStreamFrame(t, "reasoningContentEvent", map[string]interface{}{"text": "Checking"}),
+		awsEventStreamFrame(t, "reasoningContentEvent", map[string]interface{}{"text": "Checking the edge case"}),
+		awsEventStreamFrame(t, "assistantResponseEvent", map[string]interface{}{"content": "done"}),
+	}, nil))
+
+	var thinking, content string
+	err := parseEventStream(stream, &KiroStreamCallback{
+		OnText: func(text string, isThinking bool) {
+			if isThinking {
+				thinking += text
+			} else {
+				content += text
+			}
+		},
+	})
+	if err != nil {
+		t.Fatalf("unexpected parse error: %v", err)
+	}
+	if thinking != "Checking the edge case" {
+		t.Fatalf("expected interleaved real reasoning to survive placeholder suppression, got %q", thinking)
+	}
+	if content != "done" {
+		t.Fatalf("expected assistant content, got %q", content)
+	}
+}
+
 func awsEventStreamFrame(t *testing.T, eventType string, payload map[string]interface{}) []byte {
 	t.Helper()
 
