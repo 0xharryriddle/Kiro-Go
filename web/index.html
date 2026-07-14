@@ -711,6 +711,19 @@
           </div>
           <p class="api-hint"><i class="fa-solid fa-key"></i><span data-i18n="api.statsHint"></span></p>
         </section>
+
+        <!-- API key management pointer: management lives under Settings; surface
+             it here since users look for key administration on the API tab. -->
+        <section class="api-card" aria-labelledby="apiKeysManageTitle">
+          <div class="card-header api-card-header">
+            <span class="card-title" id="apiKeysManageTitle" data-i18n="api.manageKeysTitle"></span>
+          </div>
+          <p class="api-hint"><i class="fa-solid fa-key"></i><span data-i18n="api.manageKeysHint"></span></p>
+          <button class="btn btn-primary btn-sm" id="apiTabManageKeysBtn" type="button">
+            <i class="fa-solid fa-gear"></i>
+            <span data-i18n="api.manageKeysButton"></span>
+          </button>
+        </section>
       </div>
 
       <!-- Logs tab -->

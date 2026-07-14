@@ -3685,6 +3685,16 @@
     $('logoutBtn').addEventListener('click', logout);
 
     qsa('#tabBar .tab').forEach(tab => tab.addEventListener('click', () => switchTab(tab.dataset.tab)));
+
+    // Discoverability: the API tab links to the key-management UI under Settings.
+    const apiTabManageKeysBtn = $('apiTabManageKeysBtn');
+    if (apiTabManageKeysBtn) {
+      apiTabManageKeysBtn.addEventListener('click', () => {
+        switchTab('settings');
+        const list = $('apiKeysList');
+        if (list && list.scrollIntoView) list.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      });
+    }
     qsa('.tool-launch-btn').forEach(btn => btn.addEventListener('click', () => showToolPanel(btn.dataset.toolPanel)));
 
     qsa('[data-copy]').forEach(btn => btn.addEventListener('click', async () => {
