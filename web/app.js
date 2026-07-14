@@ -679,6 +679,7 @@
     renderEndpointCode('openaiResponsesEndpoint', baseUrl + '/v1/responses');
     renderEndpointCode('modelsEndpoint', baseUrl + '/v1/models');
     renderEndpointCode('statsEndpoint', baseUrl + '/v1/stats');
+    renderQuickStart();
     setTimeout(checkUpdate, 2000);
   }
   async function loadStats() {
@@ -3695,6 +3696,17 @@
         if (list && list.scrollIntoView) list.scrollIntoView({ behavior: 'smooth', block: 'center' });
       });
     }
+
+    // Quick-start: live key test + re-render curl snippets as the key is typed.
+    const quickStartTestBtn = $('quickStartTestBtn');
+    if (quickStartTestBtn) quickStartTestBtn.addEventListener('click', testQuickStartKey);
+    const quickStartKeyInput = $('quickStartKeyInput');
+    if (quickStartKeyInput) {
+      quickStartKeyInput.addEventListener('input', renderQuickStart);
+      quickStartKeyInput.addEventListener('keydown', e => {
+        if (e.key === 'Enter') { e.preventDefault(); testQuickStartKey(); }
+      });
+    }
     qsa('.tool-launch-btn').forEach(btn => btn.addEventListener('click', () => showToolPanel(btn.dataset.toolPanel)));
 
     qsa('[data-copy]').forEach(btn => btn.addEventListener('click', async () => {
@@ -3894,6 +3906,93 @@
     if (m > 0) parts.push(m + (currentLang === 'zh' ? '分' : 'm'));
     parts.push(s + (currentLang === 'zh' ? '秒' : 's'));
     return parts.join(' ');
+  }
+
+  // ── Client quick-start (API tab) ──
+  // Renders copy-paste curl snippets for the OpenAI + Claude routes, filling in
+  // the entered key (or a placeholder) so users can paste and run immediately.
+  const QUICKSTART_KEY_PLACEHOLDER = 'YOUR_API_KEY';
+
+  function currentQuickStartKey() {
+    const el = $('quickStartKeyInput');
+    const v = el ? String(el.value || '').trim() : '';
+    return v || QUICKSTART_KEY_PLACEHOLDER;
+  }
+
+  function buildOpenAICurl(key) {
+    return 'curl ' + baseUrl + '/v1/chat/completions \\\n' +
+      "  -H 'Content-Type: application/json' \\\n" +
+      "  -H 'Authorization: Bearer " + key + "' \\\n" +
+      "  -d '{\n" +
+      '    "model": "claude-sonnet-4",\n' +
+      '    "messages": [{"role": "user", "content": "Hello"}]\n' +
+      "  }'";
+  }
+
+  function buildClaudeCurl(key) {
+    return 'curl ' + baseUrl + '/v1/messages \\\n' +
+      "  -H 'Content-Type: application/json' \\\n" +
+      "  -H 'x-api-key: " + key + "' \\\n" +
+      "  -H 'anthropic-version: 2023-06-01' \\\n" +
+      "  -d '{\n" +
+      '    "model": "claude-sonnet-4",\n' +
+      '    "max_tokens": 256,\n' +
+      '    "messages": [{"role": "user", "content": "Hello"}]\n' +
+      "  }'";
+  }
+
+  function renderQuickStart() {
+    const key = currentQuickStartKey();
+    const openai = $('quickStartOpenAICode');
+    const claude = $('quickStartClaudeCode');
+    if (openai) {
+      const code = buildOpenAICurl(key);
+      openai.textContent = code;
+      openai.dataset.rawValue = code;
+    }
+    if (claude) {
+      const code = buildClaudeCurl(key);
+      claude.textContent = code;
+      claude.dataset.rawValue = code;
+    }
+  }
+
+  // Live key verification: hits the auth-gated /v1/stats endpoint (in-process
+  // counters, no upstream Kiro call, no credit spend) using the entered key.
+  async function testQuickStartKey() {
+    const input = $('quickStartKeyInput');
+    const result = $('quickStartTestResult');
+    if (!result) return;
+    const key = input ? String(input.value || '').trim() : '';
+    if (!key) {
+      result.classList.remove('hidden', 'is-success', 'is-error');
+      result.classList.add('is-error');
+      result.innerHTML = '<i class="fa-solid fa-circle-exclamation"></i> ' + escapeHtml(t('api.quickStartTestEmpty'));
+      return;
+    }
+    result.classList.remove('hidden', 'is-success', 'is-error');
+    result.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> ' + escapeHtml(t('api.quickStartTesting'));
+    try {
+      const res = await fetch(baseUrl + '/v1/stats', {
+        headers: { 'Authorization': 'Bearer ' + key }
+      });
+      if (res.ok) {
+        result.classList.add('is-success');
+        result.innerHTML = '<i class="fa-solid fa-circle-check"></i> ' + escapeHtml(t('api.quickStartTestOk'));
+      } else if (res.status === 401) {
+        result.classList.add('is-error');
+        result.innerHTML = '<i class="fa-solid fa-circle-xmark"></i> ' + escapeHtml(t('api.quickStartTestUnauthorized'));
+      } else if (res.status === 429) {
+        result.classList.add('is-error');
+        result.innerHTML = '<i class="fa-solid fa-triangle-exclamation"></i> ' + escapeHtml(t('api.quickStartTestRateLimited'));
+      } else {
+        result.classList.add('is-error');
+        result.innerHTML = '<i class="fa-solid fa-circle-exclamation"></i> ' + escapeHtml(t('api.quickStartTestError') + ' (HTTP ' + res.status + ')');
+      }
+    } catch (e) {
+      result.classList.add('is-error');
+      result.innerHTML = '<i class="fa-solid fa-circle-exclamation"></i> ' + escapeHtml(t('api.quickStartTestError') + ': ' + ((e && e.message) || ''));
+    }
   }
 
   async function showModelsView() {

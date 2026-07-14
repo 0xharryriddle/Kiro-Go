@@ -724,6 +724,44 @@
             <span data-i18n="api.manageKeysButton"></span>
           </button>
         </section>
+
+        <!-- Client quick-start: copy-paste curl for OpenAI/Claude routes + a live
+             key-test button that hits the cheap auth-gated /v1/stats endpoint (no
+             upstream Kiro call, no credit spend). -->
+        <section class="api-card" aria-labelledby="apiQuickStartTitle">
+          <div class="card-header api-card-header">
+            <span class="card-title" id="apiQuickStartTitle" data-i18n="api.quickStartTitle"></span>
+          </div>
+          <p class="api-hint"><i class="fa-solid fa-rocket"></i><span data-i18n="api.quickStartHint"></span></p>
+
+          <div class="quickstart-key-row">
+            <input type="text" id="quickStartKeyInput" class="quickstart-key-input" autocomplete="off"
+              spellcheck="false" data-i18n-placeholder="api.quickStartKeyPlaceholder" />
+            <button class="btn btn-secondary btn-sm" id="quickStartTestBtn" type="button">
+              <i class="fa-solid fa-flask"></i>
+              <span data-i18n="api.quickStartTestBtn"></span>
+            </button>
+          </div>
+          <div id="quickStartTestResult" class="quickstart-test-result hidden" role="status" aria-live="polite"></div>
+
+          <div class="quickstart-snippet">
+            <div class="quickstart-snippet-head">
+              <span class="quickstart-snippet-title" data-i18n="api.quickStartOpenAI"></span>
+              <button class="api-copy-btn" type="button" data-copy="quickStartOpenAICode" aria-label=""
+                data-i18n-aria-label="api.quickStartCopy"><i class="fa-regular fa-copy"></i></button>
+            </div>
+            <pre class="quickstart-code"><code id="quickStartOpenAICode"></code></pre>
+          </div>
+
+          <div class="quickstart-snippet">
+            <div class="quickstart-snippet-head">
+              <span class="quickstart-snippet-title" data-i18n="api.quickStartClaude"></span>
+              <button class="api-copy-btn" type="button" data-copy="quickStartClaudeCode" aria-label=""
+                data-i18n-aria-label="api.quickStartCopy"><i class="fa-regular fa-copy"></i></button>
+            </div>
+            <pre class="quickstart-code"><code id="quickStartClaudeCode"></code></pre>
+          </div>
+        </section>
       </div>
 
       <!-- Logs tab -->
