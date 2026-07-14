@@ -617,6 +617,8 @@
   "settings.saveProxy": "保存代理设置",
   "settings.saveThinking": "保存 Thinking 设置",
   "settings.saveUsage": "保存用量更改",
+  "settings.showPlaceholderReasoning": "显示占位推理内容",
+  "settings.showPlaceholderReasoningHint": "部分模型（如 GPT-5.x / o 系列）会隐藏原始推理，仅发送 \"...\" 占位符。关闭（默认）会隐藏该空占位符；对于会公开推理的模型，真实推理始终显示。开启则显示原始占位符。",
   "settings.statistics": "统计",
   "settings.statsReset": "统计已重置",
   "settings.thinkingSaved": "Thinking 设置已保存",

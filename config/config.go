@@ -254,6 +254,12 @@ type Config struct {
 	OpenAIThinkingFormat string `json:"openaiThinkingFormat,omitempty"` // OpenAI output format: "reasoning_content", "thinking", or "think"
 	ClaudeThinkingFormat string `json:"claudeThinkingFormat,omitempty"` // Claude output format: "reasoning_content", "thinking", or "think"
 
+	// ShowPlaceholderReasoning, when true, surfaces reasoning content even when it
+	// is only an upstream redaction placeholder ("..." for hidden chain-of-thought,
+	// e.g. GPT-5.x / o-series). Default false = suppress the information-free
+	// placeholder (real reasoning from models that expose it always passes through).
+	ShowPlaceholderReasoning bool `json:"showPlaceholderReasoning,omitempty"`
+
 	// Endpoint configuration: "auto", "kiro", "codewhisperer", or "amazonq"
 	PreferredEndpoint string `json:"preferredEndpoint,omitempty"`
 
@@ -1288,12 +1294,27 @@ type ThinkingConfig struct {
 	Suffix       string `json:"suffix"`       // Model name suffix that triggers thinking mode
 	OpenAIFormat string `json:"openaiFormat"` // Output format for OpenAI-compatible responses
 	ClaudeFormat string `json:"claudeFormat"` // Output format for Claude-compatible responses
+	// SuppressPlaceholderReasoning, when true, withholds reasoning content that is
+	// only an upstream redaction placeholder (empty / whitespace / dots-only, e.g.
+	// the "..." GPT-5.x / o-series send for hidden CoT). Real reasoning passes through.
+	SuppressPlaceholderReasoning bool `json:"suppressPlaceholderReasoning"`
 }
 
 // GetThinkingConfig 获取 thinking 配置
 func GetThinkingConfig() ThinkingConfig {
 	cfgLock.RLock()
 	defer cfgLock.RUnlock()
+
+	if cfg == nil {
+		// Uninitialized config (e.g. unit tests that exercise the parser
+		// directly): return safe defaults with placeholder suppression on.
+		return ThinkingConfig{
+			Suffix:                       "-thinking",
+			OpenAIFormat:                 "reasoning_content",
+			ClaudeFormat:                 "thinking",
+			SuppressPlaceholderReasoning: true,
+		}
+	}
 
 	suffix := cfg.ThinkingSuffix
 	if suffix == "" {
@@ -1312,16 +1333,19 @@ func GetThinkingConfig() ThinkingConfig {
 		Suffix:       suffix,
 		OpenAIFormat: openaiFormat,
 		ClaudeFormat: claudeFormat,
+		// Default (ShowPlaceholderReasoning=false) → suppress the placeholder.
+		SuppressPlaceholderReasoning: !cfg.ShowPlaceholderReasoning,
 	}
 }
 
 // UpdateThinkingConfig 更新 thinking 配置
-func UpdateThinkingConfig(suffix, openaiFormat, claudeFormat string) error {
+func UpdateThinkingConfig(suffix, openaiFormat, claudeFormat string, showPlaceholderReasoning bool) error {
 	cfgLock.Lock()
 	defer cfgLock.Unlock()
 	cfg.ThinkingSuffix = suffix
 	cfg.OpenAIThinkingFormat = openaiFormat
 	cfg.ClaudeThinkingFormat = claudeFormat
+	cfg.ShowPlaceholderReasoning = showPlaceholderReasoning
 	return Save()
 }
 

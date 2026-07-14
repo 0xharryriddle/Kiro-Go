@@ -178,6 +178,11 @@ func (h *Handler) handleResponsesNonStream(
 		if !thinking {
 			reasoningContent = ""
 		}
+		// Defensive: withhold reasoning that is only an upstream redaction
+		// placeholder ("...") when suppression is enabled (real CoT passes through).
+		if config.GetThinkingConfig().SuppressPlaceholderReasoning && isPlaceholderReasoning(reasoningContent) {
+			reasoningContent = ""
+		}
 
 		if realInputTokens > 0 {
 			inputTokens = realInputTokens
@@ -496,6 +501,11 @@ func (h *Handler) handleResponsesStream(
 		finalContent, _ := extractThinkingFromContent(fullText.String())
 		reasoning := reasoningText.String()
 		if !thinking {
+			reasoning = ""
+		}
+		// Defensive: withhold reasoning that is only an upstream redaction
+		// placeholder ("...") when suppression is enabled (real CoT passes through).
+		if config.GetThinkingConfig().SuppressPlaceholderReasoning && isPlaceholderReasoning(reasoning) {
 			reasoning = ""
 		}
 

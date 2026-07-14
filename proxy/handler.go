@@ -1902,6 +1902,11 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayl
 		if !thinking {
 			rawThinkingContent = ""
 		}
+		// Defensive: withhold reasoning that is only an upstream redaction
+		// placeholder ("...") when suppression is enabled (real CoT passes through).
+		if config.GetThinkingConfig().SuppressPlaceholderReasoning && isPlaceholderReasoning(rawThinkingContent) {
+			rawThinkingContent = ""
+		}
 
 		if realInputTokens > 0 {
 			inputTokens = realInputTokens
@@ -2491,6 +2496,12 @@ func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, payload *KiroPayl
 		if thinking && reasoningContent == "" && extractedReasoning != "" {
 			reasoningContent = extractedReasoning
 		} else if !thinking {
+			reasoningContent = ""
+		}
+		// Defensive: reasoning may also arrive embedded as <thinking>...</thinking>
+		// (a different channel than reasoningContentEvent). Drop it too when it is
+		// only an upstream redaction placeholder and suppression is enabled.
+		if config.GetThinkingConfig().SuppressPlaceholderReasoning && isPlaceholderReasoning(reasoningContent) {
 			reasoningContent = ""
 		}
 
@@ -5054,15 +5065,19 @@ func (h *Handler) apiGetThinkingConfig(w http.ResponseWriter, r *http.Request) {
 		"suffix":       cfg.Suffix,
 		"openaiFormat": cfg.OpenAIFormat,
 		"claudeFormat": cfg.ClaudeFormat,
+		// Report the raw show flag (inverse of the internal suppress flag) so the
+		// UI toggle reads naturally: on = show placeholder reasoning.
+		"showPlaceholderReasoning": !cfg.SuppressPlaceholderReasoning,
 	})
 }
 
 // apiUpdateThinkingConfig 更新 thinking 配置
 func (h *Handler) apiUpdateThinkingConfig(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		Suffix       string `json:"suffix"`
-		OpenAIFormat string `json:"openaiFormat"`
-		ClaudeFormat string `json:"claudeFormat"`
+		Suffix                   string `json:"suffix"`
+		OpenAIFormat             string `json:"openaiFormat"`
+		ClaudeFormat             string `json:"claudeFormat"`
+		ShowPlaceholderReasoning bool   `json:"showPlaceholderReasoning"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		w.WriteHeader(400)
@@ -5083,7 +5098,7 @@ func (h *Handler) apiUpdateThinkingConfig(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	if err := config.UpdateThinkingConfig(req.Suffix, req.OpenAIFormat, req.ClaudeFormat); err != nil {
+	if err := config.UpdateThinkingConfig(req.Suffix, req.OpenAIFormat, req.ClaudeFormat, req.ShowPlaceholderReasoning); err != nil {
 		w.WriteHeader(500)
 		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
 		return

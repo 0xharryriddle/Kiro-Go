@@ -271,6 +271,91 @@ func assertProxyURL(t *testing.T, got *url.URL, want string) {
 	}
 }
 
+func TestIsPlaceholderReasoning(t *testing.T) {
+	cases := []struct {
+		in   string
+		want bool
+	}{
+		{"", true},
+		{"   ", true},
+		{".", true},
+		{"...", true},
+		{". . .", true},
+		{"\u2026", true},    // unicode ellipsis
+		{"..\u2026 ", true}, // mixed dots + ellipsis + space
+		{"real", false},
+		{"...thinking", false}, // opens with dots but has real content
+		{"3.14", false},        // digits are real content
+		{"Let me think.", false},
+	}
+	for _, c := range cases {
+		if got := isPlaceholderReasoning(c.in); got != c.want {
+			t.Errorf("isPlaceholderReasoning(%q) = %v, want %v", c.in, got, c.want)
+		}
+	}
+}
+
+// With suppression on (the default when config is uninitialized), a stream whose
+// only reasoning is the "..." redaction placeholder must emit NO thinking text,
+// while the real assistant content still flows.
+func TestParseEventStreamSuppressesPlaceholderReasoning(t *testing.T) {
+	stream := bytes.NewReader(bytes.Join([][]byte{
+		awsEventStreamFrame(t, "reasoningContentEvent", map[string]interface{}{"text": "..."}),
+		awsEventStreamFrame(t, "assistantResponseEvent", map[string]interface{}{"content": "answer"}),
+	}, nil))
+
+	var thinking, content string
+	err := parseEventStream(stream, &KiroStreamCallback{
+		OnText: func(text string, isThinking bool) {
+			if isThinking {
+				thinking += text
+			} else {
+				content += text
+			}
+		},
+	})
+	if err != nil {
+		t.Fatalf("unexpected parse error: %v", err)
+	}
+	if thinking != "" {
+		t.Fatalf("expected placeholder reasoning to be suppressed, got %q", thinking)
+	}
+	if content != "answer" {
+		t.Fatalf("expected assistant content to flow, got %q", content)
+	}
+}
+
+// Real reasoning text must always be emitted, even if it happens to begin with
+// a dots-only chunk — the moment a real character arrives, the cumulative buffer
+// is no longer placeholder-only and everything flows.
+func TestParseEventStreamPassesRealReasoning(t *testing.T) {
+	stream := bytes.NewReader(bytes.Join([][]byte{
+		awsEventStreamFrame(t, "reasoningContentEvent", map[string]interface{}{"text": "Let me think"}),
+		awsEventStreamFrame(t, "reasoningContentEvent", map[string]interface{}{"text": "Let me think step by step"}),
+		awsEventStreamFrame(t, "assistantResponseEvent", map[string]interface{}{"content": "42"}),
+	}, nil))
+
+	var thinking, content string
+	err := parseEventStream(stream, &KiroStreamCallback{
+		OnText: func(text string, isThinking bool) {
+			if isThinking {
+				thinking += text
+			} else {
+				content += text
+			}
+		},
+	})
+	if err != nil {
+		t.Fatalf("unexpected parse error: %v", err)
+	}
+	if thinking != "Let me think step by step" {
+		t.Fatalf("expected real reasoning to pass through cumulatively, got %q", thinking)
+	}
+	if content != "42" {
+		t.Fatalf("expected assistant content, got %q", content)
+	}
+}
+
 func awsEventStreamFrame(t *testing.T, eventType string, payload map[string]interface{}) []byte {
 	t.Helper()
 

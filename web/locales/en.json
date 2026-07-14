@@ -617,6 +617,8 @@
   "settings.saveProxy": "Save Proxy Settings",
   "settings.saveThinking": "Save Thinking Settings",
   "settings.saveUsage": "Save Usage Changes",
+  "settings.showPlaceholderReasoning": "Show placeholder reasoning",
+  "settings.showPlaceholderReasoningHint": "Some models (e.g. GPT-5.x / o-series) hide their raw reasoning and send only a \"...\" placeholder. Off (default) hides this empty placeholder; real reasoning from models that expose it always shows. Turn on to surface the raw placeholder.",
   "settings.statistics": "Statistics",
   "settings.statsReset": "Statistics reset",
   "settings.thinkingSaved": "Thinking settings saved",

@@ -2220,13 +2220,15 @@
     $('thinkingSuffix').value = d.suffix || '-thinking';
     $('openaiThinkingFormat').value = d.openaiFormat || 'reasoning_content';
     $('claudeThinkingFormat').value = d.claudeFormat || 'thinking';
+    if ($('showPlaceholderReasoning')) $('showPlaceholderReasoning').checked = !!d.showPlaceholderReasoning;
   }
   async function saveThinkingConfig() {
     const res = await api('/thinking', {
       method: 'POST', body: JSON.stringify({
         suffix: $('thinkingSuffix').value || '-thinking',
         openaiFormat: $('openaiThinkingFormat').value,
-        claudeFormat: $('claudeThinkingFormat').value
+        claudeFormat: $('claudeThinkingFormat').value,
+        showPlaceholderReasoning: $('showPlaceholderReasoning') ? $('showPlaceholderReasoning').checked : false
       })
     });
     const d = await res.json();

@@ -17,9 +17,29 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode"
 
 	"github.com/google/uuid"
 )
+
+// isPlaceholderReasoning reports whether a reasoning string carries no real
+// content — it is empty, whitespace-only, or consists solely of dot / ellipsis
+// runs (e.g. the "..." redaction marker the upstream sends in place of a hidden
+// chain-of-thought for GPT-5.x / o-series models). Genuine reasoning always
+// contains at least one non-dot, non-space character, so this never matches
+// real chain-of-thought.
+func isPlaceholderReasoning(s string) bool {
+	t := strings.TrimSpace(s)
+	if t == "" {
+		return true
+	}
+	for _, r := range t {
+		if r != '.' && r != '\u2026' && !unicode.IsSpace(r) {
+			return false
+		}
+	}
+	return true
+}
 
 // Endpoint configuration (auto-fallback on quota exhaustion).
 const directProxyOptOut = "direct"
@@ -479,6 +499,12 @@ func parseEventStream(body io.Reader, callback *KiroStreamCallback) error {
 	var lastAssistantContent string
 	var lastReasoningContent string
 
+	// Read the placeholder-reasoning toggle once (not per event). When on
+	// (default), reasoning that is still a pure redaction placeholder ("...") is
+	// withheld; the moment real reasoning text appears the cumulative buffer is
+	// no longer placeholder-only and every delta flows normally.
+	suppressPlaceholderReasoning := config.GetThinkingConfig().SuppressPlaceholderReasoning
+
 	for {
 		// Prelude: 12 bytes (total_len + headers_len + crc)
 		prelude := make([]byte, 12)
@@ -535,7 +561,15 @@ func parseEventStream(body io.Reader, callback *KiroStreamCallback) error {
 			if text, ok := event["text"].(string); ok && text != "" {
 				normalized := normalizeChunk(text, &lastReasoningContent)
 				if normalized != "" && callback.OnText != nil {
-					callback.OnText(normalized, true)
+					// Withhold reasoning while the cumulative buffer is still a
+					// pure redaction placeholder ("..."). As soon as one real
+					// character arrives, isPlaceholderReasoning fails and this
+					// (and every later) delta is emitted. Disabled by config toggle.
+					if suppressPlaceholderReasoning && isPlaceholderReasoning(lastReasoningContent) {
+						// placeholder-only reasoning carries no information — skip
+					} else {
+						callback.OnText(normalized, true)
+					}
 				}
 			}
 		case "toolUseEvent":
