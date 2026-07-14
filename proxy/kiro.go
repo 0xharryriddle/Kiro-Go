@@ -385,6 +385,20 @@ func CallKiroAPI(account *config.Account, payload *KiroPayload, callback *KiroSt
 		}
 	}
 
+	// Fail closed under a region override: never dispatch a request whose profile
+	// ARN is empty or belongs to a region other than the override. Without an
+	// override, preserve the historical soft-fail behavior (dispatch with whatever
+	// ARN resolved, even empty) so nothing regresses for normal accounts.
+	if account != nil && account.EffectiveRegionOverride() != "" {
+		arn := ""
+		if payload != nil {
+			arn = strings.TrimSpace(payload.ProfileArn)
+		}
+		if arn == "" || !arnRegionAllowed(account, arn) {
+			return fmt.Errorf("no available Kiro profile in override region %q", account.EffectiveRegionOverride())
+		}
+	}
+
 	// Build endpoint list ordered by configuration.
 	endpoints := getSortedEndpoints(config.GetPreferredEndpoint())
 

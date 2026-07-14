@@ -346,10 +346,7 @@ func (h *Handler) refreshAllAccounts() {
 			account.ExpiresAt = newExpiresAt
 			config.UpdateAccountToken(account.ID, newAccessToken, newRefreshToken, newExpiresAt)
 			h.pool.UpdateToken(account.ID, newAccessToken, newRefreshToken, newExpiresAt)
-			if profileArn != "" {
-				account.ProfileArn = profileArn
-				config.UpdateAccountProfileArn(account.ID, profileArn)
-			}
+			acceptRefreshedProfileArn(account, profileArn)
 		}
 
 		// 刷新账户信息
@@ -2578,10 +2575,7 @@ func (h *Handler) ensureValidToken(account *config.Account) error {
 		account.RefreshToken = refreshToken
 	}
 	account.ExpiresAt = expiresAt
-	if profileArn != "" {
-		account.ProfileArn = profileArn
-		config.UpdateAccountProfileArn(account.ID, profileArn)
-	}
+	acceptRefreshedProfileArn(account, profileArn)
 
 	// 持久化
 	config.UpdateAccountToken(account.ID, accessToken, refreshToken, expiresAt)
@@ -3018,7 +3012,9 @@ func (h *Handler) apiRunExternalIDPLiveDiagnostics(w http.ResponseWriter, r *htt
 		return
 	}
 	if profileArn != "" && profileArn != target.ProfileArn {
-		_ = config.UpdateAccountProfileArn(target.ID, profileArn)
+		// Route through the override guard so a live refresh cannot cache an
+		// ARN from a region other than the account's pin.
+		acceptRefreshedProfileArn(target, profileArn)
 	}
 	h.pool.Reload()
 	h.appendAuditLog(AuditLog{Category: "diagnostics", Action: "external_idp_live_refresh", Status: "success", AccountID: target.ID, AccountEmail: target.Email, AuthMethod: target.AuthMethod, Provider: target.Provider})
@@ -3065,6 +3061,7 @@ func (h *Handler) apiGetAccounts(w http.ResponseWriter, r *http.Request) {
 			"overageCheckedAt":  a.OverageCheckedAt,
 			"proxyURL":          a.ProxyURL,
 			"modelAllowList":    a.ModelAllowList,
+			"regionOverride":    a.RegionOverride,
 			"subscriptionType":  a.SubscriptionType,
 			"subscriptionTitle": a.SubscriptionTitle,
 			"daysRemaining":     a.DaysRemaining,
@@ -3101,6 +3098,16 @@ func (h *Handler) apiAddAccount(w http.ResponseWriter, r *http.Request) {
 	}
 	if account.Region == "" {
 		account.Region = "us-east-1"
+	}
+	// Validate/normalize the data-plane region override supplied at creation.
+	if account.RegionOverride != "" {
+		normalized, ok := validateRegionOverride(account.RegionOverride)
+		if !ok {
+			w.WriteHeader(400)
+			json.NewEncoder(w).Encode(map[string]string{"error": "Invalid regionOverride: must be an AWS region like us-east-1, or empty"})
+			return
+		}
+		account.RegionOverride = normalized
 	}
 
 	if err := config.AddAccount(account); err != nil {
@@ -3163,6 +3170,48 @@ func parseModelAllowList(v interface{}) []string {
 	return out
 }
 
+// validateRegionOverride normalizes and loosely validates a data-plane region
+// override string. Empty (after trim) is valid and means "clear the override".
+// A non-empty value must look like an AWS region label: lowercase DNS-safe
+// segments (letters/digits) joined by hyphens, at least two segments, ending in
+// a digit group — permissive enough for us-gov-east-1 / multi-part partitions and
+// future regions, strict enough to keep it safe for hostname construction
+// (it is concatenated into q.<region>.amazonaws.com). Returns (normalized, ok).
+func validateRegionOverride(v string) (string, bool) {
+	s := strings.ToLower(strings.TrimSpace(v))
+	if s == "" {
+		return "", true // clears the override
+	}
+	if len(s) > 40 {
+		return "", false
+	}
+	if strings.HasPrefix(s, "-") || strings.HasSuffix(s, "-") || strings.Contains(s, "--") {
+		return "", false
+	}
+	segments := strings.Split(s, "-")
+	if len(segments) < 3 {
+		return "", false
+	}
+	for _, seg := range segments {
+		if seg == "" {
+			return "", false
+		}
+		for _, r := range seg {
+			if !(r >= 'a' && r <= 'z') && !(r >= '0' && r <= '9') {
+				return "", false
+			}
+		}
+	}
+	// The last segment must be a digit group (the region index, e.g. "1").
+	last := segments[len(segments)-1]
+	for _, r := range last {
+		if r < '0' || r > '9' {
+			return "", false
+		}
+	}
+	return s, true
+}
+
 func (h *Handler) apiUpdateAccount(w http.ResponseWriter, r *http.Request, id string) {
 	var updates map[string]interface{}
 	if err := json.NewDecoder(r.Body).Decode(&updates); err != nil {
@@ -3184,6 +3233,33 @@ func (h *Handler) apiUpdateAccount(w http.ResponseWriter, r *http.Request, id st
 		w.WriteHeader(404)
 		json.NewEncoder(w).Encode(map[string]string{"error": "Account not found"})
 		return
+	}
+
+	// Region override is applied atomically AFTER the whole-struct write below,
+	// so it cannot be lost to a concurrent RefreshAccountInfo. Validate it up
+	// front (typed): a present value must be a JSON string, and must pass the
+	// AWS-region shape check. Reject wrong types / malformed values with 400
+	// rather than silently ignoring them.
+	regionOverrideProvided := false
+	regionOverrideValue := ""
+	if raw, present := updates["regionOverride"]; present {
+		regionOverrideProvided = true
+		switch tv := raw.(type) {
+		case string:
+			normalized, ok := validateRegionOverride(tv)
+			if !ok {
+				w.WriteHeader(400)
+				json.NewEncoder(w).Encode(map[string]string{"error": "Invalid regionOverride: must be an AWS region like us-east-1, or empty to clear"})
+				return
+			}
+			regionOverrideValue = normalized
+		case nil:
+			regionOverrideValue = "" // explicit null clears the override
+		default:
+			w.WriteHeader(400)
+			json.NewEncoder(w).Encode(map[string]string{"error": "Invalid regionOverride: must be a string or null"})
+			return
+		}
 	}
 
 	// 只更新传入的字段
@@ -3214,12 +3290,44 @@ func (h *Handler) apiUpdateAccount(w http.ResponseWriter, r *http.Request, id st
 		return
 	}
 
+	// Apply the region override AFTER the whole-struct write, via the atomic
+	// config-layer patch, so it (and its ProfileArn reset) cannot be lost to a
+	// concurrent RefreshAccountInfo whole-struct write. When it actually changed,
+	// clear the profile-resolution cooldown and the stale model cache so the next
+	// request re-probes and re-lists models in the NEW region.
+	regionOverrideChanged := false
+	if regionOverrideProvided {
+		changed, err := config.UpdateAccountRegionOverride(id, regionOverrideValue)
+		if err != nil {
+			w.WriteHeader(500)
+			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+		regionOverrideChanged = changed
+		existing.RegionOverride = regionOverrideValue
+		if changed {
+			existing.ProfileArn = ""
+			clearProfileArnResolutionCooldown(existing)
+			h.pool.ClearModelList(id)
+		} else if regionOverrideValue != "" && existing.ProfileArn != "" &&
+			!arnRegionAllowed(existing, existing.ProfileArn) {
+			// Same override value, but the cached ARN is in a different region
+			// (e.g. left over from before the override, or repoisoned). Repair it:
+			// blank the ARN so the next call re-resolves in the pinned region.
+			existing.ProfileArn = ""
+			_ = config.UpdateAccountProfileArn(id, "")
+			clearProfileArnResolutionCooldown(existing)
+			h.pool.ClearModelList(id)
+			regionOverrideChanged = true // trigger the re-fetch below
+		}
+	}
+
 	h.pool.Reload()
-	// 账号从禁用→启用时，自动拉取并缓存模型列表
-	if !oldEnabled && existing.Enabled && existing.AccessToken != "" {
+	// 账号从禁用→启用时，自动拉取并缓存模型列表；或区域覆盖变更后重新拉取。
+	if existing.Enabled && existing.AccessToken != "" && ((!oldEnabled) || regionOverrideChanged) {
 		go func(acc config.Account) {
 			if err := h.fetchAndCacheAccountModels(&acc); err != nil {
-				logger.Warnf("[ModelsCache] Auto-refresh failed for re-enabled account %s: %v", acc.Email, err)
+				logger.Warnf("[ModelsCache] Auto-refresh failed for account %s: %v", acc.Email, err)
 			}
 		}(*existing)
 	}
@@ -3393,10 +3501,7 @@ func (h *Handler) apiBatchAccounts(w http.ResponseWriter, r *http.Request) {
 					}
 					account.ExpiresAt = newExpires
 					config.UpdateAccountToken(id, newAccess, newRefresh, newExpires)
-					if profileArn != "" {
-						account.ProfileArn = profileArn
-						config.UpdateAccountProfileArn(id, profileArn)
-					}
+					acceptRefreshedProfileArn(account, profileArn)
 					h.pool.UpdateToken(id, newAccess, newRefresh, newExpires)
 				}
 			}
@@ -4849,10 +4954,7 @@ func (h *Handler) apiRefreshAccount(w http.ResponseWriter, r *http.Request, id s
 		account.ExpiresAt = newExpiresAt
 		config.UpdateAccountToken(id, newAccessToken, newRefreshToken, newExpiresAt)
 		h.pool.UpdateToken(id, newAccessToken, newRefreshToken, newExpiresAt)
-		if profileArn != "" {
-			account.ProfileArn = profileArn
-			config.UpdateAccountProfileArn(id, profileArn)
-		}
+		acceptRefreshedProfileArn(account, profileArn)
 		return nil
 	}
 
@@ -5278,6 +5380,11 @@ func (h *Handler) apiExportAccounts(w http.ResponseWriter, r *http.Request) {
 		Tags       []interface{}   `json:"tags"`
 	}
 
+	// NOTE: RegionOverride is intentionally NOT included in this export. This is
+	// a CLIProxyAPI-interop credential schema, not our internal config; the
+	// override is a proxy-local operational setting (like ProxyURL, which is also
+	// omitted here). Operators re-apply the data-plane region pin via the admin UI
+	// after an import. Documented as a known export limitation.
 	exportAccounts := make([]ExportAccount, 0, len(accounts))
 	for _, a := range accounts {
 		// 映射 provider 到 idp

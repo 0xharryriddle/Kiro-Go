@@ -189,6 +189,18 @@ func (p *AccountPool) SetModelList(accountID string, modelIDs []string) {
 	p.mu.Unlock()
 }
 
+// ClearModelList drops the cached model set for an account. Used when a region
+// override changes: the old region's model list must not keep the account
+// marked model-capable until a successful refresh in the new region. After this,
+// accountHasModel falls back to optimistic cold-start behavior (the allow-list,
+// if any, still applies) until the next SetModelList populates the new region's
+// models.
+func (p *AccountPool) ClearModelList(accountID string) {
+	p.mu.Lock()
+	delete(p.modelLists, accountID)
+	p.mu.Unlock()
+}
+
 // GetModelList 返回该账号缓存的模型 ID 列表（供 admin API 使用）。
 // 若尚无缓存则返回空切片。
 func (p *AccountPool) GetModelList(accountID string) []string {

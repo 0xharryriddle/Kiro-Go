@@ -66,6 +66,15 @@ type Account struct {
 	// Per-account outbound proxy (falls back to global ProxyURL if empty)
 	ProxyURL string `json:"proxyURL,omitempty"`
 
+	// RegionOverride pins the AWS DATA-PLANE region for this account's Kiro/Q
+	// calls, overriding the region otherwise auto-derived from the profile ARN.
+	// Empty = no override (auto-derivation, today's behavior). This is strictly
+	// the data-plane region; the auth/OIDC region (Region) is NEVER changed by it,
+	// because they can legitimately differ and token refresh keys off Region.
+	// When set, it is a HARD pin: profile discovery is restricted to this region
+	// and any ARN whose embedded region differs is refused (fail closed).
+	RegionOverride string `json:"regionOverride,omitempty"`
+
 	// ModelAllowList optionally restricts which models this account may serve.
 	// Semantics:
 	//   - empty/nil  → no restriction: the account serves every model it natively
@@ -168,6 +177,12 @@ func (a *Account) AllowsModel(model string) bool {
 		}
 	}
 	return false
+}
+
+// EffectiveRegionOverride returns the normalized (trimmed, lower-cased) data-plane
+// region override for this account, or "" when no override is set.
+func (a *Account) EffectiveRegionOverride() string {
+	return strings.ToLower(strings.TrimSpace(a.RegionOverride))
 }
 
 // PromptFilterRule defines a single custom prompt sanitization rule.
@@ -892,6 +907,32 @@ func UpdateAccount(id string, account Account) error {
 		}
 	}
 	return nil
+}
+
+// UpdateAccountRegionOverride atomically sets the data-plane region override and,
+// when the override CHANGED, clears the cached ProfileArn so the next call
+// re-resolves the profile in the new region. It mutates ONLY these two fields
+// under one cfgLock (not a whole-struct replace), so a concurrent whole-struct
+// writer (e.g. RefreshAccountInfo persisting a pre-change snapshot) cannot lose
+// the new override. Returns (changed, error): changed reports whether the
+// normalized override value actually differed from what was stored.
+func UpdateAccountRegionOverride(id, override string) (bool, error) {
+	normalized := strings.ToLower(strings.TrimSpace(override))
+	cfgLock.Lock()
+	defer cfgLock.Unlock()
+	for i := range cfg.Accounts {
+		if cfg.Accounts[i].ID == id {
+			prev := strings.ToLower(strings.TrimSpace(cfg.Accounts[i].RegionOverride))
+			changed := prev != normalized
+			cfg.Accounts[i].RegionOverride = normalized
+			if changed {
+				// Force re-resolution of the profile in the (new) region.
+				cfg.Accounts[i].ProfileArn = ""
+			}
+			return changed, Save()
+		}
+	}
+	return false, nil
 }
 
 // UpdateAccountOverageStatus persists the cached upstream overage status fields.

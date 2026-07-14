@@ -1796,6 +1796,14 @@
       '<button class="btn btn-sm btn-primary" data-detail-action="saveProxyURL" data-id="' + idAttr + '" type="button">' + escapeHtml(t('detail.save')) + '</button>' +
       '</div><p class="help-block">' + escapeHtml(t('detail.proxyHint')) + '</p></div>' +
 
+      '<div class="detail-section"><h4>' + escapeHtml(t('detail.regionOverride')) + '</h4><div class="machine-id-row">' +
+      '<input type="text" id="regionOverrideInput" list="regionOverrideList" value="' + escapeAttr(a.regionOverride || '') + '" placeholder="' + escapeAttr(a.region || 'us-east-1') + '" />' +
+      '<datalist id="regionOverrideList">' +
+      ['us-east-1', 'us-west-2', 'eu-central-1', 'eu-west-1', 'ap-southeast-1', 'ap-southeast-2', 'ap-northeast-1'].map(function (rg) { return '<option value="' + rg + '"></option>'; }).join('') +
+      '</datalist>' +
+      '<button class="btn btn-sm btn-primary" data-detail-action="saveRegionOverride" data-id="' + idAttr + '" type="button">' + escapeHtml(t('detail.save')) + '</button>' +
+      '</div><p class="help-block">' + escapeHtml(t('detail.regionOverrideHint')) + '</p></div>' +
+
       '<div class="detail-section"><h4>' + escapeHtml(t('detail.subscription')) + '</h4><div class="detail-grid">' +
       detailItem(t('detail.subscriptionType'), a.subscriptionTitle || (a.subscriptionType ? formatSubscriptionLabel(a.subscriptionType) : '-')) +
       detailItem(t('detail.tokenExpiry'), a.expiresAt ? new Date(a.expiresAt * 1000).toLocaleString() : '-') +
@@ -2036,6 +2044,18 @@
       toast(t('detail.proxyFormatError'), 'warning'); return;
     }
     await putAccount(id, { proxyURL: url }, t('detail.proxySaved'));
+  }
+  // Data-plane region override. Empty clears it (restores auto-derivation).
+  // A non-empty value must look like an AWS region; the server re-validates and
+  // will re-resolve the profile in the new region on the next request.
+  async function saveRegionOverride(id) {
+    const el = $('regionOverrideInput');
+    if (!el) return;
+    const region = el.value.trim().toLowerCase();
+    if (region && !/^[a-z0-9]+(-[a-z0-9]+)+-[0-9]+$/.test(region)) {
+      toast(t('detail.regionOverrideInvalid'), 'warning'); return;
+    }
+    await putAccount(id, { regionOverride: region }, t('detail.regionOverrideSaved'));
   }
   function closeDetailModal() { closeDialog('detailModal'); }
 
@@ -3937,6 +3957,7 @@
       else if (a === 'toggleOverage') toggleOverageSwitch(id, b);
       else if (a === 'refreshOverage') refreshAccountOverage(id);
       else if (a === 'saveProxyURL') saveProxyURL(id);
+      else if (a === 'saveRegionOverride') saveRegionOverride(id);
       else if (a === 'loadModels') loadModels(id);
       else if (a === 'refreshModels') refreshAccountModels(id);
       else if (a === 'loadModelAccess') loadModelAccess(id);

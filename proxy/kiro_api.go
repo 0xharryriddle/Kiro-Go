@@ -38,6 +38,13 @@ func kiroRegion(account *config.Account) string {
 }
 
 func kiroRegionForProfile(account *config.Account, profileArn string) string {
+	// A manual data-plane region override is a HARD pin: it wins over every
+	// ARN-derived or auth region so all data-plane calls target it.
+	if account != nil {
+		if ov := account.EffectiveRegionOverride(); ov != "" {
+			return ov
+		}
+	}
 	if r := regionFromProfileArn(profileArn); r != "" {
 		return r
 	}
@@ -50,6 +57,53 @@ func kiroRegionForProfile(account *config.Account, profileArn string) string {
 		}
 	}
 	return "us-east-1"
+}
+
+// arnRegionAllowed reports whether a profile ARN may be cached/used for this
+// account given its region override. With no override, any ARN is allowed
+// (today's behavior). With an override set, the ARN's embedded region MUST equal
+// the override — otherwise accepting it would produce a host/ARN region mismatch
+// (the exact failure the override exists to prevent). An empty ARN is allowed
+// (it means "not yet resolved"); callers gate dispatch on emptiness separately.
+func arnRegionAllowed(account *config.Account, arn string) bool {
+	if account == nil {
+		return true
+	}
+	ov := account.EffectiveRegionOverride()
+	if ov == "" {
+		return true
+	}
+	arn = strings.TrimSpace(arn)
+	if arn == "" {
+		return true
+	}
+	return regionFromProfileArn(arn) == ov
+}
+
+// acceptRefreshedProfileArn writes an auth-refresh-returned profile ARN back to
+// the account (in memory + persisted) UNLESS a region override is set and the
+// ARN's region does not match it — in which case the write is skipped so a
+// background/manual refresh cannot silently repoison the pin with an ARN from
+// another region. Returns true when the ARN was accepted and written. A blank
+// ARN is a no-op (returns false). This is the single chokepoint every refresh
+// caller must route through instead of writing account.ProfileArn directly.
+func acceptRefreshedProfileArn(account *config.Account, arn string) bool {
+	if account == nil {
+		return false
+	}
+	if strings.TrimSpace(arn) == "" {
+		return false
+	}
+	if !arnRegionAllowed(account, arn) {
+		logger.Warnf("[ProfileArn] Refresh returned ARN outside override region %q for %s; not caching (fail closed)",
+			account.EffectiveRegionOverride(), account.Email)
+		return false
+	}
+	account.ProfileArn = arn
+	if updateErr := config.UpdateAccountProfileArn(account.ID, arn); updateErr != nil {
+		logger.Warnf("[ProfileArn] Failed to cache refreshed profile ARN for %s: %v", account.Email, updateErr)
+	}
+	return true
 }
 
 // regionalizeURL points a hardcoded us-east-1 Kiro endpoint at the profile's
@@ -113,6 +167,15 @@ func kiroProfileRegionCandidates(account *config.Account) []string {
 		}
 		seen[region] = true
 		out = append(out, region)
+	}
+
+	// A region override is a HARD pin: probe ONLY the override region. The
+	// profile the operator wants must live there; discovering an ARN in any
+	// other region would defeat the pin, so no account-region / fallback probing.
+	if account != nil {
+		if ov := account.EffectiveRegionOverride(); ov != "" {
+			return []string{ov}
+		}
 	}
 
 	if account != nil {
@@ -318,10 +381,18 @@ func ResolveProfileArn(account *config.Account) (string, error) {
 		profileUnsupported = isBuilderIDProfileUnsupportedError(account, err)
 	}
 
-	// Fallback: refresh token to get profileArn from auth response
+	// Fallback: refresh token to get profileArn from auth response.
+	// Under a region override this fallback must NOT silently cache an ARN from
+	// a different region — that would recreate the host/ARN mismatch the override
+	// prevents. Refuse a mismatched ARN and fail closed instead.
 	if account.RefreshToken != "" {
 		_, _, _, refreshedArn, refreshErr := auth.RefreshToken(account)
 		if refreshErr == nil && refreshedArn != "" {
+			if !arnRegionAllowed(account, refreshedArn) {
+				logger.Warnf("[ProfileArn] Refreshed profile ARN for %s is not in the override region %q; refusing to cache (fail closed)",
+					account.Email, account.EffectiveRegionOverride())
+				return "", fmt.Errorf("no available Kiro profile in override region %q", account.EffectiveRegionOverride())
+			}
 			if updateErr := config.UpdateAccountProfileArn(account.ID, refreshedArn); updateErr != nil {
 				logger.Warnf("[ProfileArn] Failed to cache profile ARN for %s: %v", account.Email, updateErr)
 			}
@@ -372,6 +443,18 @@ func suppressProfileArnResolution(account *config.Account) {
 		return
 	}
 	profileArnResolutionCooldowns.Store(key, time.Now().Add(profileArnUnsupportedCooldown))
+}
+
+// clearProfileArnResolutionCooldown removes any active resolution-suppression
+// entry for an account. Called when the region override changes so a manual
+// switch always forces a fresh cross-region profile probe instead of being
+// blocked by a stale Builder-ID-"unsupported" cooldown.
+func clearProfileArnResolutionCooldown(account *config.Account) {
+	key := profileArnCooldownKey(account)
+	if key == "" {
+		return
+	}
+	profileArnResolutionCooldowns.Delete(key)
 }
 
 func isProfileArnResolutionSuppressed(account *config.Account) bool {
@@ -481,6 +564,13 @@ func resolveProfileArnAcrossRegions(account *config.Account) (string, error) {
 			continue
 		}
 		for _, arn := range arns {
+			// Under a region override, refuse any discovered ARN whose embedded
+			// region does not match the pin — even if upstream returned it while
+			// probing the pinned region. This keeps the ARN and the target host
+			// in the same region (fail closed).
+			if !arnRegionAllowed(account, arn) {
+				continue
+			}
 			if !seen[arn] {
 				seen[arn] = true
 				found = append(found, arn)
@@ -575,13 +665,23 @@ func reresolveProfileArn(account *config.Account) (string, bool) {
 	if err != nil || strings.TrimSpace(newArn) == "" || newArn == oldArn {
 		return "", false
 	}
+	// Under a region override, refuse a corrected ARN from a different region.
+	if !arnRegionAllowed(account, newArn) {
+		return "", false
+	}
 
 	if updateErr := config.UpdateAccountProfileArn(account.ID, newArn); updateErr != nil {
 		logger.Warnf("[ProfileArn] Failed to cache corrected profile ARN for %s: %v", account.Email, updateErr)
 	}
 	account.ProfileArn = newArn
-	if r := regionFromProfileArn(newArn); r != "" {
-		account.Region = r
+	// Converge the auth region onto the profile's region for non-override
+	// accounts (existing self-heal behavior). When an override is set, leave
+	// account.Region (the auth/OIDC region) untouched — the override is
+	// data-plane only and token refresh keys off account.Region.
+	if account.EffectiveRegionOverride() == "" {
+		if r := regionFromProfileArn(newArn); r != "" {
+			account.Region = r
+		}
 	}
 	logger.Infof("[ProfileArn] Self-healed profile for %s: %s -> %s (previous profile was not usable)",
 		account.Email, oldArn, newArn)
