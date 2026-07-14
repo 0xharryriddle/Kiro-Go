@@ -717,6 +717,24 @@ func buildModelInfo(id, ownedBy string, supportsImage bool) map[string]interface
 	}
 }
 
+// filterModelsByAllowList returns the subset of models the account is permitted
+// to serve under its per-account allow-list, plus the matching model-ID slice.
+// An empty allow-list returns everything (backward-compatible). This keeps the
+// routing cache, the fleet model matrix, and the advertised /v1/models list all
+// consistent with the account restriction policy.
+func filterModelsByAllowList(account *config.Account, models []ModelInfo) ([]ModelInfo, []string) {
+	filtered := make([]ModelInfo, 0, len(models))
+	ids := make([]string, 0, len(models))
+	for _, m := range models {
+		if !account.AllowsModel(m.ModelId) {
+			continue
+		}
+		filtered = append(filtered, m)
+		ids = append(ids, m.ModelId)
+	}
+	return filtered, ids
+}
+
 // refreshModelsCache 从 Kiro API 拉取模型列表并缓存
 func (h *Handler) refreshModelsCache() {
 	accounts := config.GetEnabledAccounts()
@@ -739,13 +757,12 @@ func (h *Handler) refreshModelsCache() {
 			h.handleAccountFailure(account, err)
 			continue
 		}
-		// 缓存每账号可用模型，用于路由时过滤
-		modelIDs := make([]string, 0, len(models))
-		for _, m := range models {
-			modelIDs = append(modelIDs, m.ModelId)
-		}
+		// 缓存每账号可用模型，用于路由时过滤。Per-account allow-list is
+		// applied here so the routing cache, the aggregate /v1/models list,
+		// and diagnostics all reflect only what the account may serve.
+		accountModels, modelIDs := filterModelsByAllowList(account, models)
 		h.pool.SetModelList(account.ID, modelIDs)
-		aggregated = mergeUniqueModels(aggregated, models)
+		aggregated = mergeUniqueModels(aggregated, accountModels)
 	}
 
 	if len(aggregated) > 0 {
@@ -767,19 +784,16 @@ func (h *Handler) fetchAndCacheAccountModels(account *config.Account) error {
 	if err != nil {
 		return err
 	}
-	modelIDs := make([]string, 0, len(models))
-	for _, m := range models {
-		modelIDs = append(modelIDs, m.ModelId)
-	}
+	accountModels, modelIDs := filterModelsByAllowList(account, models)
 	h.pool.SetModelList(account.ID, modelIDs)
 
 	// 合并到聚合缓存
 	h.modelsCacheMu.Lock()
-	h.cachedModels = mergeUniqueModels(h.cachedModels, models)
+	h.cachedModels = mergeUniqueModels(h.cachedModels, accountModels)
 	h.modelsCacheTime = time.Now().Unix()
 	h.modelsCacheMu.Unlock()
 
-	logger.Infof("[ModelsCache] Refreshed %d models for account %s", len(models), account.Email)
+	logger.Infof("[ModelsCache] Refreshed %d models (%d allowed) for account %s", len(models), len(accountModels), account.Email)
 	return nil
 }
 
@@ -3039,6 +3053,7 @@ func (h *Handler) apiGetAccounts(w http.ResponseWriter, r *http.Request) {
 			"currentOverages":   a.CurrentOverages,
 			"overageCheckedAt":  a.OverageCheckedAt,
 			"proxyURL":          a.ProxyURL,
+			"modelAllowList":    a.ModelAllowList,
 			"subscriptionType":  a.SubscriptionType,
 			"subscriptionTitle": a.SubscriptionTitle,
 			"daysRemaining":     a.DaysRemaining,
@@ -3105,6 +3120,38 @@ func (h *Handler) apiDeleteAccount(w http.ResponseWriter, r *http.Request, id st
 	json.NewEncoder(w).Encode(map[string]bool{"success": true})
 }
 
+// parseModelAllowList coerces a decoded JSON value into a clean, de-duplicated
+// list of model IDs for Account.ModelAllowList. Accepts a JSON array of strings;
+// null / non-array / all-empty yields nil (= no restriction). Order is preserved.
+func parseModelAllowList(v interface{}) []string {
+	arr, ok := v.([]interface{})
+	if !ok {
+		return nil
+	}
+	seen := make(map[string]bool, len(arr))
+	out := make([]string, 0, len(arr))
+	for _, item := range arr {
+		s, ok := item.(string)
+		if !ok {
+			continue
+		}
+		s = strings.TrimSpace(s)
+		if s == "" {
+			continue
+		}
+		key := strings.ToLower(s)
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		out = append(out, s)
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
 func (h *Handler) apiUpdateAccount(w http.ResponseWriter, r *http.Request, id string) {
 	var updates map[string]interface{}
 	if err := json.NewDecoder(r.Body).Decode(&updates); err != nil {
@@ -3144,6 +3191,10 @@ func (h *Handler) apiUpdateAccount(w http.ResponseWriter, r *http.Request, id st
 	}
 	if v, ok := updates["proxyURL"].(string); ok {
 		existing.ProxyURL = v
+	}
+	if v, ok := updates["modelAllowList"]; ok {
+		// Accept an array of model IDs (empty array / null clears the restriction).
+		existing.ModelAllowList = parseModelAllowList(v)
 	}
 
 	if err := config.UpdateAccount(id, *existing); err != nil {
@@ -4959,20 +5010,20 @@ func (h *Handler) apiGetAccountModels(w http.ResponseWriter, r *http.Request, id
 		return
 	}
 
-	// 同步更新路由缓存
-	modelIDs := make([]string, 0, len(models))
-	for _, m := range models {
-		modelIDs = append(modelIDs, m.ModelId)
-	}
+	// 同步更新路由缓存。The routing cache + aggregate list respect the
+	// per-account allow-list, but the response returns ALL native models so the
+	// admin UI can present the full set for the operator to choose from.
+	accountModels, modelIDs := filterModelsByAllowList(account, models)
 	h.pool.SetModelList(id, modelIDs)
 	h.modelsCacheMu.Lock()
-	h.cachedModels = mergeUniqueModels(h.cachedModels, models)
+	h.cachedModels = mergeUniqueModels(h.cachedModels, accountModels)
 	h.modelsCacheTime = time.Now().Unix()
 	h.modelsCacheMu.Unlock()
 
 	json.NewEncoder(w).Encode(map[string]interface{}{
-		"success": true,
-		"models":  models,
+		"success":        true,
+		"models":         models,
+		"modelAllowList": account.ModelAllowList,
 	})
 }
 

@@ -66,6 +66,17 @@ type Account struct {
 	// Per-account outbound proxy (falls back to global ProxyURL if empty)
 	ProxyURL string `json:"proxyURL,omitempty"`
 
+	// ModelAllowList optionally restricts which models this account may serve.
+	// Semantics:
+	//   - empty/nil  → no restriction: the account serves every model it natively
+	//                  supports upstream (backward-compatible default).
+	//   - non-empty  → allow-list: the account may ONLY serve models whose ID is
+	//                  in this list, intersected with what it natively supports.
+	// Matching is case-insensitive and against the actual model ID (thinking
+	// suffix already stripped by the router). This is how an operator pins a model
+	// to specific accounts: list it only on the accounts allowed to serve it.
+	ModelAllowList []string `json:"modelAllowList,omitempty"`
+
 	// Priority weight for load balancing (higher = more requests)
 	Weight int `json:"weight,omitempty"` // 0 or 1 = normal, 2+ = higher priority
 
@@ -137,6 +148,26 @@ type Account struct {
 	ExternalCreditsEstimate float64 `json:"externalCreditsEstimate,omitempty"` // Last computed external credits (clamped >=0)
 	ExternalConfidence      string  `json:"externalConfidence,omitempty"`      // "clean" | "external" | "strong_external" | "unknown"
 	ExternalCheckedAt       int64   `json:"externalCheckedAt,omitempty"`       // Last time the estimate was recomputed (Unix seconds)
+}
+
+// AllowsModel reports whether this account is permitted to serve the given model
+// under its per-account allow-list. An empty allow-list means no restriction
+// (serve everything the account natively supports). Matching is case-insensitive
+// against the actual model ID (the router strips any thinking suffix first).
+func (a *Account) AllowsModel(model string) bool {
+	if len(a.ModelAllowList) == 0 {
+		return true
+	}
+	want := strings.ToLower(strings.TrimSpace(model))
+	if want == "" {
+		return true
+	}
+	for _, m := range a.ModelAllowList {
+		if strings.ToLower(strings.TrimSpace(m)) == want {
+			return true
+		}
+	}
+	return false
 }
 
 // PromptFilterRule defines a single custom prompt sanitization rule.

@@ -2690,6 +2690,46 @@ img.brand-icon {
   line-height: 1.4;
 }
 
+/* Per-account model access (allow-list) checkboxes */
+.model-access-list {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+  max-height: 18rem;
+  overflow-y: auto;
+  scrollbar-width: thin;
+}
+.model-access-item {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.4375rem 0.625rem;
+  background: var(--muted);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+}
+.model-access-item:hover {
+  background: var(--accent);
+}
+.model-access-cb {
+  flex: none;
+  width: 1rem;
+  height: 1rem;
+  cursor: pointer;
+}
+.model-access-name {
+  font-family: var(--font-mono);
+  font-size: 0.8125rem;
+  font-weight: 500;
+  word-break: break-all;
+}
+.model-access-actions {
+  display: flex;
+  gap: 0.5rem;
+  margin-top: 0.625rem;
+}
+
 /* Message banner */
 .message {
   border-radius: var(--radius-md);

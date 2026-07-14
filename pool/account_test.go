@@ -429,3 +429,120 @@ func TestReloadDropsOverQuotaAccountWhenAllowOverUsageDisabled(t *testing.T) {
 		t.Fatalf("expected over-quota account to be dropped, got %q", got.ID)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Per-account model allow-list
+// ---------------------------------------------------------------------------
+
+func TestAllowsModelEmptyListPermitsEverything(t *testing.T) {
+	a := config.Account{ID: "a"}
+	if !a.AllowsModel("claude-sonnet-4") {
+		t.Fatal("empty allow-list must permit every model")
+	}
+	if !a.AllowsModel("") {
+		t.Fatal("empty allow-list must permit empty model id")
+	}
+}
+
+func TestAllowsModelRestrictsToList(t *testing.T) {
+	a := config.Account{ID: "a", ModelAllowList: []string{"model-1", "model-2"}}
+	if !a.AllowsModel("model-1") || !a.AllowsModel("MODEL-2") {
+		t.Fatal("listed models (case-insensitive) must be permitted")
+	}
+	if a.AllowsModel("model-3") {
+		t.Fatal("unlisted model must be rejected")
+	}
+}
+
+// A model pinned to one account is routed only to that account, even when a
+// second account natively supports it. This is the core "Model 1 only on
+// Account A" requirement.
+func TestAllowListPinsModelToSpecificAccount(t *testing.T) {
+	p := &AccountPool{
+		accounts: []config.Account{
+			{ID: "a", Enabled: true},
+			{ID: "b", Enabled: true},
+		},
+		cooldowns:   make(map[string]time.Time),
+		errorCounts: make(map[string]int),
+		modelLists:  make(map[string]map[string]bool),
+		allowLists: map[string][]string{
+			// A may only serve model-1; B may only serve model-2/model-3.
+			"a": {"model-1"},
+			"b": {"model-2", "model-3"},
+		},
+	}
+	// Both accounts natively support all three models upstream.
+	p.SetModelList("a", []string{"model-1", "model-2", "model-3"})
+	p.SetModelList("b", []string{"model-1", "model-2", "model-3"})
+
+	// model-1 must route ONLY to A (B is allow-list-blocked despite native support).
+	for i := 0; i < 8; i++ {
+		got := p.GetNextForModel("model-1")
+		if got == nil || got.ID != "a" {
+			t.Fatalf("model-1 must route only to account a, got %#v", got)
+		}
+	}
+	// model-2 must route ONLY to B.
+	for i := 0; i < 8; i++ {
+		got := p.GetNextForModel("model-2")
+		if got == nil || got.ID != "b" {
+			t.Fatalf("model-2 must route only to account b, got %#v", got)
+		}
+	}
+	// model-3 also only B.
+	if got := p.GetNextForModel("model-3"); got == nil || got.ID != "b" {
+		t.Fatalf("model-3 must route only to account b, got %#v", got)
+	}
+}
+
+// The allow-list is enforced even during cold start (no upstream model cache
+// populated yet), because it is a policy restriction, not a capability probe.
+func TestAllowListEnforcedDuringColdStart(t *testing.T) {
+	p := &AccountPool{
+		accounts: []config.Account{
+			{ID: "a", Enabled: true},
+		},
+		cooldowns:   make(map[string]time.Time),
+		errorCounts: make(map[string]int),
+		modelLists:  make(map[string]map[string]bool), // no cache = cold start
+		allowLists:  map[string][]string{"a": {"model-1"}},
+	}
+	// model-1 is allowed → cold-start optimistic pass applies.
+	if got := p.GetNextForModel("model-1"); got == nil || got.ID != "a" {
+		t.Fatalf("cold-start allowed model must route to a, got %#v", got)
+	}
+	// model-2 is NOT on the allow-list → blocked even at cold start.
+	if got := p.GetNextForModel("model-2"); got != nil {
+		t.Fatalf("cold-start disallowed model must not route, got %q", got.ID)
+	}
+}
+
+// Reload rebuilds allowLists from config, normalizing case and dropping blanks.
+func TestReloadBuildsAllowListsFromConfig(t *testing.T) {
+	cfgFile := filepath.Join(t.TempDir(), "config.json")
+	if err := config.Init(cfgFile); err != nil {
+		t.Fatalf("config.Init: %v", err)
+	}
+	if err := config.AddAccount(config.Account{
+		ID:             "a",
+		Enabled:        true,
+		ModelAllowList: []string{"Model-1", "  ", "model-2"},
+	}); err != nil {
+		t.Fatalf("AddAccount: %v", err)
+	}
+	if err := config.AddAccount(config.Account{ID: "b", Enabled: true}); err != nil {
+		t.Fatalf("AddAccount: %v", err)
+	}
+
+	p := newTestPool()
+	p.Reload()
+
+	got := p.allowLists["a"]
+	if len(got) != 2 || got[0] != "model-1" || got[1] != "model-2" {
+		t.Fatalf("expected normalized [model-1 model-2], got %#v", got)
+	}
+	if _, ok := p.allowLists["b"]; ok {
+		t.Fatal("account with no allow-list must not appear in allowLists map")
+	}
+}

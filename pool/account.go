@@ -49,6 +49,7 @@ type AccountPool struct {
 	cooldowns     map[string]time.Time       // 账号冷却时间
 	errorCounts   map[string]int             // 连续错误计数
 	modelLists    map[string]map[string]bool // accountID → set of modelIDs (from ListAvailableModels)
+	allowLists    map[string][]string        // accountID → per-account model allow-list (from config; empty slice = no restriction)
 }
 
 var (
@@ -63,6 +64,7 @@ func GetPool() *AccountPool {
 			cooldowns:   make(map[string]time.Time),
 			errorCounts: make(map[string]int),
 			modelLists:  make(map[string]map[string]bool),
+			allowLists:  make(map[string][]string),
 		}
 		pool.Reload()
 	})
@@ -80,7 +82,23 @@ func (p *AccountPool) Reload() {
 	enabled := config.GetEnabledAccounts()
 	allowOverUsage := config.GetAllowOverUsage()
 	var weighted []config.Account
+	// Rebuild per-account model allow-lists from config (single source of truth),
+	// normalized lower-case for case-insensitive routing checks. An empty/absent
+	// list means "no restriction".
+	allowLists := make(map[string][]string, len(enabled))
 	for _, a := range enabled {
+		if len(a.ModelAllowList) > 0 {
+			norm := make([]string, 0, len(a.ModelAllowList))
+			for _, m := range a.ModelAllowList {
+				m = strings.ToLower(strings.TrimSpace(m))
+				if m != "" {
+					norm = append(norm, m)
+				}
+			}
+			if len(norm) > 0 {
+				allowLists[a.ID] = norm
+			}
+		}
 		if isQuotaBlocked(a, allowOverUsage) {
 			continue
 		}
@@ -90,6 +108,7 @@ func (p *AccountPool) Reload() {
 		}
 	}
 	p.accounts = weighted
+	p.allowLists = allowLists
 	p.totalAccounts = len(enabled)
 }
 
@@ -188,12 +207,31 @@ func (p *AccountPool) GetModelList(accountID string) []string {
 
 // accountHasModel 检查账号是否支持指定模型。
 // 若该账号尚无模型列表（冷启动），视为支持所有模型。
+//
+// A per-account model allow-list (config ModelAllowList) is enforced FIRST and
+// unconditionally: if the account has a non-empty allow-list and the model is
+// not on it, the account is never routed that model — even during cold start
+// (before the upstream model cache is populated). This is what lets an operator
+// pin a model to specific accounts.
 func (p *AccountPool) accountHasModel(accountID, model string) bool {
+	want := strings.ToLower(strings.TrimSpace(model))
+	if allow, ok := p.allowLists[accountID]; ok && len(allow) > 0 {
+		permitted := false
+		for _, m := range allow {
+			if m == want {
+				permitted = true
+				break
+			}
+		}
+		if !permitted {
+			return false
+		}
+	}
 	list, ok := p.modelLists[accountID]
 	if !ok || len(list) == 0 {
 		return true // 冷启动：列表未就绪，乐观放行
 	}
-	return list[strings.ToLower(strings.TrimSpace(model))]
+	return list[want]
 }
 
 // GetNextForModel 获取下一个支持指定模型的可用账号。

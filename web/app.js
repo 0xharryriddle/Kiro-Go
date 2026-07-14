@@ -1821,6 +1821,18 @@
       ' <button class="btn btn-sm btn-outline" data-detail-action="refreshModels" data-id="' + idAttr + '" type="button">' + escapeHtml(t('detail.refreshModelCache')) + '</button>' +
       '</h4>' +
       '<div id="modelsList" class="model-list"></div>' +
+      '</div>' +
+
+      '<div class="detail-section">' +
+      '<h4>' + escapeHtml(t('detail.modelAccessTitle')) +
+      ' <button class="btn btn-sm btn-outline" data-detail-action="loadModelAccess" data-id="' + idAttr + '" type="button">' + escapeHtml(t('detail.modelAccessLoad')) + '</button>' +
+      '</h4>' +
+      '<p class="help-block">' + escapeHtml(t('detail.modelAccessHint')) + '</p>' +
+      '<div id="modelAccessList" class="model-access-list"></div>' +
+      '<div class="model-access-actions hidden" id="modelAccessActions">' +
+      '<button class="btn btn-sm btn-outline" data-detail-action="modelAccessSelectAll" data-id="' + idAttr + '" type="button">' + escapeHtml(t('detail.modelAccessAllowAll')) + '</button>' +
+      '<button class="btn btn-sm btn-primary" data-detail-action="saveModelAccess" data-id="' + idAttr + '" type="button">' + escapeHtml(t('detail.save')) + '</button>' +
+      '</div>' +
       '</div>';
 
     openDialog('detailModal');
@@ -1853,6 +1865,61 @@
       c.innerHTML = '<p class="message message-error">' + escapeHtml(t('detail.loadFailed')) + '</p>';
       toast(t('detail.loadFailed'), 'error');
     }
+  }
+  // Model access (per-account allow-list). Fetches the account's native models
+  // and renders a checkbox per model, pre-checked against the current allow-list.
+  // Empty allow-list = all boxes checked (no restriction). Saving an all-checked
+  // (or all-unchecked) set clears the restriction back to "serve everything".
+  async function loadModelAccess(id) {
+    const c = $('modelAccessList');
+    const actions = $('modelAccessActions');
+    c.innerHTML = '<p class="empty-state">' + escapeHtml(t('detail.loading')) + '</p>';
+    if (actions) actions.classList.add('hidden');
+    try {
+      const res = await api('/accounts/' + id + '/models');
+      const d = await res.json();
+      if (!d.success || !d.models) {
+        c.innerHTML = '<p class="message message-error">' + escapeHtml(t('detail.loadFailed')) + (d.error ? ': ' + escapeHtml(d.error) : '') + '</p>';
+        return;
+      }
+      const allow = Array.isArray(d.modelAllowList) ? d.modelAllowList.map(m => String(m).toLowerCase()) : [];
+      const restricted = allow.length > 0;
+      const sorted = d.models.slice().sort((a, b) => String(a.modelId).localeCompare(String(b.modelId)));
+      if (!sorted.length) {
+        c.innerHTML = '<p class="empty-state">' + escapeHtml(t('detail.noModels')) + '</p>';
+        return;
+      }
+      c.innerHTML = sorted.map(m => {
+        const mid = String(m.modelId);
+        // No restriction → every model is allowed (checked). With a restriction,
+        // only listed models are checked.
+        const checked = !restricted || allow.includes(mid.toLowerCase());
+        return '<label class="model-access-item">' +
+          '<input type="checkbox" class="model-access-cb" value="' + escapeAttr(mid) + '"' + (checked ? ' checked' : '') + ' />' +
+          '<span class="model-access-name">' + escapeHtml(mid) + '</span>' +
+          '</label>';
+      }).join('');
+      if (actions) actions.classList.remove('hidden');
+    } catch (e) {
+      c.innerHTML = '<p class="message message-error">' + escapeHtml(t('detail.loadFailed')) + '</p>';
+      toast(t('detail.loadFailed'), 'error');
+    }
+  }
+  function modelAccessSelectAll() {
+    qsa('#modelAccessList .model-access-cb').forEach(cb => { cb.checked = true; });
+  }
+  async function saveModelAccess(id) {
+    const boxes = Array.from(qsa('#modelAccessList .model-access-cb'));
+    if (!boxes.length) { toast(t('detail.modelAccessLoadFirst'), 'warning'); return; }
+    const total = boxes.length;
+    const selected = boxes.filter(cb => cb.checked).map(cb => cb.value);
+    if (selected.length === 0) {
+      toast(t('detail.modelAccessNoneSelected'), 'warning');
+      return;
+    }
+    // All selected = no restriction: send an empty array to clear the allow-list.
+    const allowList = selected.length === total ? [] : selected;
+    await putAccount(id, { modelAllowList: allowList }, t('detail.modelAccessSaved'));
   }
   async function generateMachineId() {
     try {
@@ -3870,6 +3937,9 @@
       else if (a === 'saveProxyURL') saveProxyURL(id);
       else if (a === 'loadModels') loadModels(id);
       else if (a === 'refreshModels') refreshAccountModels(id);
+      else if (a === 'loadModelAccess') loadModelAccess(id);
+      else if (a === 'modelAccessSelectAll') modelAccessSelectAll();
+      else if (a === 'saveModelAccess') saveModelAccess(id);
     });
   }
 
