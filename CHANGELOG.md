@@ -5,6 +5,10 @@ follows [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+### Fixed
+
+- Made credential replacement a single durable config transaction, rolled back ordinary account updates on save failure, rejected cross-region profile discovery mismatches, and prevented stale admin profile/API-key responses from rendering after modal changes.
+
 ### Added
 - **Upstream Kiro-issued API-key authentication.** Accounts can now authenticate to
   Kiro with a recoverable `ksk_...` credential stored only in `kiroApiKey`, using the

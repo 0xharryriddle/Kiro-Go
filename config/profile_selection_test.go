@@ -198,4 +198,38 @@ func TestProfileMutationPathsRollBackWhenDurableWriteFails(t *testing.T) {
 	if got.Nickname != original.Nickname || got.ProfileArn != original.ProfileArn || !got.ProfilePinned || got.RegionOverride != original.RegionOverride {
 		t.Fatalf("failed replacement changed memory: %+v", got)
 	}
+
+	ordinary := original
+	ordinary.Nickname = "ordinary-update"
+	if err := UpdateAccount(original.ID, ordinary); err == nil {
+		t.Fatal("ordinary update unexpectedly succeeded")
+	}
+	got, _ = GetAccountByID(original.ID)
+	if got.Nickname != original.Nickname {
+		t.Fatalf("failed ordinary update changed memory: %+v", got)
+	}
+}
+
+func TestReplaceAccountAndDeleteIsAtomic(t *testing.T) {
+	if err := Init(filepath.Join(t.TempDir(), "config.json")); err != nil {
+		t.Fatalf("init config: %v", err)
+	}
+	original := Account{ID: "existing", Nickname: "old", AuthMethod: "social"}
+	temporary := Account{ID: "temporary", Nickname: "new", AuthMethod: "api_key"}
+	if err := AddAccount(original); err != nil {
+		t.Fatalf("add original: %v", err)
+	}
+	if err := AddAccount(temporary); err != nil {
+		t.Fatalf("add temporary: %v", err)
+	}
+	if err := ReplaceAccountAndDelete(original.ID, temporary.ID, temporary); err != nil {
+		t.Fatalf("atomic replacement: %v", err)
+	}
+	got, ok := GetAccountByID(original.ID)
+	if !ok || got.Nickname != temporary.Nickname || got.ID != original.ID {
+		t.Fatalf("unexpected replacement: %+v", got)
+	}
+	if _, ok := GetAccountByID(temporary.ID); ok || len(GetAccounts()) != 1 {
+		t.Fatalf("temporary account survived replacement: %+v", GetAccounts())
+	}
 }

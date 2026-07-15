@@ -25,6 +25,8 @@
   let kiroSsoSession = '';
   let kiroSsoPollTimer = null;
   let kiroAPIKeyProbe = null;
+  let kiroAPIKeyFlow = 0;
+  let kiroProfileFlow = 0;
   let iamSession = '';
   let exportSelectedIds = new Set();
   let currentVersion = '';
@@ -1896,6 +1898,7 @@
     c.innerHTML = warnings + autoCard + (cards || '<p class="empty-state">' + escapeHtml(t('profiles.empty')) + '</p>');
   }
   async function loadKiroProfiles(id) {
+    const flow = ++kiroProfileFlow;
     const c = $('kiroProfilesList');
     if (!c) return;
     c.innerHTML = '<p class="empty-state">' + escapeHtml(t('profiles.loading')) + '</p>';
@@ -1903,8 +1906,10 @@
       const res = await api('/accounts/' + encodeURIComponent(id) + '/kiro-profiles');
       const data = await res.json().catch(() => ({}));
       if (!res.ok) throw new Error(data.error || t('profiles.loadFailed'));
+      if (flow !== kiroProfileFlow || !c.isConnected) return;
       renderKiroProfiles(id, data);
     } catch (e) {
+      if (flow !== kiroProfileFlow || !c.isConnected) return;
       c.innerHTML = '<div class="message message-error">' + escapeHtml((e && e.message) || t('profiles.loadFailed')) + '</div>';
     }
   }
@@ -2155,7 +2160,10 @@
     }
     await putAccount(id, { regionOverride: region }, t('detail.regionOverrideSaved'));
   }
-  function closeDetailModal() { closeDialog('detailModal'); }
+  function closeDetailModal() {
+    kiroProfileFlow++;
+    closeDialog('detailModal');
+  }
 
   // Test flow
   function getTestAccount(id) {
@@ -2941,6 +2949,7 @@
     enhanceCustomSelects(body);
   }
   function closeModal() {
+    kiroAPIKeyFlow++;
     closeDialog('addModal');
     iamSession = '';
     if (builderIdPollTimer) { clearTimeout(builderIdPollTimer); builderIdPollTimer = null; }
@@ -2972,6 +2981,7 @@
       '<div class="modal-footer"><button class="btn btn-secondary" data-close-add="1" type="button">' + escapeHtml(t('common.cancel')) + '</button></div>';
   }
   function modalKiroAPIKey(title, body) {
+    kiroAPIKeyFlow++;
     kiroAPIKeyProbe = null;
     title.textContent = t('kiroApiKey.title');
     body.innerHTML =
@@ -3022,6 +3032,7 @@
   }
 
   async function probeKiroIssuedAPIKey() {
+    const flow = ++kiroAPIKeyFlow;
     const keyInput = $('kiroApiKeyInput');
     let rawKey = keyInput ? keyInput.value : '';
     if (!rawKey) return toastWarning(t('kiroApiKey.keyRequired'));
@@ -3040,12 +3051,14 @@
         method: 'POST', body: requestBody
       });
       const data = await res.json().catch(() => ({}));
+      if (flow !== kiroAPIKeyFlow) return;
       if (!res.ok || !data.probeId) {
         toastError(data.error || t('kiroApiKey.probeFailed'));
         return;
       }
       renderKiroAPIKeyProbeResults(data);
     } catch (e) {
+      if (flow !== kiroAPIKeyFlow) return;
       toastError(t('kiroApiKey.probeFailed'));
     } finally {
       if (btn && btn.isConnected) {

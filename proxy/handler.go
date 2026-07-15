@@ -4447,11 +4447,10 @@ func (h *Handler) apiApplyCredentials(w http.ResponseWriter, r *http.Request) {
 			}
 			newID := account.ID
 			account.ID = decision.ExistingAccountID
-			if err := config.ReplaceAccount(decision.ExistingAccountID, account); err != nil {
+			if err := config.ReplaceAccountAndDelete(decision.ExistingAccountID, newID, account); err != nil {
 				errs = append(errs, fmt.Sprintf("item %d: replace failed: %s", i+1, err.Error()))
 				continue
 			}
-			_ = config.DeleteAccount(newID)
 			imported = append(imported, map[string]interface{}{"id": account.ID, "email": account.Email, "authMethod": account.AuthMethod, "action": "replace_existing"})
 			h.appendAuditLog(AuditLog{Category: "import", Action: "replace_account", Status: "success", AccountID: account.ID, AccountEmail: account.Email, AuthMethod: account.AuthMethod, Provider: account.Provider, Source: "apply", SafeDetails: map[string]string{"replacedId": decision.ExistingAccountID}})
 		default:

@@ -1063,8 +1063,13 @@ func UpdateAccount(id string, account Account) error {
 			account.ProfileArn = cfg.Accounts[i].ProfileArn
 			account.ProfilePinned = cfg.Accounts[i].ProfilePinned
 			account.RegionOverride = cfg.Accounts[i].RegionOverride
+			previous := cfg.Accounts[i]
 			cfg.Accounts[i] = account
-			return Save()
+			if err := Save(); err != nil {
+				cfg.Accounts[i] = previous
+				return err
+			}
+			return nil
 		}
 	}
 	return nil
@@ -1089,6 +1094,37 @@ func ReplaceAccount(id string, account Account) error {
 		}
 	}
 	return fmt.Errorf("account not found")
+}
+
+// ReplaceAccountAndDelete atomically replaces one account and removes a temporary
+// imported row in a single durable write.
+func ReplaceAccountAndDelete(id, deleteID string, account Account) error {
+	cfgLock.Lock()
+	defer cfgLock.Unlock()
+	previous := append([]Account(nil), cfg.Accounts...)
+	found := false
+	next := make([]Account, 0, len(cfg.Accounts))
+	for _, candidate := range cfg.Accounts {
+		switch candidate.ID {
+		case id:
+			account.ID = id
+			next = append(next, account)
+			found = true
+		case deleteID:
+			continue
+		default:
+			next = append(next, candidate)
+		}
+	}
+	if !found {
+		return fmt.Errorf("account not found")
+	}
+	cfg.Accounts = next
+	if err := Save(); err != nil {
+		cfg.Accounts = previous
+		return err
+	}
+	return nil
 }
 
 // UpdateAccountRegionOverride atomically sets the data-plane region override and,

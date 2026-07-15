@@ -143,6 +143,13 @@ func discoverKiroProfiles(account *config.Account) (KiroProfileDiscovery, error)
 				})
 				continue
 			}
+			if arnRegion != region {
+				result.Warnings = append(result.Warnings, KiroProfileRegionWarning{
+					Region: region,
+					Code:   "profile_region_mismatch",
+				})
+				continue
+			}
 			seen[arn] = true
 			result.Profiles = append(result.Profiles, KiroProfile{
 				Arn:     arn,

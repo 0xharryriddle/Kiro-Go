@@ -112,3 +112,27 @@ func TestDiscoverKiroProfilesAPIKeyIsKeyBoundWithoutNetwork(t *testing.T) {
 		t.Fatalf("unexpected key-bound discovery: %+v", got)
 	}
 }
+
+func TestDiscoverKiroProfilesRejectsARNFromDifferentProbeRegion(t *testing.T) {
+	t.Setenv("KIRO_PROFILE_REGIONS", "us-east-1")
+	oldDiscover := discoverKiroProfileArnsInRegion
+	oldProbe := probeKiroProfileUsability
+	t.Cleanup(func() {
+		discoverKiroProfileArnsInRegion = oldDiscover
+		probeKiroProfileUsability = oldProbe
+	})
+	discoverKiroProfileArnsInRegion = func(*config.Account, string) ([]string, error) {
+		return []string{"arn:aws:codewhisperer:eu-central-1:123456789012:profile/wrong-region"}, nil
+	}
+	probeKiroProfileUsability = func(*config.Account, string, string) bool {
+		t.Fatal("mismatched ARN must not be usability-probed")
+		return false
+	}
+	got, err := discoverKiroProfiles(&config.Account{ID: "profile-provenance", AuthMethod: "social", AccessToken: "test-access", Region: "us-east-1"})
+	if err != nil {
+		t.Fatalf("discover profiles: %v", err)
+	}
+	if len(got.Profiles) != 0 || len(got.Warnings) == 0 || got.Warnings[0].Code != "profile_region_mismatch" {
+		t.Fatalf("unexpected discovery result: %+v", got)
+	}
+}

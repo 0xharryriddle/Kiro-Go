@@ -105,10 +105,11 @@ func acceptRefreshedProfileArn(account *config.Account, arn string) bool {
 			account.EffectiveRegionOverride(), account.Email)
 		return false
 	}
-	account.ProfileArn = arn
 	if updateErr := config.UpdateAccountProfileArn(account.ID, arn); updateErr != nil {
 		logger.Warnf("[ProfileArn] Failed to cache refreshed profile ARN for %s: %v", account.Email, updateErr)
+		return false
 	}
+	account.ProfileArn = arn
 	return true
 }
 
