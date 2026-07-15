@@ -98,7 +98,7 @@ curl http://localhost:8080/v1/chat/completions \
 
 ## 运维
 
-生产健康检查、配置备份/恢复、凭据恢复、账号/模型诊断、请求回放 dry-run、日志、指标和部署验证步骤见 [docs/operator-runbook.md](docs/operator-runbook.md)。外部 IdP 导入预览、冲突决策、诊断和审计行为见 [docs/external-idp-import.md](docs/external-idp-import.md)。
+生产健康检查、配置备份/恢复、凭据恢复、账号/模型诊断、请求回放 dry-run、日志、指标和部署验证步骤见 [docs/operator-runbook.md](docs/operator-runbook.md)。外部 IdP 导入预览、冲突决策、诊断和审计行为见 [docs/external-idp-import.md](docs/external-idp-import.md)。上游 Kiro API 密钥、多配置文件与区域自动/手动选择、Hosted SSO 配置文件选择、模型检测与路由、管理 API、迁移及敏感导出说明见 [docs/kiro-api-key-and-profiles.md](docs/kiro-api-key-and-profiles.md)。
 
 ## 思考模式
 
@@ -116,6 +116,13 @@ curl http://localhost:8080/v1/chat/completions \
 |-----|------|-------|
 | `CONFIG_PATH` | 配置文件路径 | `data/config.json` |
 | `ADMIN_PASSWORD` | 管理面板密码（覆盖配置文件） | - |
+| `PORT` | HTTP 监听端口（覆盖配置；`-port` 参数优先） | `8080` |
+| `HOST` | HTTP 绑定地址（覆盖配置；`-host` 参数优先） | `127.0.0.1` |
+| `KIRO_IMPORT_WATCH` | 启用 `data/imports/` 自动导入监听（`1`/`true`） | 默认关闭（Docker 中开启） |
+| `KIRO_IMPORT_DIR` | 自动导入监听目录 | `data/imports` |
+| `KIRO_IDE_CACHE` | Kiro IDE 凭据缓存路径 | `~/.aws/sso/cache/kiro-auth-token.json` |
+| `KIRO_AWS_SSO_CACHE_DIR` | Docker 挂载的宿主机 AWS SSO 缓存目录 | `$HOME/.aws/sso/cache` |
+| `KIRO_PROFILE_REGIONS` | 配置文件发现及 Kiro API 密钥探测的逗号分隔后备区域 | `us-east-1,eu-central-1` |
 
 ## 参与贡献
 

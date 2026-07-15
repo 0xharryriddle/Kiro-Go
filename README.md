@@ -102,7 +102,7 @@ curl http://localhost:8080/v1/chat/completions \
 
 ## Operations
 
-See [docs/operator-runbook.md](docs/operator-runbook.md) for production health checks, config backup/restore, credential recovery, account/model diagnostics, request replay dry-runs, logs, metrics, and deployment verification steps. For external IdP import preview, conflict decisions, diagnostics, and audit behavior, see [docs/external-idp-import.md](docs/external-idp-import.md).
+See [docs/operator-runbook.md](docs/operator-runbook.md) for production health checks, config backup/restore, credential recovery, account/model diagnostics, request replay dry-runs, logs, metrics, and deployment verification steps. For external IdP import preview, conflict decisions, diagnostics, and audit behavior, see [docs/external-idp-import.md](docs/external-idp-import.md). For upstream Kiro-issued API keys, automatic/manual profile and region selection, hosted-SSO profile choice, model detection/routing, admin endpoints, migrations, and secret-bearing exports, see [docs/kiro-api-key-and-profiles.md](docs/kiro-api-key-and-profiles.md).
 
 ## Thinking Mode
 
@@ -178,7 +178,7 @@ credential file (`auth_method: external_idp`). There are three ways to load that
 | `KIRO_IMPORT_DIR` | Directory the watcher scans for `CLIProxyAPI_*.json` | `data/imports` |
 | `KIRO_IDE_CACHE` | Path to the Kiro IDE credential cache for `import-ide-cache` | `~/.aws/sso/cache/kiro-auth-token.json` (Docker: `/host-aws-sso-cache/kiro-auth-token.json`) |
 | `KIRO_AWS_SSO_CACHE_DIR` | Host AWS SSO cache directory mounted by Docker Compose for IDE-cache import | `$HOME/.aws/sso/cache` |
-| `KIRO_PROFILE_REGIONS` | Comma-separated fallback regions for external_idp profile probing | `us-east-1,eu-central-1` |
+| `KIRO_PROFILE_REGIONS` | Comma-separated fallback regions for profile discovery and Kiro API-key probing | `us-east-1,eu-central-1` |
 
 ## Contributing
 

@@ -155,9 +155,9 @@ func (h *Handler) apiRecheckUsageAudit(w http.ResponseWriter, r *http.Request) {
 		if target != "" && acc.ID != target {
 			continue
 		}
-		if acc.AccessToken == "" {
+		if !acc.HasUpstreamCredential() {
 			if target != "" {
-				errs = append(errs, "account has no access token")
+				errs = append(errs, "account has no upstream credential")
 			}
 			continue
 		}

@@ -91,8 +91,14 @@ func acceptRefreshedProfileArn(account *config.Account, arn string) bool {
 	if account == nil {
 		return false
 	}
-	if strings.TrimSpace(arn) == "" {
+	arn = strings.TrimSpace(arn)
+	if arn == "" {
 		return false
+	}
+	if account.ProfilePinned {
+		// A refresh may echo the already-selected ARN, but it must never move a
+		// manually pinned account to another profile.
+		return arn == strings.TrimSpace(account.ProfileArn)
 	}
 	if !arnRegionAllowed(account, arn) {
 		logger.Warnf("[ProfileArn] Refresh returned ARN outside override region %q for %s; not caching (fail closed)",
@@ -356,6 +362,16 @@ func ResolveProfileArn(account *config.Account) (string, error) {
 	if profileArn := strings.TrimSpace(account.ProfileArn); profileArn != "" {
 		return profileArn, nil
 	}
+	if account.ProfilePinned {
+		return "", fmt.Errorf("manually pinned profile ARN is missing")
+	}
+
+	// Kiro API-key credentials are key-scoped. They may expose no listable
+	// profile and have no OAuth refresh fallback; callers recognize this as a
+	// soft skip and continue without profileArn.
+	if account.IsKiroAPIKeyCredential() {
+		return "", fmt.Errorf("profile ARN resolution skipped: api_key account uses key-bound profile")
+	}
 
 	profileLookupSuppressed := isProfileArnResolutionSuppressed(account)
 	var profileUnsupportedErr error
@@ -371,21 +387,21 @@ func ResolveProfileArn(account *config.Account) (string, error) {
 		// region, which can legitimately differ from the profile's region).
 		profileArn, err := resolveProfileArnAcrossRegions(account)
 		if err == nil && profileArn != "" {
-			if updateErr := config.UpdateAccountProfileArn(account.ID, profileArn); updateErr != nil {
-				logger.Warnf("[ProfileArn] Failed to cache profile ARN for %s: %v", account.Email, updateErr)
+			if !acceptRefreshedProfileArn(account, profileArn) {
+				return "", fmt.Errorf("failed to cache resolved Kiro profile")
 			}
-			account.ProfileArn = profileArn
 			return profileArn, nil
 		}
 		profileUnsupportedErr = err
 		profileUnsupported = isBuilderIDProfileUnsupportedError(account, err)
 	}
 
-	// Fallback: refresh token to get profileArn from auth response.
+	// Fallback: refresh OAuth credentials to get profileArn from the auth response.
 	// Under a region override this fallback must NOT silently cache an ARN from
 	// a different region — that would recreate the host/ARN mismatch the override
-	// prevents. Refuse a mismatched ARN and fail closed instead.
-	if account.RefreshToken != "" {
+	// prevents. Refuse a mismatched ARN and fail closed instead. Kiro API-key
+	// credentials never participate in this lifecycle.
+	if account.CanRefreshUpstreamCredential() {
 		_, _, _, refreshedArn, refreshErr := auth.RefreshToken(account)
 		if refreshErr == nil && refreshedArn != "" {
 			if !arnRegionAllowed(account, refreshedArn) {
@@ -393,10 +409,9 @@ func ResolveProfileArn(account *config.Account) (string, error) {
 					account.Email, account.EffectiveRegionOverride())
 				return "", fmt.Errorf("no available Kiro profile in override region %q", account.EffectiveRegionOverride())
 			}
-			if updateErr := config.UpdateAccountProfileArn(account.ID, refreshedArn); updateErr != nil {
-				logger.Warnf("[ProfileArn] Failed to cache profile ARN for %s: %v", account.Email, updateErr)
+			if !acceptRefreshedProfileArn(account, refreshedArn) {
+				return "", fmt.Errorf("failed to cache refreshed Kiro profile")
 			}
-			account.ProfileArn = refreshedArn
 			return refreshedArn, nil
 		}
 	}
@@ -654,7 +669,7 @@ func retryUsageWithReresolvedProfile(account *config.Account, origErr error) (*U
 // path use to recover from a poisoned cached profile (e.g. a not-in-plan
 // us-east-1 profile cached ahead of an in-plan eu-central-1 profile).
 func reresolveProfileArn(account *config.Account) (string, bool) {
-	if account == nil {
+	if account == nil || account.ProfilePinned {
 		return "", false
 	}
 	oldArn := strings.TrimSpace(account.ProfileArn)
@@ -670,10 +685,9 @@ func reresolveProfileArn(account *config.Account) (string, bool) {
 		return "", false
 	}
 
-	if updateErr := config.UpdateAccountProfileArn(account.ID, newArn); updateErr != nil {
-		logger.Warnf("[ProfileArn] Failed to cache corrected profile ARN for %s: %v", account.Email, updateErr)
+	if !acceptRefreshedProfileArn(account, newArn) {
+		return "", false
 	}
-	account.ProfileArn = newArn
 	// Converge the auth region onto the profile's region for non-override
 	// accounts (existing self-heal behavior). When an override is set, leave
 	// account.Region (the auth/OIDC region) untouched — the override is
@@ -847,7 +861,7 @@ func RefreshAccountInfo(account *config.Account) (*config.AccountInfo, error) {
 
 	// 获取使用量和订阅信息
 	usage, err := GetUsageLimits(account)
-	if err != nil {
+	if err != nil && !account.IsKiroAPIKeyCredential() {
 		// Self-heal a stale/wrong cached profile before treating the failure as a
 		// ban. An account that owns more than one profile (e.g. a not-in-plan
 		// us-east-1 profile plus an in-plan eu-central-1 profile) may have cached the
@@ -858,6 +872,14 @@ func RefreshAccountInfo(account *config.Account) (*config.AccountInfo, error) {
 		}
 	}
 	if err != nil {
+		// Kiro API-key credentials cannot self-heal through OAuth refresh, and
+		// throwaway probe accounts may have no persisted ID. Never mutate/ban one
+		// from a single best-effort metadata failure; the request path still
+		// surfaces the real error and normal failover applies a short cooldown.
+		if account.IsKiroAPIKeyCredential() {
+			return nil, fmt.Errorf("GetUsageLimits: %w", err)
+		}
+
 		// 检测封禁状态
 		errMsg := err.Error()
 		if strings.Contains(errMsg, "TEMPORARILY_SUSPENDED") {

@@ -168,6 +168,14 @@ func (h *Handler) handleAccountFailure(account *config.Account, err error) {
 		logger.Warnf("[AccountFailover] Profile/plan authorization error for %s (not banning): %v", account.Email, err)
 		h.pool.RecordError(account.ID, false)
 	case isAuthErrorMessage(errMsg):
+		if account.IsKiroAPIKeyCredential() {
+			// Kiro keys cannot self-heal via OAuth refresh, and one upstream
+			// auth response may be transient. Rotate/cool down instead of
+			// permanently banning the account on the first failure.
+			logger.Warnf("[AccountFailover] Kiro API-key auth error for %s (not auto-banning): %v", account.Email, err)
+			h.pool.RecordError(account.ID, false)
+			return
+		}
 		h.disableAccount(account, "BANNED", "Authentication failed - token invalid or expired")
 	default:
 		h.pool.RecordError(account.ID, false)

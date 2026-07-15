@@ -12,6 +12,8 @@ package config
 
 import (
 	"crypto/rand"
+	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -43,17 +45,19 @@ type Account struct {
 	Nickname string `json:"nickname,omitempty"` // Display name for admin panel
 
 	// Authentication credentials
-	AccessToken  string `json:"accessToken"`            // OAuth access token for API calls
-	RefreshToken string `json:"refreshToken"`           // OAuth refresh token for token renewal
-	ClientID     string `json:"clientId,omitempty"`     // OIDC client ID (for IdC auth)
-	ClientSecret string `json:"clientSecret,omitempty"` // OIDC client secret (for IdC auth)
-	AuthMethod   string `json:"authMethod"`             // Authentication method: "idc" (AWS IdC), "social" (GitHub/Google), or "external_idp" (enterprise SSO, e.g. Azure AD)
-	Provider     string `json:"provider,omitempty"`     // Identity provider name (e.g., "BuilderId", "GitHub", "AzureAD")
-	Region       string `json:"region"`                 // AWS region for OIDC endpoints
-	StartUrl     string `json:"startUrl,omitempty"`     // AWS SSO start URL
-	ExpiresAt    int64  `json:"expiresAt,omitempty"`    // Token expiration timestamp (Unix seconds)
-	MachineId    string `json:"machineId,omitempty"`    // UUID machine identifier for request tracking
-	ProfileArn   string `json:"profileArn,omitempty"`   // CodeWhisperer/Kiro profile ARN for generation requests
+	AccessToken   string `json:"accessToken"`             // OAuth access token for API calls
+	RefreshToken  string `json:"refreshToken"`            // OAuth refresh token for token renewal
+	ClientID      string `json:"clientId,omitempty"`      // OIDC client ID (for IdC auth)
+	ClientSecret  string `json:"clientSecret,omitempty"`  // OIDC client secret (for IdC auth)
+	KiroApiKey    string `json:"kiroApiKey,omitempty"`    // Upstream Kiro-issued ksk_ credential. Never mirrored into AccessToken.
+	AuthMethod    string `json:"authMethod"`              // "idc", "social", "external_idp", or "api_key"
+	Provider      string `json:"provider,omitempty"`      // Identity provider name (e.g., "BuilderId", "GitHub", "AzureAD")
+	Region        string `json:"region"`                  // AWS region for OIDC endpoints
+	StartUrl      string `json:"startUrl,omitempty"`      // AWS SSO start URL
+	ExpiresAt     int64  `json:"expiresAt,omitempty"`     // Token expiration timestamp (Unix seconds)
+	MachineId     string `json:"machineId,omitempty"`     // UUID machine identifier for request tracking
+	ProfileArn    string `json:"profileArn,omitempty"`    // CodeWhisperer/Kiro profile ARN for generation requests
+	ProfilePinned bool   `json:"profilePinned,omitempty"` // True only when an operator explicitly selected ProfileArn.
 
 	// External IdP (enterprise SSO, e.g. Microsoft 365 / Entra ID / Azure AD) refresh material.
 	// When AuthMethod == "external_idp" the credential is an IdP-issued OAuth token refreshed
@@ -183,6 +187,61 @@ func (a *Account) AllowsModel(model string) bool {
 // region override for this account, or "" when no override is set.
 func (a *Account) EffectiveRegionOverride() string {
 	return strings.ToLower(strings.TrimSpace(a.RegionOverride))
+}
+
+// IsKiroAPIKeyCredential reports whether this account uses a Kiro-issued API key
+// instead of an OAuth access token. Creation/import normalize the method to
+// "api_key"; the helper intentionally does not infer key mode from AccessToken.
+func (a *Account) IsKiroAPIKeyCredential() bool {
+	return a != nil && strings.EqualFold(strings.TrimSpace(a.AuthMethod), "api_key")
+}
+
+// HasUpstreamCredential reports whether this account has the credential required
+// to call Kiro. Kiro API-key accounts keep the key only in KiroApiKey; OAuth and
+// external-IdP accounts continue to use AccessToken.
+func (a *Account) HasUpstreamCredential() bool {
+	if a == nil {
+		return false
+	}
+	if a.IsKiroAPIKeyCredential() {
+		return strings.TrimSpace(a.KiroApiKey) != ""
+	}
+	return strings.TrimSpace(a.AccessToken) != ""
+}
+
+// UpstreamBearerToken returns the credential to place in Authorization. Callers
+// must never log this value.
+func (a *Account) UpstreamBearerToken() string {
+	if a == nil {
+		return ""
+	}
+	if a.IsKiroAPIKeyCredential() {
+		return strings.TrimSpace(a.KiroApiKey)
+	}
+	return strings.TrimSpace(a.AccessToken)
+}
+
+// CanRefreshUpstreamCredential reports whether the account participates in the
+// OAuth refresh lifecycle. Kiro API keys are long-lived and never refreshed.
+func (a *Account) CanRefreshUpstreamCredential() bool {
+	return a != nil && !a.IsKiroAPIKeyCredential() && strings.TrimSpace(a.RefreshToken) != ""
+}
+
+// CredentialKind returns a stable, non-secret label for admin/API presentation.
+func (a *Account) CredentialKind() string {
+	if a == nil {
+		return "none"
+	}
+	if a.IsKiroAPIKeyCredential() {
+		return "api_key"
+	}
+	if strings.EqualFold(strings.TrimSpace(a.AuthMethod), "external_idp") {
+		return "external_idp"
+	}
+	if strings.TrimSpace(a.AccessToken) != "" || strings.TrimSpace(a.RefreshToken) != "" {
+		return "oauth"
+	}
+	return "none"
 }
 
 // PromptFilterRule defines a single custom prompt sanitization rule.
@@ -505,6 +564,43 @@ func Load() error {
 		}
 	}
 	if overageMigrated {
+		if err := saveLocked(); err != nil {
+			return err
+		}
+	}
+
+	// Migration/normalization: upstream Kiro API-key credentials use one source
+	// of truth (KiroApiKey). Older/reference-derived configs may spell the method
+	// "apikey", omit it while carrying kiroApiKey, or mirror the same long-lived
+	// secret into AccessToken for pool compatibility. Normalize the method and
+	// remove that duplicate. An api_key row without a key is unusable, so disable
+	// it rather than accidentally falling back to an OAuth-looking AccessToken.
+	kiroAPIKeyMigrated := false
+	for i := range cfg.Accounts {
+		a := &cfg.Accounts[i]
+		method := strings.ToLower(strings.TrimSpace(a.AuthMethod))
+		key := strings.TrimSpace(a.KiroApiKey)
+		if key != "" && (method == "" || method == "apikey") {
+			a.AuthMethod = "api_key"
+			method = "api_key"
+			kiroAPIKeyMigrated = true
+		}
+		if method != "api_key" {
+			continue
+		}
+		if key == "" {
+			if a.Enabled {
+				a.Enabled = false
+				kiroAPIKeyMigrated = true
+			}
+			continue
+		}
+		if strings.TrimSpace(a.AccessToken) == key {
+			a.AccessToken = ""
+			kiroAPIKeyMigrated = true
+		}
+	}
+	if kiroAPIKeyMigrated {
 		if err := saveLocked(); err != nil {
 			return err
 		}
@@ -894,19 +990,105 @@ func AddAccount(account Account) error {
 		}
 	}
 	cfg.Accounts = append(cfg.Accounts, account)
-	return Save()
+	if err := Save(); err != nil {
+		// Keep the in-memory config consistent with the failed durable write.
+		cfg.Accounts = cfg.Accounts[:len(cfg.Accounts)-1]
+		return err
+	}
+	return nil
+}
+
+// AddKiroAPIKeyAccountIfAbsent atomically deduplicates and persists a probed
+// Kiro-issued API-key account. The stable identity is userId+data-plane region;
+// when upstream omits userId, the key itself is compared inside this locked,
+// non-exported path. The returned Account is the existing row when added=false.
+func AddKiroAPIKeyAccountIfAbsent(account Account) (existing Account, added bool, err error) {
+	cfgLock.Lock()
+	defer cfgLock.Unlock()
+
+	region := accountDataPlaneRegion(account)
+	userID := strings.TrimSpace(account.UserId)
+	key := strings.TrimSpace(account.KiroApiKey)
+	for _, candidate := range cfg.Accounts {
+		if accountDataPlaneRegion(candidate) != region {
+			continue
+		}
+		candidateUserID := strings.TrimSpace(candidate.UserId)
+		sameIdentity := userID != "" && candidateUserID != "" && candidateUserID == userID
+		if !sameIdentity && (userID == "" || candidateUserID == "") && key != "" && candidate.IsKiroAPIKeyCredential() {
+			candidateKey := strings.TrimSpace(candidate.KiroApiKey)
+			left := sha256.Sum256([]byte(key))
+			right := sha256.Sum256([]byte(candidateKey))
+			sameIdentity = candidateKey != "" && subtle.ConstantTimeCompare(left[:], right[:]) == 1
+		}
+		if sameIdentity {
+			return candidate, false, nil
+		}
+	}
+	if account.ID != "" {
+		for _, candidate := range cfg.Accounts {
+			if candidate.ID == account.ID {
+				return Account{}, false, fmt.Errorf("account with id %s already exists", account.ID)
+			}
+		}
+	}
+	cfg.Accounts = append(cfg.Accounts, account)
+	if err := Save(); err != nil {
+		cfg.Accounts = cfg.Accounts[:len(cfg.Accounts)-1]
+		return Account{}, false, err
+	}
+	return account, true, nil
+}
+
+func accountDataPlaneRegion(account Account) string {
+	if region := account.EffectiveRegionOverride(); region != "" {
+		return region
+	}
+	parts := strings.SplitN(strings.TrimSpace(account.ProfileArn), ":", 6)
+	if len(parts) == 6 && parts[0] == "arn" && parts[2] == "codewhisperer" && strings.TrimSpace(parts[3]) != "" {
+		return strings.ToLower(strings.TrimSpace(parts[3]))
+	}
+	return strings.ToLower(strings.TrimSpace(account.Region))
 }
 
 func UpdateAccount(id string, account Account) error {
 	cfgLock.Lock()
 	defer cfgLock.Unlock()
-	for i, a := range cfg.Accounts {
-		if a.ID == id {
+	for i := range cfg.Accounts {
+		if cfg.Accounts[i].ID == id {
+			// ProfileArn/ProfilePinned/RegionOverride form one atomic routing tuple.
+			// Most callers update unrelated fields from detached snapshots (ban state,
+			// usage, admin metadata). Preserve the current tuple so a stale whole-row
+			// write cannot undo a concurrent manual profile selection.
+			account.ProfileArn = cfg.Accounts[i].ProfileArn
+			account.ProfilePinned = cfg.Accounts[i].ProfilePinned
+			account.RegionOverride = cfg.Accounts[i].RegionOverride
 			cfg.Accounts[i] = account
 			return Save()
 		}
 	}
 	return nil
+}
+
+// ReplaceAccount explicitly replaces an entire account, including its atomic
+// profile routing tuple. Use only for operator-confirmed replacement workflows;
+// ordinary updates must use UpdateAccount so stale snapshots cannot clobber a
+// concurrent manual profile selection.
+func ReplaceAccount(id string, account Account) error {
+	cfgLock.Lock()
+	defer cfgLock.Unlock()
+	for i := range cfg.Accounts {
+		if cfg.Accounts[i].ID == id {
+			previous := cfg.Accounts[i]
+			cfg.Accounts[i] = account
+			if err := Save(); err != nil {
+				cfg.Accounts[i] = previous
+				return err
+			}
+			return nil
+		}
+	}
+	return fmt.Errorf("account not found")
 }
 
 // UpdateAccountRegionOverride atomically sets the data-plane region override and,
@@ -922,14 +1104,23 @@ func UpdateAccountRegionOverride(id, override string) (bool, error) {
 	defer cfgLock.Unlock()
 	for i := range cfg.Accounts {
 		if cfg.Accounts[i].ID == id {
+			previous := cfg.Accounts[i]
 			prev := strings.ToLower(strings.TrimSpace(cfg.Accounts[i].RegionOverride))
-			changed := prev != normalized
+			// Calling the standalone region editor is also an explicit switch away
+			// from manual profile selection, even when the region text is unchanged.
+			changed := prev != normalized || cfg.Accounts[i].ProfilePinned
 			cfg.Accounts[i].RegionOverride = normalized
 			if changed {
-				// Force re-resolution of the profile in the (new) region.
+				// A standalone region change returns profile choice to automatic mode
+				// within the new hard-pinned region. Never leave a stale manual ARN/pin.
 				cfg.Accounts[i].ProfileArn = ""
+				cfg.Accounts[i].ProfilePinned = false
 			}
-			return changed, Save()
+			if err := Save(); err != nil {
+				cfg.Accounts[i] = previous
+				return false, err
+			}
+			return changed, nil
 		}
 	}
 	return false, nil
@@ -1003,11 +1194,60 @@ func UpdateAccountProfileArn(id, profileArn string) error {
 	defer cfgLock.Unlock()
 	for i, a := range cfg.Accounts {
 		if a.ID == id {
+			profileArn = strings.TrimSpace(profileArn)
+			if cfg.Accounts[i].ProfilePinned && profileArn != strings.TrimSpace(cfg.Accounts[i].ProfileArn) {
+				return fmt.Errorf("account profile is manually pinned")
+			}
 			cfg.Accounts[i].ProfileArn = profileArn
 			return Save()
 		}
 	}
 	return nil
+}
+
+// UpdateAccountProfileSelection atomically changes the operator-visible profile
+// mode. pinned=true binds ProfileArn and RegionOverride together; pinned=false
+// restores fully automatic discovery by clearing the ARN, pin, and region override.
+// The proxy layer validates ARN structure and that the selected ARN was freshly
+// discovered before calling this persistence primitive.
+func UpdateAccountProfileSelection(id, profileArn, dataPlaneRegion string, pinned bool) (bool, error) {
+	profileArn = strings.TrimSpace(profileArn)
+	dataPlaneRegion = strings.ToLower(strings.TrimSpace(dataPlaneRegion))
+	if pinned && (profileArn == "" || dataPlaneRegion == "") {
+		return false, fmt.Errorf("pinned profile and data-plane region are required")
+	}
+	if !pinned {
+		profileArn = ""
+		dataPlaneRegion = ""
+	}
+
+	cfgLock.Lock()
+	defer cfgLock.Unlock()
+	for i := range cfg.Accounts {
+		if cfg.Accounts[i].ID != id {
+			continue
+		}
+		changed := strings.TrimSpace(cfg.Accounts[i].ProfileArn) != profileArn ||
+			cfg.Accounts[i].ProfilePinned != pinned ||
+			strings.ToLower(strings.TrimSpace(cfg.Accounts[i].RegionOverride)) != dataPlaneRegion
+		if !changed {
+			return false, nil
+		}
+		previousArn := cfg.Accounts[i].ProfileArn
+		previousPinned := cfg.Accounts[i].ProfilePinned
+		previousOverride := cfg.Accounts[i].RegionOverride
+		cfg.Accounts[i].ProfileArn = profileArn
+		cfg.Accounts[i].ProfilePinned = pinned
+		cfg.Accounts[i].RegionOverride = dataPlaneRegion
+		if err := Save(); err != nil {
+			cfg.Accounts[i].ProfileArn = previousArn
+			cfg.Accounts[i].ProfilePinned = previousPinned
+			cfg.Accounts[i].RegionOverride = previousOverride
+			return false, err
+		}
+		return true, nil
+	}
+	return false, fmt.Errorf("account not found")
 }
 
 func DeleteAccount(id string) error {

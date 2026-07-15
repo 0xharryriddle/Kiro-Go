@@ -341,6 +341,21 @@ func getSortedEndpoints(preferred string) []kiroEndpoint {
 	return result
 }
 
+// validateKiroDispatchProfile enforces the host/profile region invariant before
+// any network request is created. Without a region override, the historical
+// soft-fail behavior is preserved. With an override, OAuth credentials require
+// a matching profile ARN; key-scoped API-key credentials may omit it.
+func validateKiroDispatchProfile(account *config.Account, profileArn string) error {
+	if account == nil || account.EffectiveRegionOverride() == "" {
+		return nil
+	}
+	arn := strings.TrimSpace(profileArn)
+	if (arn == "" && !account.IsKiroAPIKeyCredential()) || (arn != "" && !arnRegionAllowed(account, arn)) {
+		return fmt.Errorf("no available Kiro profile in override region %q", account.EffectiveRegionOverride())
+	}
+	return nil
+}
+
 // CallKiroAPI calls the Kiro streaming API, trying each configured endpoint with automatic fallback.
 func CallKiroAPI(account *config.Account, payload *KiroPayload, callback *KiroStreamCallback) error {
 	originalProfileArn := ""
@@ -386,17 +401,15 @@ func CallKiroAPI(account *config.Account, payload *KiroPayload, callback *KiroSt
 	}
 
 	// Fail closed under a region override: never dispatch a request whose profile
-	// ARN is empty or belongs to a region other than the override. Without an
-	// override, preserve the historical soft-fail behavior (dispatch with whatever
-	// ARN resolved, even empty) so nothing regresses for normal accounts.
-	if account != nil && account.EffectiveRegionOverride() != "" {
-		arn := ""
-		if payload != nil {
-			arn = strings.TrimSpace(payload.ProfileArn)
-		}
-		if arn == "" || !arnRegionAllowed(account, arn) {
-			return fmt.Errorf("no available Kiro profile in override region %q", account.EffectiveRegionOverride())
-		}
+	// ARN is empty or belongs to a region other than the override. Kiro API-key
+	// credentials are key-scoped, so an empty ARN is valid for them while the
+	// override still pins the regional host.
+	profileArn := ""
+	if payload != nil {
+		profileArn = payload.ProfileArn
+	}
+	if err := validateKiroDispatchProfile(account, profileArn); err != nil {
+		return err
 	}
 
 	// Build endpoint list ordered by configuration.

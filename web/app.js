@@ -24,6 +24,7 @@
   let builderIdPollTimer = null;
   let kiroSsoSession = '';
   let kiroSsoPollTimer = null;
+  let kiroAPIKeyProbe = null;
   let iamSession = '';
   let exportSelectedIds = new Set();
   let currentVersion = '';
@@ -1001,6 +1002,7 @@
     if (normalized === 'idc') return t('auth.enterprise');
     if (normalized === 'social') return t('auth.social');
     if (normalized === 'builderid') return 'BuilderID';
+    if (normalized === 'api_key' || normalized === 'kiroapikey') return t('kiroApiKey.title');
     if (normalized === 'github') return t('local.providerGithub');
     if (normalized === 'google') return t('local.providerGoogle');
     return method;
@@ -1622,8 +1624,15 @@
       const jsonPromise = api('/accounts/' + id + '/full').then(async res => {
         if (!res.ok) throw new Error('Failed');
         const a = await res.json();
-        const { clientId, clientSecret, accessToken, refreshToken } = a;
-        return JSON.stringify({ clientId, clientSecret, accessToken, refreshToken }, null, 2);
+        const {
+          clientId, clientSecret, accessToken, refreshToken,
+          kiroApiKey, authMethod, provider, region, regionOverride
+        } = a;
+        const exportRegion = authMethod === 'api_key' ? (regionOverride || region) : region;
+        return JSON.stringify({
+          clientId, clientSecret, accessToken, refreshToken,
+          kiroApiKey, authMethod, provider, region: exportRegion
+        }, null, 2);
       });
       await copyText(jsonPromise);
       flashCopySuccess(btn);
@@ -1766,6 +1775,7 @@
       detailItem(t('detail.email'), getDisplayEmail(a.email, null)) +
       detailItem(t('detail.userId'), a.userId || '-') +
       detailItem(t('detail.authMethod'), formatAuthMethod(a.provider || a.authMethod)) +
+      (a.kiroApiKeyMask ? detailItem(t('kiroApiKey.mask'), a.kiroApiKeyMask) : '') +
       detailItem(t('detail.region'), a.region || 'us-east-1') +
       '</div></div>' +
 
@@ -1803,6 +1813,13 @@
       '</datalist>' +
       '<button class="btn btn-sm btn-primary" data-detail-action="saveRegionOverride" data-id="' + idAttr + '" type="button">' + escapeHtml(t('detail.save')) + '</button>' +
       '</div><p class="help-block">' + escapeHtml(t('detail.regionOverrideHint')) + '</p></div>' +
+
+      '<div class="detail-section"><h4>' + escapeHtml(t('profiles.title')) +
+      ' <button class="btn btn-sm btn-outline" data-detail-action="loadKiroProfiles" data-id="' + idAttr + '" type="button">' + escapeHtml(t('profiles.discover')) + '</button>' +
+      '</h4>' +
+      '<p class="help-block">' + escapeHtml(t('profiles.hint')) + '</p>' +
+      '<div id="kiroProfilesList" class="profile-list"><p class="empty-state">' + escapeHtml(t('profiles.loadPrompt')) + '</p></div>' +
+      '</div>' +
 
       '<div class="detail-section"><h4>' + escapeHtml(t('detail.subscription')) + '</h4><div class="detail-grid">' +
       detailItem(t('detail.subscriptionType'), a.subscriptionTitle || (a.subscriptionType ? formatSubscriptionLabel(a.subscriptionType) : '-')) +
@@ -1844,6 +1861,87 @@
       '</div>';
 
     openDialog('detailModal');
+  }
+  function renderKiroProfileWarnings(warnings) {
+    if (!Array.isArray(warnings) || !warnings.length) return '';
+    return '<div class="message message-warning profile-warning"><strong>' + escapeHtml(t('profiles.partialWarning')) + '</strong><ul>' +
+      warnings.map(w => '<li>' + escapeHtml((w.region || '-') + ': ' + t('profiles.warning.' + (w.code || 'upstream_error'))) + '</li>').join('') +
+      '</ul></div>';
+  }
+  function renderKiroProfiles(id, data) {
+    const c = $('kiroProfilesList');
+    if (!c) return;
+    if (data.mode === 'key_bound') {
+      c.innerHTML = '<div class="message message-info">' + escapeHtml(t('profiles.keyBound')) + '</div>';
+      return;
+    }
+    const profiles = Array.isArray(data.profiles) ? data.profiles : [];
+    const warnings = renderKiroProfileWarnings(data.warnings);
+    const autoCard = '<div class="profile-card profile-card--auto">' +
+      '<div class="profile-card-body"><strong>' + escapeHtml(t('profiles.auto')) + '</strong>' +
+      '<span>' + escapeHtml(t('profiles.autoDesc')) + '</span></div>' +
+      '<button class="btn btn-sm btn-outline" data-detail-action="autoKiroProfile" data-id="' + escapeAttr(id) + '" type="button">' + escapeHtml(t('profiles.useAuto')) + '</button>' +
+      '</div>';
+    const cards = profiles.map(p => {
+      const badges = (p.current ? '<span class="badge badge-info">' + escapeHtml(t('profiles.current')) + '</span>' : '') +
+        (p.pinned ? '<span class="badge badge-warning">' + escapeHtml(t('profiles.manual')) + '</span>' : '') +
+        '<span class="badge ' + (p.usable ? 'badge-success' : 'badge-error') + '">' + escapeHtml(p.usable ? t('profiles.usable') : t('profiles.unusable')) + '</span>';
+      const action = p.current && p.pinned
+        ? '<button class="btn btn-sm btn-outline" disabled type="button">' + escapeHtml(t('profiles.selected')) + '</button>'
+        : '<button class="btn btn-sm btn-primary" data-detail-action="selectKiroProfile" data-id="' + escapeAttr(id) + '" data-profile-arn="' + escapeAttr(p.arn || '') + '" ' + (p.usable ? '' : 'disabled ') + 'type="button">' + escapeHtml(t('profiles.select')) + '</button>';
+      return '<div class="profile-card">' +
+        '<div class="profile-card-body"><div class="profile-card-head"><strong>' + escapeHtml(p.region || '-') + '</strong><span class="profile-badges">' + badges + '</span></div>' +
+        '<code class="profile-arn">' + escapeHtml(p.arn || '') + '</code></div>' + action + '</div>';
+    }).join('');
+    c.innerHTML = warnings + autoCard + (cards || '<p class="empty-state">' + escapeHtml(t('profiles.empty')) + '</p>');
+  }
+  async function loadKiroProfiles(id) {
+    const c = $('kiroProfilesList');
+    if (!c) return;
+    c.innerHTML = '<p class="empty-state">' + escapeHtml(t('profiles.loading')) + '</p>';
+    try {
+      const res = await api('/accounts/' + encodeURIComponent(id) + '/kiro-profiles');
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.error || t('profiles.loadFailed'));
+      renderKiroProfiles(id, data);
+    } catch (e) {
+      c.innerHTML = '<div class="message message-error">' + escapeHtml((e && e.message) || t('profiles.loadFailed')) + '</div>';
+    }
+  }
+  async function selectKiroProfile(id, arn) {
+    if (!arn) return;
+    const ok = await confirmAction(t('profiles.confirmSelect'), {
+      title: t('profiles.selectTitle'), confirmText: t('profiles.select')
+    });
+    if (!ok) return;
+    try {
+      const res = await api('/accounts/' + encodeURIComponent(id) + '/kiro-profiles', {
+        method: 'POST', body: JSON.stringify({ profileArn: arn })
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok || !data.success) throw new Error(data.error || t('profiles.selectFailed'));
+      await loadAccounts();
+      await loadKiroProfiles(id);
+      toast(data.modelsRefreshed ? t('profiles.selectedAndRefreshed') : t('profiles.selectedNoRefresh'), data.modelsRefreshed ? 'success' : 'warning');
+    } catch (e) {
+      toast((e && e.message) || t('profiles.selectFailed'), 'error');
+    }
+  }
+  async function autoKiroProfile(id) {
+    const ok = await confirmAction(t('profiles.confirmAuto'), {
+      title: t('profiles.auto'), confirmText: t('profiles.useAuto')
+    });
+    if (!ok) return;
+    try {
+      const res = await api('/accounts/' + encodeURIComponent(id) + '/kiro-profiles/auto', { method: 'POST' });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok || !data.success) throw new Error(data.error || t('profiles.autoFailed'));
+      await loadAccounts();
+      await loadKiroProfiles(id);
+      toast(data.resolved ? t('profiles.autoEnabled') : t('profiles.autoEnabledWarning'), data.resolved ? 'success' : 'warning');
+    } catch (e) {
+      toast((e && e.message) || t('profiles.autoFailed'), 'error');
+    }
   }
   async function loadModels(id) {
     const c = $('modelsList');
@@ -2807,6 +2905,7 @@
   // Add-account modal templates
   var METHOD_ICONS = {
     builderid: 'fa-solid fa-id-card',
+    kiroapikey: 'fa-solid fa-key',
     iam: 'fa-solid fa-key',
     enterprisesso: 'fa-brands fa-microsoft',
     sso: 'fa-solid fa-shield-halved',
@@ -2830,6 +2929,7 @@
     const title = $('modalTitle');
     const body = $('modalBody');
     if (type === 'add') modalAdd(title, body);
+    else if (type === 'kiroapikey') modalKiroAPIKey(title, body);
     else if (type === 'builderid') modalBuilderId(title, body);
     else if (type === 'iam') modalIam(title, body);
     else if (type === 'enterprisesso') modalEnterpriseSso(title, body);
@@ -2853,11 +2953,14 @@
       api('/auth/kiro-sso/cancel', { method: 'POST', body: JSON.stringify({ sessionId: kiroSsoSession }) }).catch(() => {});
     }
     kiroSsoSession = '';
+    kiroAPIKeyProbe = null;
   }
   function modalAdd(title, body) {
+    kiroAPIKeyProbe = null;
     title.textContent = t('modal.addAccount');
     body.innerHTML =
       '<div class="method-list">' +
+      methodCard('kiroapikey', t('kiroApiKey.title'), t('kiroApiKey.desc')) +
       methodCard('builderid', t('modal.builderIdTitle'), t('modal.builderIdDesc')) +
       methodCard('iam', t('modal.iamTitle'), t('modal.iamDesc')) +
       methodCard('enterprisesso', t('modal.enterpriseSsoTitle'), t('modal.enterpriseSsoDesc')) +
@@ -2867,6 +2970,122 @@
       methodCard('cookie', t('modal.cookieTitle'), t('modal.cookieDesc')) +
       '</div>' +
       '<div class="modal-footer"><button class="btn btn-secondary" data-close-add="1" type="button">' + escapeHtml(t('common.cancel')) + '</button></div>';
+  }
+  function modalKiroAPIKey(title, body) {
+    kiroAPIKeyProbe = null;
+    title.textContent = t('kiroApiKey.title');
+    body.innerHTML =
+      '<p class="help-block">' + escapeHtml(t('kiroApiKey.desc')) + '</p>' +
+      '<div class="message message-info"><p class="text-xs">' + escapeHtml(t('kiroApiKey.securityHint')) + '</p></div>' +
+      '<div id="kiroApiKeyProbeStep">' +
+      '<div class="form-group"><label>' + escapeHtml(t('kiroApiKey.keyLabel')) + '</label>' +
+      '<input type="password" id="kiroApiKeyInput" autocomplete="off" spellcheck="false" placeholder="ksk_..." /></div>' +
+      '<div class="form-group"><label>' + escapeHtml(t('kiroApiKey.regionsLabel')) + '</label>' +
+      '<input type="text" id="kiroApiKeyRegions" placeholder="us-east-1, eu-central-1" />' +
+      '<small>' + escapeHtml(t('kiroApiKey.regionsHint')) + '</small></div>' +
+      '<div class="modal-footer">' +
+      '<button class="btn btn-secondary" data-modal-goto="add" type="button">' + escapeHtml(t('common.back')) + '</button>' +
+      '<button class="btn btn-primary" id="probeKiroApiKeyBtn" type="button">' + escapeHtml(t('kiroApiKey.probe')) + '</button>' +
+      '</div></div>' +
+      '<div id="kiroApiKeyCommitStep" class="hidden"></div>';
+    $('probeKiroApiKeyBtn').addEventListener('click', probeKiroIssuedAPIKey);
+  }
+
+  function renderKiroAPIKeyProbeResults(data) {
+    const regions = Array.isArray(data.regions) ? data.regions : [];
+    const usable = regions.filter(r => r.usable);
+    kiroAPIKeyProbe = { probeId: data.probeId, expiresAt: data.expiresAt, regions: usable };
+    const rows = regions.map((r, index) => {
+      const checked = r.usable && usable[0] && r.region === usable[0].region ? ' checked' : '';
+      const identity = [r.email, r.subscriptionTitle || r.subscriptionType].filter(Boolean).join(' · ');
+      return '<label class="diag-chip ' + (r.usable ? 'diag-chip--ok' : 'diag-chip--warn') + '">' +
+        '<input type="radio" name="kiroApiKeyRegion" value="' + escapeAttr(r.region || '') + '"' +
+        (r.usable ? checked : ' disabled') + ' /> ' +
+        '<strong>' + escapeHtml(r.region || '-') + '</strong>' +
+        '<span>' + escapeHtml(r.usable ? (identity || t('kiroApiKey.usable')) : t('kiroApiKey.unusable', r.errorCode || 'upstream_error')) + '</span>' +
+        '</label>';
+    }).join('');
+    $('kiroApiKeyProbeStep').classList.add('hidden');
+    const step = $('kiroApiKeyCommitStep');
+    step.classList.remove('hidden');
+    step.innerHTML =
+      '<p class="help-block">' + escapeHtml(t('kiroApiKey.selectRegion')) + '</p>' +
+      '<div class="diag-list">' + rows + '</div>' +
+      '<div class="form-group mt-4"><label>' + escapeHtml(t('kiroApiKey.nickname')) + '</label>' +
+      '<input type="text" id="kiroApiKeyNickname" maxlength="100" placeholder="' + escapeAttr(t('kiroApiKey.nicknamePlaceholder')) + '" /></div>' +
+      '<label class="checkbox-row"><input type="checkbox" id="kiroApiKeyEnabled" checked /> <span>' + escapeHtml(t('kiroApiKey.enabled')) + '</span></label>' +
+      '<div class="modal-footer">' +
+      '<button class="btn btn-secondary" data-modal-goto="kiroapikey" type="button">' + escapeHtml(t('common.back')) + '</button>' +
+      '<button class="btn btn-primary" id="commitKiroApiKeyBtn" type="button">' + escapeHtml(t('kiroApiKey.add')) + '</button>' +
+      '</div>';
+    $('commitKiroApiKeyBtn').addEventListener('click', commitKiroIssuedAPIKey);
+  }
+
+  async function probeKiroIssuedAPIKey() {
+    const keyInput = $('kiroApiKeyInput');
+    let rawKey = keyInput ? keyInput.value : '';
+    if (!rawKey) return toastWarning(t('kiroApiKey.keyRequired'));
+    const regions = (($('kiroApiKeyRegions') && $('kiroApiKeyRegions').value) || '')
+      .split(',').map(v => v.trim()).filter(Boolean);
+    const requestBody = JSON.stringify({ kiroApiKey: rawKey, regions });
+    // Clear our input and local plaintext reference before any network wait or
+    // response render. The fetch request body is the only unavoidable copy.
+    keyInput.value = '';
+    rawKey = '';
+    const btn = $('probeKiroApiKeyBtn');
+    btn.disabled = true;
+    btn.textContent = t('kiroApiKey.probing');
+    try {
+      const res = await api('/auth/kiro-api-key/probe', {
+        method: 'POST', body: requestBody
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok || !data.probeId) {
+        toastError(data.error || t('kiroApiKey.probeFailed'));
+        return;
+      }
+      renderKiroAPIKeyProbeResults(data);
+    } catch (e) {
+      toastError(t('kiroApiKey.probeFailed'));
+    } finally {
+      if (btn && btn.isConnected) {
+        btn.disabled = false;
+        btn.textContent = t('kiroApiKey.probe');
+      }
+    }
+  }
+
+  async function commitKiroIssuedAPIKey() {
+    if (!kiroAPIKeyProbe || !kiroAPIKeyProbe.probeId) return toastError(t('kiroApiKey.probeExpired'));
+    const selected = document.querySelector('input[name="kiroApiKeyRegion"]:checked');
+    if (!selected) return toastWarning(t('kiroApiKey.regionRequired'));
+    const btn = $('commitKiroApiKeyBtn');
+    btn.disabled = true;
+    try {
+      const res = await api('/auth/kiro-api-key/commit', {
+        method: 'POST',
+        body: JSON.stringify({
+          probeId: kiroAPIKeyProbe.probeId,
+          selectedRegion: selected.value,
+          nickname: ($('kiroApiKeyNickname') && $('kiroApiKeyNickname').value.trim()) || '',
+          enabled: !!($('kiroApiKeyEnabled') && $('kiroApiKeyEnabled').checked)
+        })
+      });
+      const data = await res.json().catch(() => ({}));
+      kiroAPIKeyProbe = null;
+      if (!res.ok || !data.success) {
+        toastError(data.error || t('kiroApiKey.commitFailed'));
+        return;
+      }
+      closeModal();
+      await Promise.all([loadAccounts(), loadStats()]);
+      toast(t('kiroApiKey.added'), 'success');
+      autoRefreshNewAccount(data.account && data.account.id);
+    } catch (e) {
+      toastError(t('kiroApiKey.commitFailed'));
+    } finally {
+      if (btn && btn.isConnected) btn.disabled = false;
+    }
   }
   function modalBuilderId(title, body) {
     title.textContent = t('modal.builderIdTitle');
@@ -3085,6 +3304,7 @@
             accessToken: c.accessToken || a.accessToken,
             clientId: c.clientId || a.clientId,
             clientSecret: c.clientSecret || a.clientSecret,
+			kiroApiKey: c.kiroApiKey || a.kiroApiKey,
             region: c.region || a.region,
             authMethod: c.authMethod || a.authMethod,
             provider: c.provider || a.provider || a.idp,
@@ -3115,10 +3335,14 @@
     }
     let ok = 0, fail = 0, newIds = [];
     for (const item of items) {
-      if (!item.refreshToken) { fail++; continue; }
+	  const rawAuthMethod = (item.authMethod || '').toLowerCase();
+	  const isKiroAPIKey = ['api_key', 'apikey', 'kiro_api_key', 'kiroapikey'].includes(rawAuthMethod) || !!item.kiroApiKey;
+	  if (isKiroAPIKey ? !item.kiroApiKey : !item.refreshToken) { fail++; continue; }
       const EXTERNAL_IDP = ['external_idp','azuread','azure','entra','entra-id','microsoft','m365','office365','external'];
-      let authMethod = (item.authMethod || '').toLowerCase();
-      if (EXTERNAL_IDP.includes(authMethod) || item.tokenEndpoint) {
+	  let authMethod = rawAuthMethod;
+	  if (isKiroAPIKey) {
+		authMethod = 'api_key';
+	  } else if (EXTERNAL_IDP.includes(authMethod) || item.tokenEndpoint) {
         authMethod = 'external_idp';
       } else if (item.clientId && item.clientSecret) {
         authMethod = 'idc';
@@ -3131,11 +3355,13 @@
       if (!provider && authMethod === 'external_idp') provider = 'AzureAD';
       if (!provider && authMethod === 'social') provider = 'Google';
       if (!provider && authMethod === 'idc') provider = 'BuilderId';
+	  if (!provider && authMethod === 'api_key') provider = 'KiroAPIKey';
       const payload = {
-        refreshToken: item.refreshToken,
+		refreshToken: item.refreshToken || '',
         accessToken: item.accessToken || '',
         clientId: item.clientId || '',
         clientSecret: item.clientSecret || '',
+		kiroApiKey: item.kiroApiKey || '',
         authMethod, provider,
         region: item.region || 'us-east-1',
         tokenEndpoint: item.tokenEndpoint || '',
@@ -3287,6 +3513,13 @@
       '<p id="kiroSsoStatus" class="text-center text-sm mt-4 muted-text">' + escapeHtml(t('builderid.waiting')) + '</p>' +
       '<div class="modal-footer"><button class="btn btn-secondary" id="kiroSsoCancelBtn" type="button">' + escapeHtml(t('common.cancel')) + '</button></div>' +
       '</div>' +
+      '<div id="kiroSsoStep3" class="hidden">' +
+      '<h4>' + escapeHtml(t('kirosso.chooseProfileTitle')) + '</h4>' +
+      '<p class="help-block">' + escapeHtml(t('kirosso.chooseProfileHint')) + '</p>' +
+      '<div id="kiroSsoProfileWarnings"></div>' +
+      '<div id="kiroSsoProfileList" class="profile-list"></div>' +
+      '<div class="modal-footer"><button class="btn btn-secondary" id="kiroSsoProfileCancelBtn" type="button">' + escapeHtml(t('common.cancel')) + '</button></div>' +
+      '</div>' +
       // Alternative path: import a CLIProxyAPI_*.json already minted by the
       // standalone kiro-login-helper.py (offline / headless hosts where the
       // browser sign-in can't run on the proxy host itself).
@@ -3302,6 +3535,7 @@
       '</div>';
     $('startKiroSsoBtn').addEventListener('click', startKiroSsoLogin);
     $('kiroSsoIdeCacheBtn').addEventListener('click', importIdeCache);
+    $('kiroSsoProfileCancelBtn').addEventListener('click', cancelKiroSsoLogin);
     $('kiroSsoJsonFile').addEventListener('change', e => loadHelperJsonFiles(e.target));
     $('kiroSsoImportJsonBtn').addEventListener('click', importHelperJson);
   }
@@ -3432,7 +3666,7 @@
   function pollKiroSso(interval) {
     kiroSsoPollTimer = setTimeout(async () => {
       const res = await api('/auth/kiro-sso/poll', { method: 'POST', body: JSON.stringify({ sessionId: kiroSsoSession }) });
-      const d = await res.json();
+      const d = await res.json().catch(() => ({}));
       if (d.completed) {
         // Session is already consumed server-side; clear it so closeModal() does
         // not fire a redundant cancel for an account that succeeded.
@@ -3440,6 +3674,9 @@
         closeModal(); loadAccounts(); loadStats();
         toastPrimary(t('builderid.success') + ': ' + (d.account?.email || d.account?.id));
         autoRefreshNewAccount(d.account?.id);
+      } else if (d.success && d.requiresProfileChoice) {
+        kiroSsoPollTimer = null;
+        renderKiroSsoProfileChoice(d);
       } else if (d.success && !d.completed) {
         $('kiroSsoStatus').textContent = t('builderid.waiting');
         pollKiroSso(interval);
@@ -3448,6 +3685,45 @@
         cancelKiroSsoLogin();
       }
     }, interval * 1000);
+  }
+  function renderKiroSsoProfileChoice(data) {
+    $('kiroSsoStep2').classList.add('hidden');
+    $('kiroSsoStep3').classList.remove('hidden');
+    const warnings = Array.isArray(data.warnings) ? data.warnings : [];
+    $('kiroSsoProfileWarnings').innerHTML = warnings.length
+      ? '<div class="message message-warning"><strong>' + escapeHtml(t('profiles.partialWarning')) + '</strong><ul>' +
+        warnings.map(w => '<li>' + escapeHtml((w.region || '-') + ': ' + t('profiles.warning.' + (w.code || 'upstream_error'))) + '</li>').join('') + '</ul></div>'
+      : '';
+    const profiles = Array.isArray(data.profiles) ? data.profiles : [];
+    $('kiroSsoProfileList').innerHTML = profiles.map(p =>
+      '<div class="profile-card"><div class="profile-card-body"><strong>' + escapeHtml(p.region || '-') + '</strong>' +
+      '<code class="profile-arn">' + escapeHtml(p.arn || '') + '</code></div>' +
+      '<button class="btn btn-sm btn-primary" type="button" data-kiro-sso-profile="' + escapeAttr(p.arn || '') + '">' + escapeHtml(t('kirosso.chooseProfile')) + '</button></div>'
+    ).join('') || '<p class="empty-state">' + escapeHtml(t('profiles.empty')) + '</p>';
+    qsa('[data-kiro-sso-profile]', $('kiroSsoProfileList')).forEach(btn => {
+      btn.addEventListener('click', () => finalizeKiroSsoProfile(btn.dataset.kiroSsoProfile, btn));
+    });
+  }
+  async function finalizeKiroSsoProfile(profileArn, btn) {
+    if (!kiroSsoSession || !profileArn) return;
+    btn.disabled = true;
+    const originalText = btn.textContent;
+    btn.textContent = t('kirosso.finalizingProfile');
+    try {
+      const res = await api('/auth/kiro-sso/profile', {
+        method: 'POST', body: JSON.stringify({ sessionId: kiroSsoSession, profileArn })
+      });
+      const d = await res.json().catch(() => ({}));
+      if (!res.ok || !d.completed) throw new Error(d.error || t('kirosso.profileFinalizeFailed'));
+      kiroSsoSession = '';
+      closeModal(); loadAccounts(); loadStats();
+      toastPrimary(t('builderid.success') + ': ' + (d.account?.email || d.account?.id));
+      autoRefreshNewAccount(d.account?.id);
+    } catch (e) {
+      btn.disabled = false;
+      btn.textContent = originalText;
+      toastError((e && e.message) || t('kirosso.profileFinalizeFailed'));
+    }
   }
   function cancelKiroSsoLogin() {
     if (kiroSsoPollTimer) { clearTimeout(kiroSsoPollTimer); kiroSsoPollTimer = null; }
@@ -3958,6 +4234,9 @@
       else if (a === 'refreshOverage') refreshAccountOverage(id);
       else if (a === 'saveProxyURL') saveProxyURL(id);
       else if (a === 'saveRegionOverride') saveRegionOverride(id);
+      else if (a === 'loadKiroProfiles') loadKiroProfiles(id);
+      else if (a === 'selectKiroProfile') selectKiroProfile(id, b.dataset.profileArn);
+      else if (a === 'autoKiroProfile') autoKiroProfile(id);
       else if (a === 'loadModels') loadModels(id);
       else if (a === 'refreshModels') refreshAccountModels(id);
       else if (a === 'loadModelAccess') loadModelAccess(id);

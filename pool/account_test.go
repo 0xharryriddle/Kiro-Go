@@ -101,6 +101,20 @@ func TestGetNextForModelKeepsExpiringTokenAvailableForRequestRefresh(t *testing.
 	}
 }
 
+func TestGetByIDReturnsDetachedCopy(t *testing.T) {
+	p := newTestPool(config.Account{ID: "acct-1", AccessToken: "original"})
+	got := p.GetByID("acct-1")
+	if got == nil {
+		t.Fatal("expected account copy")
+	}
+	got.AccessToken = "mutated-outside-lock"
+
+	again := p.GetByID("acct-1")
+	if again == nil || again.AccessToken != "original" {
+		t.Fatalf("GetByID exposed mutable internal account: %+v", again)
+	}
+}
+
 // ---------------------------------------------------------------------------
 // IsAuthFailure
 // ---------------------------------------------------------------------------

@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"kiro-go/config"
 	"net/http"
+	"strings"
 )
 
 const (
@@ -56,8 +57,13 @@ func buildKiroHeaderValues(account *config.Account, host, apiName, sdkVersion, m
 }
 
 func applyKiroBaseHeaders(req *http.Request, account *config.Account, values kiroHeaderValues) {
-	if account != nil && account.AccessToken != "" {
-		req.Header.Set("Authorization", "Bearer "+account.AccessToken)
+	if account != nil {
+		if bearer := account.UpstreamBearerToken(); bearer != "" {
+			req.Header.Set("Authorization", "Bearer "+bearer)
+			if account.IsKiroAPIKeyCredential() {
+				req.Header.Set("TokenType", "API_KEY")
+			}
+		}
 	}
 	req.Header.Set("User-Agent", values.UserAgent)
 	req.Header.Set("x-amz-user-agent", values.AmzUserAgent)
@@ -66,7 +72,7 @@ func applyKiroBaseHeaders(req *http.Request, account *config.Account, values kir
 	// CodeWhisperer does not recognize the token type and silently returns an empty
 	// profile list (and rejects data-plane calls). With it, a provisioned account
 	// resolves its profile; an unprovisioned one gets a clear 403.
-	if account != nil && account.AuthMethod == "external_idp" {
+	if account != nil && strings.EqualFold(strings.TrimSpace(account.AuthMethod), "external_idp") {
 		req.Header.Set("TokenType", "EXTERNAL_IDP")
 	}
 	if values.Host != "" {

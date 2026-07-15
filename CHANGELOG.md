@@ -6,6 +6,34 @@ follows [Keep a Changelog](https://keepachangelog.com/).
 ## [Unreleased]
 
 ### Added
+- **Upstream Kiro-issued API-key authentication.** Accounts can now authenticate to
+  Kiro with a recoverable `ksk_...` credential stored only in `kiroApiKey`, using the
+  upstream `Authorization: Bearer` / `TokenType: API_KEY` contract without entering
+  OAuth refresh. A five-minute probe/commit flow validates candidate regions before
+  persistence, returns sanitized metadata, commits one selected region, and atomically
+  deduplicates the same Kiro identity plus region.
+- **Kiro API-key admin UI and import/export round trip.** Add Account now includes a
+  Kiro API Key method with region probe results and masked account presentation.
+  Credential import live-validates `authMethod: api_key` records; explicit credential
+  export includes the key and effective region while ordinary account lists expose only
+  credential type, presence, and a mask.
+- **Existing-account multi-profile discovery and switching.** New authenticated
+  `GET/POST /admin/api/accounts/{id}/kiro-profiles` and
+  `POST /admin/api/accounts/{id}/kiro-profiles/auto` endpoints discover profiles across
+  deterministic candidate regions, report partial-region warnings, validate selections
+  against a fresh result, and atomically align a manual profile with its data-plane region.
+- **Hosted-SSO multi-profile choice.** Zero/one/multiple profile outcomes now preserve
+  lazy fallback, auto-cache one profile, or park the exchanged credential for explicit
+  selection. Pending credentials are TTL-bound, retry-safe after persistence failures,
+  consume-once after success, and cleared by cancellation. Overlapping polls and cancel
+  are serialized across the auth-session-to-choice handoff.
+- **Profile-aware model detection and routing.** Profile/region changes invalidate stale
+  per-account and aggregate model caches, refresh the selected profile's model list, and
+  route requested models only to compatible accounts. Non-pinned profiles can self-heal
+  once across regions after profile/plan authorization failures.
+- Added [docs/kiro-api-key-and-profiles.md](docs/kiro-api-key-and-profiles.md) covering
+  credentials, admin APIs, automatic region/profile selection, model routing, security
+  boundaries, migration, rollback, and the deferred multi-region-slot design.
 - **Import Microsoft 365 / Entra ID (Azure AD) credentials from the login helper.**
   Three converging paths now load a `CLIProxyAPI_*.json` file produced by
   `kiro-login-helper.py`, all funnelling through one `importOne` core so the
@@ -45,6 +73,11 @@ follows [Keep a Changelog](https://keepachangelog.com/).
   troubleshooting, credential recovery, diagnostics, logs, metrics, and security checks.
 
 ### Fixed
+- Profile ARN, manual-pin state, and data-plane region now form an atomic routing tuple.
+  Stale whole-account writers cannot overwrite a concurrent manual selection, and failed
+  durable writes roll back in-memory add, replacement, region, and profile mutations.
+- Kiro API-key and hosted-SSO commits retain the original pending credential and deadline
+  after a durable-write failure, allowing safe retry without re-entering secrets or login.
 - `external_idp` imports previously returned `400 "external IdP refresh requires
   clientId and tokenEndpoint"` because the import endpoint dropped `tokenEndpoint`,
   `issuerUrl`, `scopes`, and `profileArn`. The refresh-before-import step now carries
@@ -53,6 +86,13 @@ follows [Keep a Changelog](https://keepachangelog.com/).
   up front with an actionable message instead of an opaque refresh failure.
 
 ### Security
+- Kiro API keys are never mirrored into OAuth `accessToken`, returned by probe/commit or
+  ordinary account-list responses, or included in sanitized errors. Probe, commit, full
+  account, credential export, and config export responses disable caching. Full-account,
+  credential-export, config-export, and backup surfaces remain intentionally secret-bearing
+  operator channels and must be protected accordingly.
+- Legacy Kiro-key records normalize on load: `apikey` becomes `api_key`, duplicate
+  `accessToken == kiroApiKey` material is removed, and keyless API-key rows are disabled.
 - The account email is stored as a label only; the password is never persisted or
   sent upstream. Microsoft 365 tenants enforce MFA / Conditional Access, so a headless
   ROPC password grant is not a supported auth path — the interactive helper (browser

@@ -314,7 +314,8 @@ func (p *AccountPool) GetByID(id string) *config.Account {
 	defer p.mu.RUnlock()
 	for i := range p.accounts {
 		if p.accounts[i].ID == id {
-			return &p.accounts[i]
+			account := p.accounts[i]
+			return &account
 		}
 	}
 	return nil

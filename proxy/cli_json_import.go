@@ -17,7 +17,8 @@ type importCredentialRequest struct {
 	RefreshToken string
 	ClientID     string
 	ClientSecret string
-	AuthMethod   string // "idc" | "social" | "external_idp"
+	KiroAPIKey   string
+	AuthMethod   string // "idc" | "social" | "external_idp" | "api_key"
 	Provider     string // e.g. "AzureAD"
 	Region       string
 	// External IdP (enterprise SSO) refresh material.
@@ -49,6 +50,7 @@ type rawCredential struct {
 	TokenEndpointSnake string `json:"token_endpoint"`
 	IssuerURLSnake     string `json:"issuer_url"`
 	ProfileArnSnake    string `json:"profile_arn"`
+	KiroAPIKeySnake    string `json:"kiro_api_key"`
 
 	// camelCase (existing API / web UI)
 	AccessTokenCamel   string `json:"accessToken"`
@@ -59,6 +61,7 @@ type rawCredential struct {
 	TokenEndpointCamel string `json:"tokenEndpoint"`
 	IssuerURLCamel     string `json:"issuerUrl"`
 	ProfileArnCamel    string `json:"profileArn"`
+	KiroAPIKeyCamel    string `json:"kiroApiKey"`
 
 	// Shared / single-casing keys.
 	Scopes   string `json:"scopes"`
@@ -92,6 +95,8 @@ func firstNonEmpty(vals ...string) string {
 // present (external IdP material > IdC client secret > social).
 func normalizeAuthMethod(raw, tokenEndpoint, clientID, clientSecret string) string {
 	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "api_key", "apikey", "kiro_api_key", "kiroapikey":
+		return "api_key"
 	case "external_idp", "azure", "azuread", "entra", "entraid", "m365", "microsoft365", "microsoft":
 		return "external_idp"
 	case "idc", "builderid", "enterprise":
@@ -122,6 +127,8 @@ func providerWithDefault(authMethod, provider string) string {
 		return "BuilderId"
 	case "social":
 		return "Google"
+	case "api_key":
+		return "KiroAPIKey"
 	}
 	return ""
 }
@@ -137,6 +144,12 @@ func normalizeRawCredential(rc rawCredential) importCredentialRequest {
 	tokenEndpoint := firstNonEmpty(rc.TokenEndpointSnake, rc.TokenEndpointCamel)
 	issuerURL := firstNonEmpty(rc.IssuerURLSnake, rc.IssuerURLCamel)
 	profileArn := firstNonEmpty(rc.ProfileArnSnake, rc.ProfileArnCamel)
+	// Preserve API-key bytes exactly so strict validation can reject leading or
+	// trailing whitespace instead of normalization silently changing the secret.
+	kiroAPIKey := rc.KiroAPIKeySnake
+	if kiroAPIKey == "" {
+		kiroAPIKey = rc.KiroAPIKeyCamel
+	}
 	authMethodRaw := firstNonEmpty(rc.AuthMethodSnake, rc.AuthMethodCamel)
 
 	authMethod := normalizeAuthMethod(authMethodRaw, tokenEndpoint, clientID, clientSecret)
@@ -152,6 +165,7 @@ func normalizeRawCredential(rc rawCredential) importCredentialRequest {
 		RefreshToken:  refreshToken,
 		ClientID:      clientID,
 		ClientSecret:  clientSecret,
+		KiroAPIKey:    kiroAPIKey,
 		AuthMethod:    authMethod,
 		Provider:      provider,
 		Region:        region,

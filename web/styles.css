@@ -3960,6 +3960,69 @@ img.brand-icon {
   border-color: color-mix(in srgb, var(--warning) 55%, var(--border));
 }
 
+.profile-list {
+  display: grid;
+  gap: 0.625rem;
+}
+
+.profile-card {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+  padding: 0.7rem 0.8rem;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--card);
+}
+
+.profile-card--auto {
+  border-style: dashed;
+}
+
+.profile-card-body {
+  display: grid;
+  min-width: 0;
+  gap: 0.35rem;
+  color: var(--muted-foreground);
+  font-size: 0.8125rem;
+}
+
+.profile-card-head,
+.profile-badges {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+}
+
+.profile-card-head strong {
+  color: var(--foreground);
+}
+
+.profile-arn {
+  white-space: normal;
+  overflow-wrap: anywhere;
+  color: var(--foreground);
+  font-size: 0.75rem;
+}
+
+.profile-warning {
+  margin-bottom: 0;
+}
+
+.profile-warning ul {
+  margin: 0.35rem 0 0;
+  padding-left: 1.1rem;
+}
+
+@media (max-width: 640px) {
+  .profile-card {
+    align-items: stretch;
+    flex-direction: column;
+  }
+}
+
 .metrics-summary {
   display: flex;
   flex-wrap: wrap;

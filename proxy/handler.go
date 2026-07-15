@@ -92,6 +92,19 @@ type Handler struct {
 	rateLimiter *rateLimiter
 	// F5: in-process exact-match response cache (opt-in, non-stream only).
 	responseCache *responseCache
+	// Pending Kiro-issued API-key probes. Secrets live only in this TTL-bound,
+	// consume-once in-memory store until an operator commits one region.
+	kiroAPIKeyProbes   *kiroAPIKeyProbeStore
+	kiroAPIKeyProbesMu sync.Mutex
+	// Hosted-SSO credentials awaiting an explicit profile choice. The exchanged
+	// credential is TTL-bound, consume-once, and never persisted before selection.
+	kiroSsoProfileChoices   *kiroSsoProfileChoiceStore
+	kiroSsoProfileChoicesMu sync.Mutex
+	// Serializes hosted-SSO poll completion with cancellation. The auth package
+	// consumes its session before profile discovery/parking, so without this lock
+	// an overlapping poll could observe a transient "session not found" and a
+	// concurrent cancel could miss the not-yet-parked credential.
+	kiroSsoLifecycleMu sync.Mutex
 }
 
 type thinkingStreamSource int
@@ -327,12 +340,13 @@ func (h *Handler) refreshAllAccounts() {
 	accounts := config.GetAccounts()
 	for i := range accounts {
 		account := &accounts[i]
-		if !account.Enabled || account.AccessToken == "" {
+		if !account.Enabled || !account.HasUpstreamCredential() {
 			continue
 		}
 
-		// 检查 token 是否需要刷新
-		if account.ExpiresAt > 0 && time.Now().Unix() > account.ExpiresAt-tokenRefreshSkewSeconds {
+		// OAuth credentials refresh near expiry. Kiro API keys never enter
+		// the OAuth refresh lifecycle.
+		if account.CanRefreshUpstreamCredential() && account.ExpiresAt > 0 && time.Now().Unix() > account.ExpiresAt-tokenRefreshSkewSeconds {
 			newAccessToken, newRefreshToken, newExpiresAt, profileArn, err := auth.RefreshToken(account)
 			if err != nil {
 				logger.Warnf("[BackgroundRefresh] Token refresh failed for %s: %v", account.Email, err)
@@ -762,13 +776,23 @@ func (h *Handler) refreshModelsCache() {
 		aggregated = mergeUniqueModels(aggregated, accountModels)
 	}
 
+	// Always replace the aggregate, including with an empty result. Retaining the
+	// old list when every account fails would advertise stale models from a prior
+	// profile/region.
+	h.modelsCacheMu.Lock()
+	h.cachedModels = aggregated
+	h.modelsCacheTime = time.Now().Unix()
+	h.modelsCacheMu.Unlock()
 	if len(aggregated) > 0 {
-		h.modelsCacheMu.Lock()
-		h.cachedModels = aggregated
-		h.modelsCacheTime = time.Now().Unix()
-		h.modelsCacheMu.Unlock()
 		logger.Infof("[ModelsCache] Cached %d models", len(aggregated))
 	}
+}
+
+func (h *Handler) invalidateAggregatedModelsCache() {
+	h.modelsCacheMu.Lock()
+	h.cachedModels = nil
+	h.modelsCacheTime = 0
+	h.modelsCacheMu.Unlock()
 }
 
 // fetchAndCacheAccountModels 为单个账号拉取并写入模型缓存。
@@ -2545,6 +2569,9 @@ func (h *Handler) sendOpenAIError(w http.ResponseWriter, status int, errType, me
 
 // ensureValidToken 确保 token 有效
 func (h *Handler) ensureValidToken(account *config.Account) error {
+	if account == nil || account.IsKiroAPIKeyCredential() {
+		return nil
+	}
 	if account.ExpiresAt == 0 || time.Now().Unix() < account.ExpiresAt-tokenRefreshSkewSeconds {
 		return nil
 	}
@@ -2639,6 +2666,15 @@ func (h *Handler) handleAdminAPI(w http.ResponseWriter, r *http.Request) {
 	case strings.HasPrefix(path, "/accounts/") && strings.HasSuffix(path, "/models/refresh") && r.Method == "POST":
 		id := strings.TrimSuffix(strings.TrimPrefix(path, "/accounts/"), "/models/refresh")
 		h.apiRefreshAccountModels(w, r, id)
+	case strings.HasPrefix(path, "/accounts/") && strings.HasSuffix(path, "/kiro-profiles/auto") && r.Method == "POST":
+		id := strings.TrimSuffix(strings.TrimPrefix(path, "/accounts/"), "/kiro-profiles/auto")
+		h.apiAutoKiroProfile(w, r, id)
+	case strings.HasPrefix(path, "/accounts/") && strings.HasSuffix(path, "/kiro-profiles") && r.Method == "GET":
+		id := strings.TrimSuffix(strings.TrimPrefix(path, "/accounts/"), "/kiro-profiles")
+		h.apiGetKiroProfiles(w, r, id)
+	case strings.HasPrefix(path, "/accounts/") && strings.HasSuffix(path, "/kiro-profiles") && r.Method == "POST":
+		id := strings.TrimSuffix(strings.TrimPrefix(path, "/accounts/"), "/kiro-profiles")
+		h.apiSelectKiroProfile(w, r, id)
 	case strings.HasPrefix(path, "/accounts/") && strings.HasSuffix(path, "/refresh") && r.Method == "POST":
 		id := strings.TrimSuffix(strings.TrimPrefix(path, "/accounts/"), "/refresh")
 		h.apiRefreshAccount(w, r, id)
@@ -2678,8 +2714,14 @@ func (h *Handler) handleAdminAPI(w http.ResponseWriter, r *http.Request) {
 		h.apiStartKiroSso(w, r)
 	case path == "/auth/kiro-sso/poll" && r.Method == "POST":
 		h.apiPollKiroSso(w, r)
+	case path == "/auth/kiro-sso/profile" && r.Method == "POST":
+		h.apiFinalizeKiroSsoProfile(w, r)
 	case path == "/auth/kiro-sso/cancel" && r.Method == "POST":
 		h.apiCancelKiroSso(w, r)
+	case path == "/auth/kiro-api-key/probe" && r.Method == "POST":
+		h.apiProbeKiroAPIKey(w, r)
+	case path == "/auth/kiro-api-key/commit" && r.Method == "POST":
+		h.apiCommitKiroAPIKey(w, r)
 	case path == "/auth/sso-token" && r.Method == "POST":
 		h.apiImportSsoToken(w, r)
 	case path == "/auth/credentials" && r.Method == "POST":
@@ -2838,6 +2880,7 @@ func (h *Handler) apiRestoreConfigBackup(w http.ResponseWriter, r *http.Request)
 }
 
 func (h *Handler) apiExportConfig(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Cache-Control", "no-store")
 	data, err := config.ExportJSON()
 	if err != nil {
 		w.WriteHeader(http.StatusInternalServerError)
@@ -3050,7 +3093,10 @@ func (h *Handler) apiGetAccounts(w http.ResponseWriter, r *http.Request) {
 			"banReason":         a.BanReason,
 			"banTime":           a.BanTime,
 			"expiresAt":         a.ExpiresAt,
-			"hasToken":          a.AccessToken != "",
+			"hasToken":          a.HasUpstreamCredential(),
+			"credentialKind":    a.CredentialKind(),
+			"kiroApiKeyMask":    maskKiroIssuedAPIKey(a.KiroApiKey),
+			"profilePinned":     a.ProfilePinned,
 			"machineId":         a.MachineId,
 			"weight":            a.Weight,
 			"overageStatus":     a.OverageStatus,
@@ -3099,6 +3145,14 @@ func (h *Handler) apiAddAccount(w http.ResponseWriter, r *http.Request) {
 	if account.Region == "" {
 		account.Region = "us-east-1"
 	}
+	// Phase 1 establishes safe runtime support only. Do not persist a long-lived
+	// Kiro key through this generic whole-Account decoder; Phase 2 adds a
+	// probe/commit workflow that validates the key and region first.
+	if strings.TrimSpace(account.KiroApiKey) != "" || account.IsKiroAPIKeyCredential() {
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Kiro API-key onboarding is not enabled on this endpoint"})
+		return
+	}
 	// Validate/normalize the data-plane region override supplied at creation.
 	if account.RegionOverride != "" {
 		normalized, ok := validateRegionOverride(account.RegionOverride)
@@ -3118,7 +3172,7 @@ func (h *Handler) apiAddAccount(w http.ResponseWriter, r *http.Request) {
 
 	h.pool.Reload()
 	// 新账号若已启用且有 token，立即拉取并缓存模型列表
-	if account.Enabled && account.AccessToken != "" {
+	if account.Enabled && account.HasUpstreamCredential() {
 		go func(acc config.Account) {
 			if err := h.fetchAndCacheAccountModels(&acc); err != nil {
 				logger.Warnf("[ModelsCache] Auto-refresh failed for new account %s: %v", acc.Email, err)
@@ -3307,6 +3361,7 @@ func (h *Handler) apiUpdateAccount(w http.ResponseWriter, r *http.Request, id st
 		existing.RegionOverride = regionOverrideValue
 		if changed {
 			existing.ProfileArn = ""
+			existing.ProfilePinned = false
 			clearProfileArnResolutionCooldown(existing)
 			h.pool.ClearModelList(id)
 		} else if regionOverrideValue != "" && existing.ProfileArn != "" &&
@@ -3324,7 +3379,7 @@ func (h *Handler) apiUpdateAccount(w http.ResponseWriter, r *http.Request, id st
 
 	h.pool.Reload()
 	// 账号从禁用→启用时，自动拉取并缓存模型列表；或区域覆盖变更后重新拉取。
-	if existing.Enabled && existing.AccessToken != "" && ((!oldEnabled) || regionOverrideChanged) {
+	if existing.Enabled && existing.HasUpstreamCredential() && ((!oldEnabled) || regionOverrideChanged) {
 		go func(acc config.Account) {
 			if err := h.fetchAndCacheAccountModels(&acc); err != nil {
 				logger.Warnf("[ModelsCache] Auto-refresh failed for account %s: %v", acc.Email, err)
@@ -3452,7 +3507,7 @@ func (h *Handler) apiBatchAccounts(w http.ResponseWriter, r *http.Request) {
 		for _, a := range accounts {
 			if idSet[a.ID] {
 				// 记录本次从禁用→启用、且有 token 的账号
-				if enabled && !a.Enabled && a.AccessToken != "" {
+				if enabled && !a.Enabled && a.HasUpstreamCredential() {
 					toRefreshModels = append(toRefreshModels, a)
 				}
 				a.Enabled = enabled
@@ -3492,8 +3547,9 @@ func (h *Handler) apiBatchAccounts(w http.ResponseWriter, r *http.Request) {
 				failCount++
 				continue
 			}
-			// 刷新 token
-			if account.RefreshToken != "" {
+			// Refresh OAuth credentials only. Kiro API keys skip directly to
+			// metadata refresh below.
+			if account.CanRefreshUpstreamCredential() {
 				if newAccess, newRefresh, newExpires, profileArn, err := auth.RefreshToken(account); err == nil {
 					account.AccessToken = newAccess
 					if newRefresh != "" {
@@ -3734,12 +3790,16 @@ func (h *Handler) apiStartKiroSso(w http.ResponseWriter, r *http.Request) {
 // cancelled the modal), freeing the loopback callback port immediately instead of
 // waiting for the deadline.
 func (h *Handler) apiCancelKiroSso(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Cache-Control", "no-store")
 	var req struct {
 		SessionID string `json:"sessionId"`
 	}
 	json.NewDecoder(r.Body).Decode(&req)
 	if req.SessionID != "" {
+		h.kiroSsoLifecycleMu.Lock()
+		defer h.kiroSsoLifecycleMu.Unlock()
 		auth.CancelKiroSsoLogin(req.SessionID)
+		h.getKiroSsoProfileChoiceStore().cancel(req.SessionID)
 	}
 	json.NewEncoder(w).Encode(map[string]interface{}{"success": true})
 }
@@ -3750,6 +3810,7 @@ func (h *Handler) apiCancelKiroSso(w http.ResponseWriter, r *http.Request) {
 // returns completed=true. The profileArn is resolved lazily on first use (the EXTERNAL_IDP
 // token type header is now sent on CodeWhisperer calls), so it is not required here.
 func (h *Handler) apiPollKiroSso(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Cache-Control", "no-store")
 	var req struct {
 		SessionID string `json:"sessionId"`
 	}
@@ -3759,7 +3820,23 @@ func (h *Handler) apiPollKiroSso(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	result, status, err := auth.PollKiroSsoAuth(req.SessionID)
+	req.SessionID = strings.TrimSpace(req.SessionID)
+	if req.SessionID == "" {
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(map[string]string{"error": "sessionId is required"})
+		return
+	}
+	h.kiroSsoLifecycleMu.Lock()
+	defer h.kiroSsoLifecycleMu.Unlock()
+	// The auth session is consumed before an exchanged credential is parked.
+	// Repeated polls must therefore consult the pending-choice store while holding
+	// the lifecycle lock before attempting another auth poll.
+	if profiles, warnings, expiresAt, ok := h.pendingKiroSsoProfileChoice(req.SessionID); ok {
+		writeKiroSsoProfileChoice(w, profiles, warnings, expiresAt)
+		return
+	}
+
+	result, status, err := pollKiroSsoAuthForAdmin(req.SessionID)
 	if err != nil {
 		w.WriteHeader(400)
 		json.NewEncoder(w).Encode(map[string]interface{}{
@@ -3778,41 +3855,22 @@ func (h *Handler) apiPollKiroSso(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 授权完成，创建账号
-	account := config.Account{
-		ID:            auth.GenerateAccountID(),
-		Email:         result.Email,
-		AccessToken:   result.AccessToken,
-		RefreshToken:  result.RefreshToken,
-		ClientID:      result.ClientID,
-		AuthMethod:    result.AuthMethod,
-		Provider:      result.Provider,
-		Region:        result.Region,
-		ProfileArn:    result.ProfileArn,
-		TokenEndpoint: result.TokenEndpoint,
-		IssuerURL:     result.IssuerURL,
-		Scopes:        result.Scopes,
-		ExpiresAt:     time.Now().Unix() + int64(result.ExpiresIn),
-		Enabled:       true,
-		MachineId:     config.GenerateMachineId(),
+	if err := validateCompletedKiroSsoResult(result, status); err != nil {
+		w.WriteHeader(http.StatusBadGateway)
+		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		return
 	}
-
-	if err := config.AddAccount(account); err != nil {
+	account, profiles, warnings, expiresAt, err := h.processCompletedKiroSsoResult(req.SessionID, *result)
+	if err != nil {
 		w.WriteHeader(500)
 		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
 		return
 	}
-
-	h.pool.Reload()
-	json.NewEncoder(w).Encode(map[string]interface{}{
-		"success":   true,
-		"completed": true,
-		"account": map[string]interface{}{
-			"id":         account.ID,
-			"email":      account.Email,
-			"authMethod": account.AuthMethod,
-		},
-	})
+	if len(profiles) >= 2 {
+		writeKiroSsoProfileChoice(w, profiles, warnings, expiresAt)
+		return
+	}
+	writeKiroSsoCompleted(w, account)
 }
 
 func (h *Handler) apiImportSsoToken(w http.ResponseWriter, r *http.Request) {
@@ -3965,6 +4023,9 @@ func (h *Handler) importOne(req importCredentialRequest) (config.Account, error)
 		return config.Account{}, &importValidationError{"credential import is not valid"}
 	}
 	req = plan.Request
+	if req.AuthMethod == "api_key" {
+		return h.importKiroAPIKeyCredential(req)
+	}
 
 	var (
 		accessToken     string
@@ -4044,6 +4105,67 @@ func (h *Handler) importOne(req importCredentialRequest) (config.Account, error)
 	return account, nil
 }
 
+// importKiroAPIKeyCredential restores an explicitly exported Kiro-issued key
+// through the same live-validation and atomic-dedup invariants as interactive
+// probe/commit onboarding. It never routes API-key material through OAuth refresh.
+func (h *Handler) importKiroAPIKeyCredential(req importCredentialRequest) (config.Account, error) {
+	key, err := validateKiroIssuedAPIKey(req.KiroAPIKey)
+	if err != nil {
+		return config.Account{}, &importValidationError{err.Error()}
+	}
+	region, ok := validateRegionOverride(req.Region)
+	if !ok || region == "" {
+		return config.Account{}, &importValidationError{"api_key import requires a valid selected region"}
+	}
+	probe := &config.Account{
+		AuthMethod: "api_key", Provider: "KiroAPIKey", KiroApiKey: key,
+		Region: region, RegionOverride: region, MachineId: config.GenerateMachineId(),
+	}
+	info, probeErr := probeKiroAPIKeyAccount(probe)
+	if probeErr != nil || info == nil {
+		if probeErr == nil {
+			probeErr = fmt.Errorf("empty upstream probe result")
+		}
+		return config.Account{}, &importValidationError{
+			"Kiro API key validation failed: " + classifyKiroAPIKeyProbeError(probeErr),
+		}
+	}
+
+	accountID := strings.TrimSpace(req.ID)
+	if accountID == "" || config.AccountIDExists(accountID) {
+		accountID = auth.GenerateAccountID()
+	}
+	email := strings.TrimSpace(info.Email)
+	if email == "" {
+		email = strings.TrimSpace(req.Email)
+	}
+	account := config.Account{
+		ID: accountID, Email: email, UserId: strings.TrimSpace(info.UserId),
+		Nickname: strings.TrimSpace(req.Nickname), KiroApiKey: key,
+		AuthMethod: "api_key", Provider: "KiroAPIKey", Region: region,
+		RegionOverride: region, MachineId: config.GenerateMachineId(), Enabled: true,
+		BanStatus: "ACTIVE", ExpiresAt: 0, SubscriptionType: info.SubscriptionType,
+		SubscriptionTitle: info.SubscriptionTitle, UsageCurrent: info.UsageCurrent,
+		UsageLimit: info.UsageLimit, NextResetDate: info.NextResetDate, LastRefresh: time.Now().Unix(),
+	}
+	if strings.TrimSpace(req.UserID) != "" && account.UserId == "" {
+		account.UserId = strings.TrimSpace(req.UserID)
+	}
+	if account.UsageLimit > 0 {
+		account.UsagePercent = account.UsageCurrent / account.UsageLimit
+	}
+	existing, added, err := config.AddKiroAPIKeyAccountIfAbsent(account)
+	if err != nil {
+		return config.Account{}, err
+	}
+	if !added {
+		return config.Account{}, &importValidationError{
+			fmt.Sprintf("Kiro API-key account already exists for this identity and region (account %s)", existing.ID),
+		}
+	}
+	return account, nil
+}
+
 // pickProfileArn prefers a freshly-resolved ARN, falling back to the one the
 // helper persisted, then empty (resolved lazily on first use).
 func pickProfileArn(resolved, fromHelper string) string {
@@ -4093,6 +4215,7 @@ type importPreviewItem struct {
 	HasAccessToken       bool                    `json:"hasAccessToken"`
 	HasClientID          bool                    `json:"hasClientId"`
 	HasClientSecret      bool                    `json:"hasClientSecret"`
+	HasKiroAPIKey        bool                    `json:"hasKiroApiKey"`
 	Derived              importDerivedInfo       `json:"derived"`
 	Validation           importValidationInfo    `json:"validation"`
 	ImportMode           string                  `json:"importMode"`
@@ -4116,8 +4239,26 @@ func buildImportPlan(index int, req importCredentialRequest) importPreviewItem {
 		req.Region = "us-east-1"
 	}
 	req.AuthMethod = normalizeAuthMethod(req.AuthMethod, req.TokenEndpoint, req.ClientID, req.ClientSecret)
+	if req.AuthMethod == "api_key" {
+		if _, err := validateKiroIssuedAPIKey(req.KiroAPIKey); err != nil {
+			plan.Errors = append(plan.Errors, err.Error())
+		}
+		if strings.TrimSpace(req.AccessToken) != "" || strings.TrimSpace(req.RefreshToken) != "" ||
+			strings.TrimSpace(req.ClientID) != "" || strings.TrimSpace(req.ClientSecret) != "" ||
+			strings.TrimSpace(req.TokenEndpoint) != "" {
+			plan.Errors = append(plan.Errors, "api_key import must not include OAuth credential material")
+		}
+		if region, ok := validateRegionOverride(req.Region); !ok || region == "" {
+			plan.Errors = append(plan.Errors, "api_key import requires a valid selected region")
+		} else {
+			req.Region = region
+		}
+	} else if req.KiroAPIKey != "" {
+		plan.Errors = append(plan.Errors, "kiroApiKey requires authMethod=api_key")
+	}
 	derivedTE, derivedIss, derivedScopes := auth.DeriveExternalIdpEndpoints(req.UserID, req.ClientID, req.AccessToken)
-	if derivedTE != "" && auth.ValidateExternalIdpEndpoint(derivedTE) == nil && req.AuthMethod != "external_idp" {
+	if derivedTE != "" && auth.ValidateExternalIdpEndpoint(derivedTE) == nil &&
+		req.AuthMethod != "external_idp" && req.AuthMethod != "api_key" {
 		req.AuthMethod = "external_idp"
 	}
 	if req.AuthMethod == "external_idp" {
@@ -4162,12 +4303,15 @@ func buildImportPlan(index int, req importCredentialRequest) importPreviewItem {
 			}
 		}
 	}
-	if strings.TrimSpace(req.RefreshToken) == "" {
+	if req.AuthMethod != "api_key" && strings.TrimSpace(req.RefreshToken) == "" {
 		plan.Errors = append(plan.Errors, "refreshToken is required")
 	}
 	plan.JWTExpiresAt = auth.ExpFromAccessTokenJWT(req.AccessToken)
 	plan.TrustOnImport = req.AuthMethod == "external_idp" && strings.TrimSpace(req.AccessToken) != "" && plan.JWTExpiresAt > 0
 	plan.ImportMode = "live_refresh"
+	if req.AuthMethod == "api_key" {
+		plan.ImportMode = "live_api_key_probe"
+	}
 	if plan.TrustOnImport {
 		plan.ImportMode = "trust_access_token_exp"
 		plan.Warnings = append(plan.Warnings, "access token JWT exp can be used without a live refresh, but it does not prove the token is accepted upstream")
@@ -4193,6 +4337,7 @@ func buildImportPlan(index int, req importCredentialRequest) importPreviewItem {
 	plan.HasAccessToken = strings.TrimSpace(req.AccessToken) != ""
 	plan.HasClientID = strings.TrimSpace(req.ClientID) != ""
 	plan.HasClientSecret = strings.TrimSpace(req.ClientSecret) != ""
+	plan.HasKiroAPIKey = strings.TrimSpace(req.KiroAPIKey) != ""
 	for _, acc := range config.GetAccounts() {
 		if email != "" && strings.EqualFold(strings.TrimSpace(acc.Email), email) {
 			plan.WillReplaceEmail = true
@@ -4302,7 +4447,7 @@ func (h *Handler) apiApplyCredentials(w http.ResponseWriter, r *http.Request) {
 			}
 			newID := account.ID
 			account.ID = decision.ExistingAccountID
-			if err := config.UpdateAccount(decision.ExistingAccountID, account); err != nil {
+			if err := config.ReplaceAccount(decision.ExistingAccountID, account); err != nil {
 				errs = append(errs, fmt.Sprintf("item %d: replace failed: %s", i+1, err.Error()))
 				continue
 			}
@@ -4940,7 +5085,7 @@ func (h *Handler) apiRefreshAccount(w http.ResponseWriter, r *http.Request, id s
 
 	// 先尝试刷新 token（不管是否过期，确保 token 有效）
 	refreshTokenIfNeeded := func() error {
-		if account.RefreshToken == "" {
+		if !account.CanRefreshUpstreamCredential() {
 			return nil
 		}
 		newAccessToken, newRefreshToken, newExpiresAt, profileArn, err := auth.RefreshToken(account)
@@ -5022,6 +5167,7 @@ func (h *Handler) apiRefreshAccount(w http.ResponseWriter, r *http.Request, id s
 
 // apiGetAccountFull 获取单个账号的完整信息（包含敏感字段）
 func (h *Handler) apiGetAccountFull(w http.ResponseWriter, r *http.Request, id string) {
+	w.Header().Set("Cache-Control", "no-store")
 	accounts := config.GetAccounts()
 	poolAccounts := h.pool.GetAllAccounts()
 
@@ -5059,9 +5205,13 @@ func (h *Handler) apiGetAccountFull(w http.ResponseWriter, r *http.Request, id s
 		"refreshToken":      account.RefreshToken,
 		"clientId":          account.ClientID,
 		"clientSecret":      account.ClientSecret,
+		"kiroApiKey":        account.KiroApiKey,
 		"authMethod":        account.AuthMethod,
 		"provider":          account.Provider,
 		"region":            account.Region,
+		"regionOverride":    account.RegionOverride,
+		"profileArn":        account.ProfileArn,
+		"profilePinned":     account.ProfilePinned,
 		"expiresAt":         account.ExpiresAt,
 		"machineId":         account.MachineId,
 		"weight":            account.Weight,
@@ -5306,6 +5456,7 @@ func (h *Handler) apiGetVersion(w http.ResponseWriter, r *http.Request) {
 
 // apiExportAccounts 导出账号凭证
 func (h *Handler) apiExportAccounts(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Cache-Control", "no-store")
 	var req struct {
 		IDs []string `json:"ids"` // 为空则导出全部
 	}
@@ -5338,6 +5489,7 @@ func (h *Handler) apiExportAccounts(w http.ResponseWriter, r *http.Request) {
 		RefreshToken string `json:"refreshToken"`
 		ClientID     string `json:"clientId,omitempty"`
 		ClientSecret string `json:"clientSecret,omitempty"`
+		KiroAPIKey   string `json:"kiroApiKey,omitempty"`
 		Region       string `json:"region,omitempty"`
 		ExpiresAt    int64  `json:"expiresAt"`
 		AuthMethod   string `json:"authMethod,omitempty"`
@@ -5414,6 +5566,10 @@ func (h *Handler) apiExportAccounts(w http.ResponseWriter, r *http.Request) {
 			subType = "Pro_Plus"
 		}
 
+		exportRegion := a.Region
+		if a.IsKiroAPIKeyCredential() {
+			exportRegion = accountDataPlaneRegionForResponse(a)
+		}
 		exportAccounts = append(exportAccounts, ExportAccount{
 			ID:        a.ID,
 			Email:     a.Email,
@@ -5427,7 +5583,8 @@ func (h *Handler) apiExportAccounts(w http.ResponseWriter, r *http.Request) {
 				RefreshToken: a.RefreshToken,
 				ClientID:     a.ClientID,
 				ClientSecret: a.ClientSecret,
-				Region:       a.Region,
+				KiroAPIKey:   a.KiroApiKey,
+				Region:       exportRegion,
 				ExpiresAt:    a.ExpiresAt * 1000, // 转为毫秒时间戳
 				AuthMethod:   authMethod,
 				Provider:     a.Provider,
