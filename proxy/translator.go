@@ -8,6 +8,7 @@ import (
 	"regexp"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/google/uuid"
 )
@@ -39,8 +40,52 @@ var modelAliases = []modelMapping{
 var claudeVersionPattern = regexp.MustCompile(`claude-(opus|sonnet|haiku)-(\d+)-(\d{1,2})\b`)
 
 // Thinking 模式提示
+//
+// ThinkingModePrompt is the directive used when the client enables thinking
+// without naming a budget (e.g. via the -thinking model suffix, or adaptive
+// mode). defaultMaxThinkingLength must stay in sync with the literal below so
+// the no-budget path is byte-identical to its historical output.
 const ThinkingModePrompt = `<thinking_mode>enabled</thinking_mode>
 <max_thinking_length>200000</max_thinking_length>`
+
+const defaultMaxThinkingLength = 200000
+
+// thinkingModePromptForBudget renders the thinking directive for an explicit
+// client budget.
+//
+// Kiro's upstream request has no thinking-budget field: InferenceConfig carries
+// only maxTokens, temperature, and topP. The <max_thinking_length> directive in
+// the system prompt is therefore the ONLY channel through which a client's
+// thinking.budget_tokens can reach the model. Before this existed the directive
+// was a hardcoded 200000, so budget_tokens was validated and then dropped, and a
+// request asking for 1024 produced byte-identical upstream bytes to one asking
+// for 64000.
+//
+// A non-positive budget yields the unchanged default, keeping existing
+// deployments byte-for-byte stable.
+func thinkingModePromptForBudget(budget int) string {
+	if budget <= 0 || budget == defaultMaxThinkingLength {
+		return ThinkingModePrompt
+	}
+	return fmt.Sprintf("<thinking_mode>enabled</thinking_mode>\n<max_thinking_length>%d</max_thinking_length>", budget)
+}
+
+// claudeThinkingBudget returns the client's explicit thinking budget, or 0 when
+// none applies. Only type=="enabled" carries a budget: validation rejects
+// budget_tokens on adaptive and disabled, so those must fall back to the
+// default directive rather than silently inheriting a stale number.
+func claudeThinkingBudget(cfg *ClaudeThinkingConfig) int {
+	if cfg == nil {
+		return 0
+	}
+	if !strings.EqualFold(strings.TrimSpace(cfg.Type), "enabled") {
+		return 0
+	}
+	if cfg.BudgetTokens <= 0 {
+		return 0
+	}
+	return cfg.BudgetTokens
+}
 
 const minimalFallbackUserContent = "."
 
@@ -55,6 +100,41 @@ const assistantPrefillContinuation = "Continue."
 const toolResultsContinuationPrefix = "Tool results:"
 const toolResultImagePlaceholder = "[Tool returned an image; the image is attached to this message.]"
 
+// toolResultErrorPrefix marks a tool result whose tool FAILED.
+//
+// Anthropic signals this with tool_result.is_error and OpenAI-compatible clients
+// carry the equivalent in the tool message; both were discarded, so a failed tool
+// reached the model looking exactly like a successful one. The model then builds
+// on broken output — a stack trace read as data, a non-existent file treated as
+// empty — instead of retrying or repairing. That matters most in agentic loops,
+// where one unmarked failure derails every following turn.
+const toolResultErrorPrefix = "[Tool execution FAILED. The following is an error, not a successful result.]"
+
+// isClaudeToolResultError reports whether an Anthropic tool_result block is
+// flagged as an error. JSON decodes booleans to bool, but a client may also send
+// the string "true", so both are accepted.
+func isClaudeToolResultError(block map[string]interface{}) bool {
+	switch v := block["is_error"].(type) {
+	case bool:
+		return v
+	case string:
+		return strings.EqualFold(strings.TrimSpace(v), "true")
+	}
+	return false
+}
+
+// markToolResultFailed prefixes tool-result text with the failure marker,
+// preserving the original content (which usually holds the error detail).
+func markToolResultFailed(content string) string {
+	if strings.TrimSpace(content) == "" {
+		return toolResultErrorPrefix
+	}
+	if strings.HasPrefix(content, toolResultErrorPrefix) {
+		return content
+	}
+	return toolResultErrorPrefix + "\n" + content
+}
+
 // maxPayloadBytes is the upper bound for the serialized Kiro request body.
 // Kiro's upstream rejects oversized requests with HTTP 400
 // "Input is too long." (CONTENT_LENGTH_EXCEEDS_THRESHOLD). When a converted
@@ -64,6 +144,35 @@ const toolResultImagePlaceholder = "[Tool returned an image; the image is attach
 // The limit is kept conservatively below the observed upstream threshold to
 // leave room for headers and minor serialization overhead.
 const maxPayloadBytes = 900 * 1024
+
+// truncateBytesRuneSafe cuts s to at most limit BYTES without splitting a
+// multi-byte UTF-8 rune.
+//
+// Every truncation in this file is byte-bounded because the upstream limit is a
+// byte limit, but a plain s[:limit] can land in the middle of a rune and emit a
+// lone continuation byte. That produces invalid UTF-8 in the JSON request body,
+// which upstream may reject outright or decode as U+FFFD — silently corrupting
+// the last character of a tool description, tool result, or user message. Any
+// non-ASCII text (CJK, accented Latin, emoji) can hit this; ASCII never does,
+// which is why it went unnoticed.
+//
+// Trailing incomplete runes are dropped, so the result is always <= limit bytes
+// and always valid UTF-8.
+func truncateBytesRuneSafe(s string, limit int) string {
+	if limit <= 0 {
+		return ""
+	}
+	if len(s) <= limit {
+		return s
+	}
+	cut := limit
+	// Walk back over continuation bytes (0b10xxxxxx) to the rune boundary.
+	for cut > 0 && !utf8.RuneStart(s[cut]) {
+		cut--
+	}
+	// cut now indexes a rune start (or 0); everything before it is complete.
+	return s[:cut]
+}
 
 // truncationPlaceholder is inserted in history where older turns were dropped to
 // fit within maxPayloadBytes.
@@ -163,6 +272,11 @@ type ClaudeContentBlock struct {
 	ToolUseID string       `json:"tool_use_id,omitempty"`
 	Content   interface{}  `json:"content,omitempty"` // for tool_result
 	Source    *ImageSource `json:"source,omitempty"`
+	// CacheControl carries an Anthropic prompt-cache marker on an individual
+	// content block. Like ClaudeTool.CacheControl it must be declared here or
+	// the marker is dropped at decode and the block can never act as a cache
+	// breakpoint.
+	CacheControl map[string]interface{} `json:"cache_control,omitempty"`
 }
 
 type ImageSource struct {
@@ -175,6 +289,16 @@ type ClaudeTool struct {
 	Name        string      `json:"name"`
 	Description string      `json:"description"`
 	InputSchema interface{} `json:"input_schema"`
+	// CacheControl carries an Anthropic prompt-cache marker, e.g.
+	// {"type":"ephemeral"} or {"type":"ephemeral","ttl":"1h"}.
+	//
+	// This field must exist for prompt caching to work at all on tool
+	// definitions. Without it the marker was silently discarded at decode
+	// time, so extractPromptCacheTTL could never find it no matter how the
+	// client asked — and tool schemas are the LARGEST stable prefix in an
+	// agentic request (the same 15-20 schemas ship on every turn), making it
+	// the single biggest cache saving available.
+	CacheControl map[string]interface{} `json:"cache_control,omitempty"`
 }
 
 type ClaudeResponse struct {
@@ -230,7 +354,7 @@ func ClaudeToKiro(req *ClaudeRequest, thinking bool) *KiroPayload {
 	origin := "AI_EDITOR"
 
 	// 提取系统提示
-	systemPrompt := buildClaudeSystemPrompt(req.System, thinking)
+	systemPrompt := buildClaudeSystemPrompt(req.System, thinking, claudeThinkingBudget(req.Thinking))
 
 	// 构建历史消息
 	history := make([]KiroHistoryMessage, 0)
@@ -383,16 +507,21 @@ func ClaudeToKiro(req *ClaudeRequest, thinking bool) *KiroPayload {
 	return payload
 }
 
-func buildClaudeSystemPrompt(system interface{}, thinking bool) string {
+// buildClaudeSystemPrompt renders the system prompt actually sent upstream.
+// thinkingBudget is the client's explicit thinking.budget_tokens (0 when none),
+// which is conveyed through the <max_thinking_length> directive because the
+// upstream payload has no budget field.
+func buildClaudeSystemPrompt(system interface{}, thinking bool, thinkingBudget int) string {
 	systemPrompt := extractSystemPrompt(system)
 	systemPrompt = applyPromptFilters(systemPrompt)
 	if !thinking {
 		return systemPrompt
 	}
+	directive := thinkingModePromptForBudget(thinkingBudget)
 	if systemPrompt == "" {
-		return ThinkingModePrompt
+		return directive
 	}
-	return ThinkingModePrompt + "\n\n" + systemPrompt
+	return directive + "\n\n" + systemPrompt
 }
 
 // applyPromptFilters applies all enabled prompt filter rules to the system prompt.
@@ -607,13 +736,19 @@ func cloneClaudeRequestForThinking(req *ClaudeRequest, thinking bool) *ClaudeReq
 
 	cloned := *req
 	if thinking {
-		cloned.System = prependThinkingSystem(req.System)
+		// Must use the SAME directive bytes as ClaudeToKiro: this clone feeds the
+		// input-token estimate and the prompt-cache fingerprint, so a different
+		// budget here would fingerprint content that never ships upstream.
+		cloned.System = prependThinkingSystem(req.System, claudeThinkingBudget(req.Thinking))
 	}
 	return &cloned
 }
 
-func prependThinkingSystem(system interface{}) interface{} {
-	thinkingText := ThinkingModePrompt
+// prependThinkingSystem injects the thinking directive ahead of the client's
+// system content. thinkingBudget is the client's explicit thinking.budget_tokens
+// (0 for the default), and must match what ClaudeToKiro sends upstream.
+func prependThinkingSystem(system interface{}, thinkingBudget int) interface{} {
+	thinkingText := thinkingModePromptForBudget(thinkingBudget)
 	if hasClaudeSystemContent(system) {
 		thinkingText += "\n"
 	}
@@ -726,6 +861,20 @@ func extractClaudeUserContent(content interface{}) (string, []KiroImage, []KiroT
 					if strings.TrimSpace(resultContent) == "" {
 						resultContent = toolResultImagePlaceholder
 					}
+				}
+				// Anthropic's tool_result carries is_error to say the tool FAILED.
+				// It was dropped entirely, so a failed tool was indistinguishable
+				// from a successful one and the model would build on broken output
+				// instead of retrying or repairing.
+				//
+				// The marker goes in the content rather than in Status: the set of
+				// status values Kiro accepts is not documented in this repo and
+				// could not be verified, so sending an unaccepted enum risks
+				// 400-ing every failed tool turn. Content is free text (the same
+				// channel toolResultImagePlaceholder already uses), so this is
+				// lossless and cannot be rejected.
+				if isClaudeToolResultError(block) {
+					resultContent = markToolResultFailed(resultContent)
 				}
 				toolResults = append(toolResults, KiroToolResult{
 					ToolUseID: toolUseID,
@@ -860,7 +1009,7 @@ func convertClaudeTools(tools []ClaudeTool) ([]KiroToolWrapper, map[string]strin
 	for _, tool := range tools {
 		desc := tool.Description
 		if len(desc) > maxToolDescLen {
-			desc = desc[:maxToolDescLen] + "..."
+			desc = truncateBytesRuneSafe(desc, maxToolDescLen) + "..."
 		}
 		sanitized := shortenToolName(sanitizeToolName(tool.Name))
 		if sanitized != tool.Name {
@@ -1843,7 +1992,12 @@ func truncateCurrentMessage(payload *KiroPayload) {
 			cur.Content = minimalFallbackUserContent
 			return
 		}
-		cur.Content = cur.Content[:budget]
+		cur.Content = truncateBytesRuneSafe(cur.Content, budget)
+		if cur.Content == "" {
+			// The budget was smaller than the first rune; send the minimal
+			// placeholder rather than an empty message, which Kiro rejects.
+			cur.Content = minimalFallbackUserContent
+		}
 	}
 }
 
@@ -1870,7 +2024,7 @@ func buildToolResultsContinuation(toolResults []KiroToolResult) string {
 
 	joined := toolResultsContinuationPrefix + "\n\n" + strings.Join(parts, "\n\n")
 	if len(joined) > 4000 {
-		return joined[:4000]
+		return truncateBytesRuneSafe(joined, 4000)
 	}
 	return joined
 }
@@ -2108,7 +2262,7 @@ func convertOpenAITools(tools []OpenAITool) []KiroToolWrapper {
 		}
 		desc := tool.Function.Description
 		if len(desc) > maxToolDescLen {
-			desc = desc[:maxToolDescLen] + "..."
+			desc = truncateBytesRuneSafe(desc, maxToolDescLen) + "..."
 		}
 		name := shortenToolName(tool.Function.Name)
 		if strings.TrimSpace(name) == "" {

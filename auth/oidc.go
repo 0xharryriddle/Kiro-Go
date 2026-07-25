@@ -124,7 +124,13 @@ func postExternalIdpToken(client *http.Client, tokenEndpoint string, form url.Va
 		if out.Error != "" {
 			return "", "", 0, fmt.Errorf("external IdP token exchange failed (status %d): %s: %s", resp.StatusCode, out.Error, out.ErrorDesc)
 		}
-		return "", "", 0, fmt.Errorf("external IdP token exchange failed (status %d): %s", resp.StatusCode, string(body))
+		// Never echo the raw body. This branch is also reached on a 2xx that simply
+		// lacks access_token, and such a body legitimately carries refresh_token —
+		// so stringifying it wrote a live credential into an error that
+		// proxy/handler.go logs verbatim on every background refresh failure.
+		// Report only the status and the response size, which is enough to
+		// diagnose a malformed token response without persisting a secret.
+		return "", "", 0, fmt.Errorf("external IdP token exchange failed (status %d): unexpected token response (%d bytes, no access_token)", resp.StatusCode, len(body))
 	}
 	return out.AccessToken, out.RefreshToken, out.ExpiresIn, nil
 }

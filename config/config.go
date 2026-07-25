@@ -496,9 +496,28 @@ var (
 
 // Init initializes the configuration system with the specified file path.
 // If the file doesn't exist, a default configuration is created.
+//
+// The path is published under cfgLock. Every other cfgPath access already holds
+// that lock (Save reads it while the caller holds the write lock), but Init used
+// to assign the global directly with no synchronisation. Because Save is reached
+// from detached goroutines — pool.UpdateStats persists via
+// `go config.UpdateAccountStats(...)` — that unsynchronised write raced with a
+// background persist reading the path, which the race detector flagged at
+// config.go:500 vs config.go:692.
+//
+// The lock is released before Load() because Load acquires cfgLock itself.
 func Init(path string) error {
+	cfgLock.Lock()
 	cfgPath = path
+	cfgLock.Unlock()
 	return Load()
+}
+
+// configPath returns the currently configured file path under the read lock.
+func configPath() string {
+	cfgLock.RLock()
+	defer cfgLock.RUnlock()
+	return cfgPath
 }
 
 func Load() error {
@@ -1398,16 +1417,49 @@ func GetStats() (int, int, int, int, float64) {
 	return cfg.TotalRequests, cfg.SuccessRequests, cfg.FailedRequests, cfg.TotalTokens, cfg.TotalCredits
 }
 
+// UpdateAccountStats persists an ABSOLUTE counter snapshot for one account.
+//
+// The sole caller (pool.UpdateStats) computes the snapshot under the pool lock
+// and then persists it from a detached goroutine, so two snapshots can land here
+// out of order. Assigning unconditionally let an older snapshot overwrite a newer
+// one, and because these are cumulative counters that showed up as the persisted
+// request/token/credit totals moving BACKWARDS relative to the in-memory pool —
+// under-reporting usage and credits in the admin panel and on disk.
+//
+// Counters are therefore applied monotonically: a snapshot may only advance them.
+// This is safe because every counter here is cumulative and only ever grows for a
+// given account; the per-account stats are never reset through this function
+// (apiResetStats clears the GLOBAL totals via UpdateStats instead).
 func UpdateAccountStats(id string, requestCount, errorCount, totalTokens int, totalCredits float64, lastUsed int64) error {
 	cfgLock.Lock()
 	defer cfgLock.Unlock()
 	for i, a := range cfg.Accounts {
 		if a.ID == id {
-			cfg.Accounts[i].RequestCount = requestCount
-			cfg.Accounts[i].ErrorCount = errorCount
-			cfg.Accounts[i].TotalTokens = totalTokens
-			cfg.Accounts[i].TotalCredits = totalCredits
-			cfg.Accounts[i].LastUsed = lastUsed
+			changed := false
+			if requestCount > cfg.Accounts[i].RequestCount {
+				cfg.Accounts[i].RequestCount = requestCount
+				changed = true
+			}
+			if errorCount > cfg.Accounts[i].ErrorCount {
+				cfg.Accounts[i].ErrorCount = errorCount
+				changed = true
+			}
+			if totalTokens > cfg.Accounts[i].TotalTokens {
+				cfg.Accounts[i].TotalTokens = totalTokens
+				changed = true
+			}
+			if totalCredits > cfg.Accounts[i].TotalCredits {
+				cfg.Accounts[i].TotalCredits = totalCredits
+				changed = true
+			}
+			if lastUsed > cfg.Accounts[i].LastUsed {
+				cfg.Accounts[i].LastUsed = lastUsed
+				changed = true
+			}
+			if !changed {
+				// Stale snapshot carrying nothing new: skip the disk write.
+				return nil
+			}
 			return Save()
 		}
 	}

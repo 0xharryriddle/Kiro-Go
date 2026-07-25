@@ -515,10 +515,16 @@ func (h *Handler) handleResponsesStream(
 		tr.applyDiagnostics(att, &diag)
 		if err != nil {
 			tr.endAttempt(att, err)
+			// Attribute the failure to the account on EVERY path. Previously this
+			// only ran in the !responseStarted branch, so an upstream that died
+			// after the first bytes were flushed was never recorded against the
+			// account: no cooldown, no error count, so the pool kept routing to a
+			// broken account. The sibling Claude and OpenAI stream routes both
+			// record unconditionally.
+			excluded[account.ID] = true
+			h.handleAccountFailure(account, err)
 			if !responseStarted {
 				lastErr = err
-				excluded[account.ID] = true
-				h.handleAccountFailure(account, err)
 				continue
 			}
 			send("response.failed", map[string]interface{}{
@@ -532,6 +538,11 @@ func (h *Handler) handleResponsesStream(
 					},
 				},
 			})
+			// Terminate the SSE stream. The success path sends [DONE]; without it
+			// here a client that consumes until the sentinel keeps waiting on a
+			// stream that will never produce another byte.
+			fmt.Fprintf(w, "data: [DONE]\n\n")
+			flusher.Flush()
 			h.emitTrace(tr, outcomeError, statusForUpstreamError(err))
 			return
 		}
@@ -614,6 +625,10 @@ func (h *Handler) handleResponsesStream(
 		return
 	}
 
+	// Both terminal failure paths below must also close the SSE stream with the
+	// [DONE] sentinel, for the same reason as the mid-stream path above: the
+	// initial response.created event has already been sent, so the client is
+	// consuming a stream and needs an explicit end marker.
 	if lastErr == nil {
 		send("response.failed", map[string]interface{}{
 			"type": "response.failed",
@@ -626,6 +641,8 @@ func (h *Handler) handleResponsesStream(
 				},
 			},
 		})
+		fmt.Fprintf(w, "data: [DONE]\n\n")
+		flusher.Flush()
 		return
 	}
 	h.emitTrace(tr, outcomeError, http.StatusInternalServerError)
@@ -640,4 +657,6 @@ func (h *Handler) handleResponsesStream(
 			},
 		},
 	})
+	fmt.Fprintf(w, "data: [DONE]\n\n")
+	flusher.Flush()
 }

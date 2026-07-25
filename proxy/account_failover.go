@@ -4,6 +4,8 @@ import (
 	"kiro-go/config"
 	"kiro-go/logger"
 	"net/http"
+	"regexp"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -82,18 +84,92 @@ func isProfileUnavailableErrorMessage(msg string) bool {
 	return strings.Contains(msg, "no available kiro profile")
 }
 
+// upstreamStatusPatterns match the authoritative HTTP status in an upstream error
+// string. The status is structural — the code that formats these errors puts it
+// there — whereas everything after it is an opaque upstream response body.
+//
+// Three formats exist in the codebase and all three must be recognised, because a
+// format that is NOT matched falls back to scanning the body and can ban a healthy
+// account:
+//
+//	"HTTP 500 from kiro: <body>"                     proxy/kiro.go
+//	"refresh failed: 500 <body>"                     auth/oidc.go
+//	"social token exchange failed (status 503): ..."  auth/kiro_sso.go
+var upstreamStatusPatterns = []*regexp.Regexp{
+	regexp.MustCompile(`(?i)\bhttp (\d{3})\b`),
+	regexp.MustCompile(`(?i)refresh failed:\s*(\d{3})\b`),
+	regexp.MustCompile(`(?i)\(status (\d{3})\)`),
+}
+
+// upstreamStatusFromMessage returns the HTTP status carried by an upstream error
+// message and whether one was found.
+func upstreamStatusFromMessage(lower string) (int, bool) {
+	for _, re := range upstreamStatusPatterns {
+		if m := re.FindStringSubmatch(lower); m != nil {
+			if status, err := strconv.Atoi(m[1]); err == nil {
+				return status, true
+			}
+		}
+	}
+	return 0, false
+}
+
+// authErrorNarrowMarkers are phrases specific enough that they identify a
+// credential failure on their own, even without a 401/403 status: they name an
+// OAuth/token grant condition rather than describing permissions in prose.
+var authErrorNarrowMarkers = []string{
+	"invalid_grant",
+	"invalid grant",
+	"invalid_token",
+	"authentication failed",
+	"access token expired",
+	"refresh token expired",
+}
+
+// isAuthErrorMessage reports whether an upstream error means THIS account's
+// credentials are bad. The answer is load-bearing: handleAccountFailure routes a
+// true here to disableAccount(..., "BANNED", ...), a permanent ban only an
+// operator can lift, and statusForUpstreamError turns it into a client-facing 401.
+//
+// It used to substring-match bare words ("unauthorized", "forbidden", "token
+// expired") anywhere in the message. Because the message embeds the FULL upstream
+// response body, any unrelated 5xx whose body merely mentioned one of those words
+// — an upstream stack trace, a WAF/gateway HTML page, a JSON error about some
+// other resource's permissions — permanently banned a perfectly healthy account
+// and reported the outage to the client as an auth error.
+//
+// The status token is authoritative, so when one is present it decides; the body
+// only gets a vote through the narrow markers above. Errors with no HTTP status
+// (OAuth refresh failures and similar) keep the marker-based path.
 func isAuthErrorMessage(msg string) bool {
-	msg = strings.ToLower(msg)
-	return strings.Contains(msg, "http 401") ||
-		strings.Contains(msg, "http 403") ||
-		strings.Contains(msg, "unauthorized") ||
-		strings.Contains(msg, "forbidden") ||
-		strings.Contains(msg, "authentication failed") ||
-		strings.Contains(msg, "token invalid") ||
-		strings.Contains(msg, "token expired") ||
-		strings.Contains(msg, "invalid_grant") ||
-		strings.Contains(msg, "access token expired") ||
-		strings.Contains(msg, "refresh token expired")
+	lower := strings.ToLower(msg)
+
+	if status, ok := upstreamStatusFromMessage(lower); ok {
+		if status == http.StatusUnauthorized || status == http.StatusForbidden {
+			return true
+		}
+		// A definite non-auth status: trust it over whatever the body says,
+		// but still honour a narrow marker (e.g. a 400 carrying invalid_grant
+		// is a genuine revoked refresh token).
+		return containsAny(lower, authErrorNarrowMarkers)
+	}
+
+	// No status to anchor on. Keep the original broader markers so credential
+	// failures surfaced without an HTTP status are still caught.
+	return containsAny(lower, authErrorNarrowMarkers) ||
+		strings.Contains(lower, "unauthorized") ||
+		strings.Contains(lower, "forbidden") ||
+		strings.Contains(lower, "token invalid") ||
+		strings.Contains(lower, "token expired")
+}
+
+func containsAny(haystack string, needles []string) bool {
+	for _, n := range needles {
+		if strings.Contains(haystack, n) {
+			return true
+		}
+	}
+	return false
 }
 
 func (h *Handler) disableAccount(account *config.Account, banStatus, banReason string) {

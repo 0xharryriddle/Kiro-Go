@@ -938,6 +938,17 @@
         ? '<span class="log-tries log-tries--multi" title="' + escapeAttr(t('logs.triesHint')) + '">' + tries + '</span>'
         : '<span class="text-muted">' + (tries || '-') + '</span>';
       const ttfb = l.ttfbMs ? ('<span class="log-ttfb" title="' + escapeAttr(t('logs.ttfb')) + '">' + l.ttfbMs + 'ms</span> / ') : '';
+      // Prompt-cache reads are the single largest cost lever on an agentic
+      // workload, but a flat token total hides them completely: a fully cached
+      // 100k-token prefix looks identical to 100k of fresh input. Surfacing the
+      // cached share here makes a cache regression visible from the list.
+      const cacheRead = l.cacheReadTokens || 0;
+      let cacheCell = '';
+      if (cacheRead > 0) {
+        const share = l.tokens > 0 ? Math.round((cacheRead / l.tokens) * 100) : 0;
+        cacheCell = ' <span class="log-cache" title="' + escapeAttr(t('logs.cacheReadTokens') + ': ' + formatNum(cacheRead)) + '">' +
+          '\u21BB' + share + '%</span>';
+      }
       html += '<tr class="logs-row" data-trace="' + escapeAttr(l.requestId || '') + '" tabindex="0">' +
         '<td>' + escapeHtml(formatLogTime(l.time)) + '</td>' +
         '<td>' + statusCell + '</td>' +
@@ -945,7 +956,7 @@
         '<td>' + escapeHtml(l.model || '-') + '</td>' +
         '<td>' + escapeHtml(accountLabel(l.accountId, l.accountEmail)) + '</td>' +
         '<td>' + triesCell + '</td>' +
-        '<td>' + (l.tokens ? formatNum(l.tokens) : '-') + '</td>' +
+        '<td>' + (l.tokens ? formatNum(l.tokens) : '-') + cacheCell + '</td>' +
         '<td>' + ttfb + (l.duration ? (l.duration + 'ms') : '-') + '</td>' +
         '<td>' + detailCell + '</td>' +
         '</tr>';
@@ -1085,12 +1096,63 @@
     return parts.join('');
   }
 
+  // Raw (unformatted) trace bodies, keyed by pane id. The pane displays a
+  // pretty-printed view for readability while Copy still yields the exact bytes
+  // that went over the wire, which is what makes a trace usable for a bug report.
+  const traceRawBodies = new Map();
+
+  // formatTraceBody turns a captured body into something readable.
+  //
+  // Three shapes occur in practice:
+  //   1) A single JSON document (non-streaming request/response).
+  //   2) An SSE stream: repeated "event:" / "data: {...}" lines, where each
+  //      data payload is its own JSON document. Parsing the whole blob fails,
+  //      so each data line is expanded individually.
+  //   3) Anything else (plain text, truncated capture) is returned untouched.
+  function formatTraceBody(content) {
+    if (typeof content !== 'string' || content === '') return content;
+
+    const trimmed = content.trim();
+    if (trimmed.startsWith('{') || trimmed.startsWith('[')) {
+      try {
+        return JSON.stringify(JSON.parse(trimmed), null, 2);
+      } catch (e) {
+        // Not a complete JSON document (e.g. truncated capture): fall through.
+      }
+    }
+
+    if (!/^(event|data):/m.test(content)) return content;
+
+    const out = [];
+    for (const rawLine of content.split('\n')) {
+      const line = rawLine.replace(/\r$/, '');
+      const match = /^data:\s*(.*)$/.exec(line);
+      if (!match) {
+        out.push(line);
+        continue;
+      }
+      const payload = match[1].trim();
+      if (payload === '' || payload === '[DONE]') {
+        out.push(line);
+        continue;
+      }
+      try {
+        out.push('data: ' + JSON.stringify(JSON.parse(payload), null, 2));
+      } catch (e) {
+        out.push(line);
+      }
+    }
+    return out.join('\n');
+  }
+
   function traceBodyPane(label, content, id) {
     if (!content) return '';
+    traceRawBodies.set(id, content);
+    const formatted = formatTraceBody(content);
     return '<details class="trace-section" open><summary class="trace-section-title">' + escapeHtml(label) +
       ' <button class="btn btn-outline btn-sm trace-copy" data-copy-target="' + escapeAttr(id) + '">' +
       escapeHtml(t('common.copy')) + '</button></summary>' +
-      '<pre class="trace-pre" id="' + escapeAttr(id) + '">' + escapeHtml(content) + '</pre></details>';
+      '<pre class="trace-pre" id="' + escapeAttr(id) + '">' + escapeHtml(formatted) + '</pre></details>';
   }
 
   function wireTraceCopyButtons(root) {
@@ -1098,7 +1160,12 @@
       btn.addEventListener('click', e => {
         e.preventDefault();
         e.stopPropagation();
-        const target = document.getElementById(btn.getAttribute('data-copy-target'));
+        const targetId = btn.getAttribute('data-copy-target');
+        if (traceRawBodies.has(targetId)) {
+          copyText(traceRawBodies.get(targetId));
+          return;
+        }
+        const target = document.getElementById(targetId);
         if (!target) return;
         copyText(target.textContent || '');
       });

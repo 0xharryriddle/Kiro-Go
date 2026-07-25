@@ -569,6 +569,16 @@ func retryAfterFromHeader(raw string) string {
 
 // ==================== Event Stream Parsing ====================
 
+// maxEventStreamFrameBytes caps the size of a single AWS event-stream frame that
+// parseEventStream is willing to allocate for.
+//
+// The frame length is read from 4 unvalidated bytes on the wire, so without a
+// ceiling a corrupt or hostile prelude can drive an arbitrary allocation. Real
+// frames carry one streamed event (a text delta, a tool-use fragment, a usage
+// block) and are kilobytes at most; 16 MiB leaves several orders of magnitude of
+// headroom while keeping a bad length field from turning into a memory spike.
+const maxEventStreamFrameBytes = 16 << 20
+
 // parseEventStream decodes an AWS binary Event Stream response body.
 func parseEventStream(body io.Reader, callback *KiroStreamCallback) error {
 	if callback == nil {
@@ -604,6 +614,17 @@ func parseEventStream(body io.Reader, callback *KiroStreamCallback) error {
 
 		if totalLength < 16 {
 			continue
+		}
+
+		// Bound the allocation by the declared frame length BEFORE allocating.
+		//
+		// totalLength comes straight off the wire as 4 unvalidated bytes, so a
+		// corrupt or hostile frame could declare up to ~2GiB and this loop would
+		// allocate it eagerly — a 12-byte input was measured allocating 192MiB.
+		// A single AWS event-stream frame is orders of magnitude smaller than this
+		// ceiling in practice, so a frame claiming more is malformed, not large.
+		if totalLength > maxEventStreamFrameBytes {
+			return fmt.Errorf("event stream frame length %d exceeds maximum %d", totalLength, maxEventStreamFrameBytes)
 		}
 
 		// Read the remaining message bytes.
@@ -755,27 +776,56 @@ func getContextWindowSize(model string) int {
 	return 200_000
 }
 
-// largeContextMinor matches "claude-<family>-<major>.<minor>" (dot or dash form)
-// and is used to classify 1M-window models by version.
-var claudeVersionExtractor = regexp.MustCompile(`claude-(?:opus|sonnet|haiku)-(\d+)[.-](\d+)`)
+// claudeVersionExtractor matches "claude-<family>-<major>[.<minor>]" in dot or
+// dash form and is used to classify 1M-window models by version.
+//
+// Two details are load-bearing:
+//
+//   - The minor group is OPTIONAL, so a bare-major flagship name such as
+//     "claude-opus-5" is recognised. Previously the minor was required, so
+//     "claude-opus-5" fell through to a substring fallback that matched nothing
+//     and silently reported a 200K window — under-reporting a flagship model's
+//     context by 5x.
+//   - The minor group is capped at TWO digits with a trailing boundary, so a
+//     dated snapshot ("claude-sonnet-4-20250514") does not parse as minor
+//     20250514. With an unbounded minor that date compared as ">= 6" and
+//     wrongly promoted a 200K model to a 1M window.
+var claudeVersionExtractor = regexp.MustCompile(`claude-(?:opus|sonnet|haiku)-(\d+)(?:[.-](\d{1,2})(?:\b|_|$))?`)
 
+// isLargeContextModel reports whether a model uses the 1M-token context window.
+//
+// Policy: Claude 4.6+ within the 4.x line, and every major >= 5 regardless of
+// minor. A bare major (no minor component) is treated as the ".0" release of
+// that line, which is what makes "claude-opus-5" a 1M model. Defaulting an
+// unknown NEWER major to the large window is deliberate: under-reporting the
+// window makes clients compact too late and overflow the request, whereas
+// over-reporting merely makes them compact slightly early.
 func isLargeContextModel(model string) bool {
 	m := strings.ToLower(model)
 	if match := claudeVersionExtractor.FindStringSubmatch(m); match != nil {
 		major, errMaj := strconv.Atoi(match[1])
-		minor, errMin := strconv.Atoi(match[2])
-		if errMaj == nil && errMin == nil {
-			// 1M window for Claude >= 4.6 (4.6, 4.7, 4.8, ...) and any major >= 5.
-			if major > 4 {
-				return true
-			}
-			if major == 4 && minor >= 6 {
-				return true
-			}
+		if errMaj != nil {
 			return false
 		}
+		// Any major beyond the 4.x line is a large-context model.
+		if major > 4 {
+			return true
+		}
+		if major < 4 {
+			return false
+		}
+		// Within 4.x the minor decides. A bare "claude-opus-4" means 4.0.
+		if match[2] == "" {
+			return false
+		}
+		minor, errMin := strconv.Atoi(match[2])
+		if errMin != nil {
+			return false
+		}
+		return minor >= 6
 	}
-	// Fallback substring checks for non-standard identifiers.
+	// Fallback for non-standard identifiers that still carry a recognisable
+	// 4.6+ version tag (e.g. a vendor-prefixed id the regex above misses).
 	for _, tag := range []string{"4.6", "4-6", "4.7", "4-7", "4.8", "4-8", "4.9", "4-9"} {
 		if strings.Contains(m, tag) {
 			return true
@@ -908,6 +958,27 @@ func handleToolUseEvent(event map[string]interface{}, current *toolUseState, cal
 	} else if name != "" && current != nil && current.Name != name {
 		finishToolUse(current, callback)
 		current = &toolUseState{ToolUseID: "toolu_" + uuid.New().String(), Name: name, GeneratedID: true}
+	} else if toolUseID != "" && current != nil && current.ToolUseID != toolUseID {
+		// A fragment carrying a DIFFERENT tool-use id but NO name still belongs to
+		// another call. Every branch above requires name != "", so such a fragment
+		// used to fall through to the input-accumulation block below and be spliced
+		// into the currently-open call's argument buffer: call A's JSON was
+		// corrupted with call B's arguments and call B was never emitted at all.
+		// This is precisely the shape parallel tool use produces.
+		//
+		// A generated id means we never saw the real one, so adopt the id rather
+		// than splitting a call that is actually the same one.
+		if current.GeneratedID {
+			current.ToolUseID = toolUseID
+			current.GeneratedID = false
+		} else {
+			previousName := current.Name
+			finishToolUse(current, callback)
+			// The name is absent on this fragment; carry the previous call's name
+			// forward so the new call is still emittable (finishToolUse drops a
+			// state with an empty Name).
+			current = &toolUseState{ToolUseID: toolUseID, Name: previousName}
+		}
 	}
 
 	if current != nil {

@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"crypto/subtle"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -1631,6 +1632,24 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 				"type":  "error",
 				"error": map[string]string{"type": "api_error", "message": err.Error()},
 			})
+			// Terminate the SSE message properly. Emitting `error` and returning
+			// left any open content_block unclosed and never sent message_delta or
+			// message_stop, so a client that had already received message_start
+			// was left with a half-open message: strict Anthropic SSE consumers
+			// either hang waiting for the close or raise a protocol error instead
+			// of surfacing the upstream failure. stop_reason is reported as
+			// "error" so the client can tell this apart from a normal end_turn.
+			closeActiveBlock()
+			h.sendSSE(w, flusher, "message_delta", map[string]interface{}{
+				"type": "message_delta",
+				"delta": map[string]interface{}{
+					"stop_reason": "error",
+				},
+				"usage": buildClaudeUsageMap(inputTokens, outputTokens, cacheUsage, cacheProfile != nil),
+			})
+			h.sendSSE(w, flusher, "message_stop", map[string]interface{}{
+				"type": "message_stop",
+			})
 			return
 		}
 		tr.endAttempt(att, nil)
@@ -2566,6 +2585,30 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 				continue
 			}
 			h.emitTrace(tr, outcomeError, statusForUpstreamError(err))
+			// Terminate the SSE stream. Returning here simply stopped writing, so
+			// a client that had already received content saw the connection end
+			// with no error payload, no finish_reason, and no [DONE] sentinel: the
+			// partial answer looked like a COMPLETE one. Emit an explicit error
+			// chunk, a finish_reason, and [DONE] so the failure is unambiguous.
+			errChunk := map[string]interface{}{
+				"id":      chatID,
+				"object":  "chat.completion.chunk",
+				"created": time.Now().Unix(),
+				"model":   model,
+				"choices": []map[string]interface{}{{
+					"index":         0,
+					"delta":         map[string]interface{}{},
+					"finish_reason": "error",
+				}},
+				"error": map[string]string{
+					"type":    errorTypeForOpenAIStatus(statusForUpstreamError(err)),
+					"message": err.Error(),
+				},
+			}
+			errData, _ := json.Marshal(errChunk)
+			fmt.Fprintf(w, "data: %s\n\n", string(errData))
+			fmt.Fprintf(w, "data: [DONE]\n\n")
+			flusher.Flush()
 			return
 		}
 		tr.endAttempt(att, nil)
@@ -2817,7 +2860,32 @@ func (h *Handler) handleAdminAPI(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	if password != config.GetPassword() {
+	// Fail CLOSED when no admin password is configured.
+	//
+	// The check used to be a bare `password != config.GetPassword()` with no
+	// non-empty guard on the configured side, so a blank cfg.Password made
+	// "" == "" succeed and opened every /admin/api/* route to an unauthenticated
+	// caller — including /config/export (raw config.json with refresh tokens and
+	// ksk_ keys) and /export (full credential export). The admin UI cannot blank
+	// the password, but config.SetPassword is unguarded and a hand-edited or
+	// migrated config.json with "password": "" loads verbatim, so this was a
+	// latent fail-open on operator-supplied config.
+	//
+	// The API-key path already fails closed in exactly this situation (see
+	// authenticate in auth.go: "Auth required but nothing configured → fail
+	// closed"); this now matches it.
+	expected := config.GetPassword()
+	if expected == "" {
+		w.WriteHeader(401)
+		json.NewEncoder(w).Encode(map[string]string{
+			"error": "Admin access is not available: no admin password is configured",
+		})
+		return
+	}
+
+	// Constant-time comparison so an unauthenticated, unrate-limited endpoint
+	// does not leak the password prefix through response timing.
+	if subtle.ConstantTimeCompare([]byte(password), []byte(expected)) != 1 {
 		w.WriteHeader(401)
 		json.NewEncoder(w).Encode(map[string]string{"error": "Unauthorized"})
 		return

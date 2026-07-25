@@ -167,7 +167,15 @@ func (p *AccountPool) GetNextExcluding(excluded map[string]bool) *config.Account
 			continue
 		}
 
-		return acc
+		// Return a COPY, never &p.accounts[idx]. Callers mutate the returned
+		// account without holding the pool lock (proxy's ensureValidToken
+		// assigns AccessToken/RefreshToken/ExpiresAt), which raced with
+		// UpdateToken writing the same fields under p.mu.Lock. Persistence does
+		// not depend on the alias: every mutation site also calls
+		// pool.UpdateToken plus config.UpdateAccountToken, and Reload() rebuilds
+		// pool storage from config.
+		selected := *acc
+		return &selected
 	}
 
 	// No currently available account. Do not break cooldown here; returning a
@@ -300,7 +308,10 @@ func (p *AccountPool) GetNextForModelExcluding(model string, excluded map[string
 			seen[acc.ID] = true
 			continue
 		}
-		return acc
+		// Return a COPY (see GetNextExcluding for the full rationale): callers
+		// mutate the result without the pool lock, which raced with UpdateToken.
+		selected := *acc
+		return &selected
 	}
 
 	// No currently available account for this model. Do not break cooldown here;
@@ -629,15 +640,24 @@ func (p *AccountPool) diagnosticsForLocked(accounts []config.Account, model stri
 			available = false
 			reason = "cooldown"
 			cooldownUntil = cooldown.Unix()
-		} else if acc.ExpiresAt > 0 && now.Unix() > acc.ExpiresAt-tokenRefreshSkewSeconds {
-			available = true
-			reason = "token_refresh_due"
 		} else if isQuotaBlocked(acc, allowOverUsage) {
 			available = false
 			reason = "quota_exhausted"
 		} else if !inPool[acc.ID] {
 			available = false
 			reason = "not_in_pool"
+		} else if acc.ExpiresAt > 0 && now.Unix() > acc.ExpiresAt-tokenRefreshSkewSeconds {
+			// token_refresh_due is INFORMATIONAL, not a blocking state: the request
+			// handler refreshes the token before use, so such an account is still
+			// routable. It must therefore be evaluated LAST.
+			//
+			// Previously it sat ahead of the quota and not-in-pool checks, so a
+			// quota-exhausted account that Reload() had already dropped from the
+			// routing pool was reported to the operator as Available=true with
+			// reason "token_refresh_due" — the admin panel showed a healthy account
+			// that could not serve a single request, hiding the real cause.
+			available = true
+			reason = "token_refresh_due"
 		}
 
 		out = append(out, AccountDiagnostics{
@@ -735,7 +755,13 @@ func (p *AccountPool) pickQuotaAware(model string, excluded map[string]bool, now
 			bestRem = rem
 		}
 	}
-	return best
+	if best == nil {
+		return nil
+	}
+	// Return a COPY: both callers hand this pointer straight back to the request
+	// path, which mutates it without the pool lock (see GetNextExcluding).
+	selected := *best
+	return &selected
 }
 
 // isQuotaBlocked reports whether an over-quota account should be skipped:
