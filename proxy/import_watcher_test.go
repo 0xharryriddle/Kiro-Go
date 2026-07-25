@@ -23,6 +23,15 @@ func newExternalIdpTokenServer(t *testing.T) *httptest.Server {
 	}))
 }
 
+// bypassExternalIdpValidator installs a no-op IdP endpoint validator for the test.
+// importOne allow-lists external_idp token endpoints, and these tests point at an
+// httptest server (http + 127.0.0.1) that the real validator rejects by design.
+func bypassExternalIdpValidator(t *testing.T) {
+	t.Helper()
+	restore := auth.SetExternalIdpValidatorForTest(func(string) error { return nil })
+	t.Cleanup(func() { auth.SetExternalIdpValidatorForTest(restore) })
+}
+
 // backdateForWatcher rewinds a fixture's mtime past importMinFileAgeSeconds so
 // scanImportDir's "file still being written" guard (proxy/import_watcher.go) does
 // not skip it. Tests write and scan in the same instant, so without this every
@@ -66,6 +75,7 @@ func TestImportWatcherProcessesValidFile(t *testing.T) {
 	}
 	defer installCleanAuthClient(t)()
 
+	bypassExternalIdpValidator(t)
 	idp := newExternalIdpTokenServer(t)
 	defer idp.Close()
 
@@ -142,6 +152,7 @@ func TestImportWatcherSkipsDuplicate(t *testing.T) {
 		t.Fatalf("seed account: %v", err)
 	}
 
+	bypassExternalIdpValidator(t)
 	idp := newExternalIdpTokenServer(t)
 	defer idp.Close()
 

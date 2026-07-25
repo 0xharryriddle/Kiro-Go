@@ -21,16 +21,16 @@ const tokenRefreshSkewSeconds int64 = 120
 
 // RequestLog stores details about a single API request (success or failure).
 type RequestLog struct {
-	Time      int64  `json:"time"`      // Unix timestamp
-	Endpoint  string `json:"endpoint"`  // claude/openai/responses
-	Model     string `json:"model"`     // Requested model
-	AccountID string `json:"accountId"` // Account used
-	Status    string `json:"status"`    // "success" or "error"
-	Error     string `json:"error"`     // Error message (empty on success)
-	ErrorType string `json:"errorType"` // Error category (empty on success)
-	Tokens    int    `json:"tokens"`    // Total tokens (input+output, 0 on failure)
-	Credits   float64 `json:"credits"`  // Credits consumed (0 on failure)
-	Duration  int64  `json:"duration"`  // Request duration in ms
+	Time      int64   `json:"time"`      // Unix timestamp
+	Endpoint  string  `json:"endpoint"`  // claude/openai/responses
+	Model     string  `json:"model"`     // Requested model
+	AccountID string  `json:"accountId"` // Account used
+	Status    string  `json:"status"`    // "success" or "error"
+	Error     string  `json:"error"`     // Error message (empty on success)
+	ErrorType string  `json:"errorType"` // Error category (empty on success)
+	Tokens    int     `json:"tokens"`    // Total tokens (input+output, 0 on failure)
+	Credits   float64 `json:"credits"`   // Credits consumed (0 on failure)
+	Duration  int64   `json:"duration"`  // Request duration in ms
 }
 
 const requestLogsMaxSize = 500
@@ -3012,6 +3012,11 @@ func (h *Handler) apiImportSsoToken(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) apiImportCredentials(w http.ResponseWriter, r *http.Request) {
+	// Cap the body: accessToken becomes attacker-influenced input that is base64- and
+	// JSON-decoded twice (issuerFromAccessTokenJWT / ExpFromAccessTokenJWT). Without a
+	// limit an oversized token is a memory-amplification DoS. Mirrors the io.LimitReader
+	// guard on outbound IdP responses in auth/kiro_sso.go's oidcDiscover.
+	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
 		w.WriteHeader(400)
@@ -3062,14 +3067,11 @@ func importErrorStatus(err error) int {
 }
 
 // importOne is the single source of truth for turning a normalized credential
-// request into a persisted account. apiImportCredentials, apiImportCliJson, and
-// the directory watcher all funnel through here so the stored account is
-// identical to what apiPollKiroSso writes for an interactive login.
-//
-// The refresh-before-import invariant is intentional: a credential is only
-// persisted after one successful token refresh, because a locally-cached access
-// token carries no trustworthy expiry and guessing a short TTL makes the pool
-// skip the account forever (see ensureValidToken / Pick expiry handling).
+// request into a persisted account. apiImportCredentials, apiImportCliJson,
+// apiImportIdeCache, and the directory watcher all funnel through here, so every
+// import path inherits the same auth-method normalization, external-IdP endpoint
+// allow-listing, tenant derivation, and trust-on-import behavior, and the stored
+// account is identical to what apiPollKiroSso writes for an interactive login.
 func (h *Handler) importOne(req importCredentialRequest) (config.Account, error) {
 	if strings.TrimSpace(req.RefreshToken) == "" {
 		return config.Account{}, &importValidationError{"refreshToken is required"}
@@ -3080,45 +3082,119 @@ func (h *Handler) importOne(req importCredentialRequest) (config.Account, error)
 	if req.AuthMethod == "" {
 		req.AuthMethod = normalizeAuthMethod("", req.TokenEndpoint, req.ClientID, req.ClientSecret)
 	}
+
+	// Resolve Azure endpoints from userId (Kiro Account Manager exports carry the
+	// tenant at account level) or the accessToken JWT issuer (bare blobs: clientId
+	// + token only). A derivation that also clears the allow-list is itself proof
+	// the credential is external_idp — IdC/social access tokens are not
+	// microsoftonline JWTs, so a bare IdC blob (its iss is an AWS host) won't clear
+	// the list and won't be misclassified.
+	derivedTE, derivedIss, derivedSc := auth.DeriveExternalIdpEndpoints(req.UserID, req.ClientID, req.AccessToken)
+	if derivedTE != "" && auth.ValidateExternalIdpEndpoint(derivedTE) == nil && req.AuthMethod != "external_idp" {
+		// Only the provider label that was auto-derived for the previous (wrong)
+		// classification is replaced; an explicitly supplied provider survives.
+		if req.Provider == "" || req.Provider == providerWithDefault(req.AuthMethod, "") {
+			req.Provider = "AzureAD"
+		}
+		req.AuthMethod = "external_idp"
+	}
+
 	// external_idp refreshes against the IdP token endpoint (refresh_token grant,
-	// public client). Without tokenEndpoint+clientId, refreshExternalIdpToken
-	// hard-fails with an opaque error; reject up front with an actionable message.
+	// public client). tokenEndpoint is caller-supplied, so it is a trust boundary:
+	// an untrusted credential JSON could otherwise point at an internal or
+	// attacker-controlled host and leak the refresh token to it. Validate it (and
+	// the issuer) against the IdP host allow-list before any refresh POST.
 	if req.AuthMethod == "external_idp" {
+		// Kiro Account Manager exports and bare blobs omit tokenEndpoint/issuerUrl/
+		// scopes; fill them from the derived (userId or accessToken-JWT) tenant.
+		if req.TokenEndpoint == "" {
+			req.TokenEndpoint = derivedTE
+		}
+		if req.IssuerURL == "" {
+			req.IssuerURL = derivedIss
+		}
+		if req.Scopes == "" {
+			req.Scopes = derivedSc
+		}
 		if strings.TrimSpace(req.TokenEndpoint) == "" || strings.TrimSpace(req.ClientID) == "" {
 			return config.Account{}, &importValidationError{
-				"external_idp import requires token_endpoint and client_id (mint them with kiro-login-helper.py)",
+				"external_idp import requires token_endpoint and client_id (or userId/accessToken to derive them; mint them with kiro-login-helper.py)",
+			}
+		}
+		if err := auth.ValidateExternalIdpEndpoint(req.TokenEndpoint); err != nil {
+			return config.Account{}, &importValidationError{"external IdP endpoint rejected: " + err.Error()}
+		}
+		if req.IssuerURL != "" {
+			if err := auth.ValidateExternalIdpEndpoint(req.IssuerURL); err != nil {
+				return config.Account{}, &importValidationError{"external IdP issuer rejected: " + err.Error()}
 			}
 		}
 	}
 
-	// Mandatory refresh. Carry the external_idp material so the external branch in
-	// auth.RefreshToken actually succeeds.
-	tempAccount := &config.Account{
-		RefreshToken:  req.RefreshToken,
-		ClientID:      req.ClientID,
-		ClientSecret:  req.ClientSecret,
-		AuthMethod:    req.AuthMethod,
-		Region:        req.Region,
-		TokenEndpoint: req.TokenEndpoint,
-		IssuerURL:     req.IssuerURL,
-		Scopes:        req.Scopes,
+	// Resolve the access token to persist. For external_idp we prefer
+	// TRUST-ON-IMPORT: when the credential carries an Azure AD access token (a JWT
+	// with a real exp), persist it directly WITHOUT a live refresh round-trip. The
+	// same JSON can then be imported repeatedly / into several instances without
+	// each import consuming (rotating) the refresh token, and without requiring
+	// egress to Microsoft at import time; the runtime background refresh renews it
+	// when the account is actually used.
+	//
+	// Everything else falls back to refresh-at-import. That invariant is
+	// deliberate: a locally-cached access token carries no trustworthy expiry, and
+	// guessing a short TTL makes the pool skip the account forever (see
+	// ensureValidToken / Pick expiry handling), so the credential is only persisted
+	// after one successful refresh.
+	var (
+		accessToken string
+		expiresAt   int64
+		profileArn  string
+	)
+	email := strings.TrimSpace(req.Email)
+	if req.AuthMethod == "external_idp" && req.AccessToken != "" {
+		if exp := auth.ExpFromAccessTokenJWT(req.AccessToken); exp > 0 {
+			accessToken = req.AccessToken
+			expiresAt = exp
+			profileArn = req.ProfileArn
+		}
 	}
-	accessToken, newRefreshToken, expiresAt, newProfileArn, err := auth.RefreshToken(tempAccount)
-	if err != nil {
-		return config.Account{}, &importValidationError{"Token refresh failed: " + err.Error()}
-	}
-	if newRefreshToken != "" {
-		req.RefreshToken = newRefreshToken
+	if accessToken == "" {
+		// Mandatory refresh. Carry the external_idp material so the external branch
+		// in auth.RefreshToken actually succeeds.
+		tempAccount := &config.Account{
+			RefreshToken:  req.RefreshToken,
+			ClientID:      req.ClientID,
+			ClientSecret:  req.ClientSecret,
+			AuthMethod:    req.AuthMethod,
+			Region:        req.Region,
+			TokenEndpoint: req.TokenEndpoint,
+			IssuerURL:     req.IssuerURL,
+			Scopes:        req.Scopes,
+		}
+		a, newRefreshToken, ea, newProfileArn, err := auth.RefreshToken(tempAccount)
+		if err != nil {
+			return config.Account{}, &importValidationError{"Token refresh failed: " + err.Error()}
+		}
+		accessToken = a
+		expiresAt = ea
+		profileArn = newProfileArn
+		if newRefreshToken != "" {
+			req.RefreshToken = newRefreshToken
+		}
+		// Email: prefer the request-supplied label; else best-effort from the token.
+		if email == "" {
+			email, _, _ = auth.GetUserInfo(accessToken)
+		}
 	}
 
-	// Email: prefer the request-supplied label; else best-effort from the token.
-	email := strings.TrimSpace(req.Email)
-	if email == "" {
-		email, _, _ = auth.GetUserInfo(accessToken)
+	// Reuse a supplied record's id when it does not collide; otherwise mint a fresh
+	// one so re-importing a backup never creates a duplicate entry.
+	id := strings.TrimSpace(req.ID)
+	if id == "" || config.AccountIDExists(id) {
+		id = auth.GenerateAccountID()
 	}
 
 	account := config.Account{
-		ID:            auth.GenerateAccountID(),
+		ID:            id,
 		Email:         email,
 		Nickname:      req.Nickname,
 		AccessToken:   accessToken,
@@ -3134,7 +3210,7 @@ func (h *Handler) importOne(req importCredentialRequest) (config.Account, error)
 		// external_idp refresh returns "" for profileArn by design; fall back to
 		// the helper-provided ARN. If both empty, ResolveProfileArn discovers it
 		// lazily on first use (incl. the cross-region probe for external_idp).
-		ProfileArn: pickProfileArn(newProfileArn, req.ProfileArn),
+		ProfileArn: pickProfileArn(profileArn, req.ProfileArn),
 		ExpiresAt:  expiresAt,
 		Enabled:    true,
 		MachineId:  config.GenerateMachineId(),
@@ -3262,6 +3338,58 @@ func (h *Handler) apiImportIdeCache(w http.ResponseWriter, r *http.Request) {
 			"authMethod": account.AuthMethod,
 		},
 	})
+}
+
+// externalIdpAuthMethodAliases are lower-cased authMethod values (or Kiro Account
+// Manager provider labels) that mean "external IdP / enterprise SSO" and must
+// normalize to "external_idp".
+var externalIdpAuthMethodAliases = map[string]bool{
+	"external_idp": true,
+	"azuread":      true,
+	"azure":        true,
+	"entra":        true,
+	"entra-id":     true,
+	"entra_id":     true,
+	"microsoft":    true,
+	"m365":         true,
+	"office365":    true,
+	"external":     true,
+}
+
+// normalizeImportAuthMethod maps a pasted credential JSON's authMethod (plus its
+// clientId/clientSecret/tokenEndpoint) onto one of the three canonical methods
+// ("external_idp" | "idc" | "social"). external_idp MUST be detected before the
+// clientId+clientSecret→idc inference, because external_idp accounts carry clientId
+// but NO clientSecret, so the old default branch misclassified them as "social" and
+// refresh hit the wrong endpoint.
+//
+// It preserves the pre-existing idc/social heuristics:
+//   - empty authMethod + clientId present             -> idc
+//   - empty authMethod, no clientId                   -> social
+//   - "enterprise" (Kiro Account Manager IdC label)   -> idc
+//   - unrecognized non-empty + clientId+clientSecret  -> idc, else social
+func normalizeImportAuthMethod(authMethod, clientID, clientSecret, tokenEndpoint string) string {
+	am := strings.ToLower(strings.TrimSpace(authMethod))
+	switch {
+	case externalIdpAuthMethodAliases[am]:
+		return "external_idp"
+	case tokenEndpoint != "": // infer when not declared explicitly
+		return "external_idp"
+	case am == "social" || am == "google" || am == "github":
+		return "social"
+	case am == "idc" || am == "builderid" || am == "enterprise":
+		return "idc"
+	}
+	if am == "" {
+		if clientID != "" {
+			return "idc"
+		}
+		return "social"
+	}
+	if clientID != "" && clientSecret != "" {
+		return "idc"
+	}
+	return "social"
 }
 
 func (h *Handler) apiGetStatus(w http.ResponseWriter, r *http.Request) {

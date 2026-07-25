@@ -25,6 +25,13 @@ type importCredentialRequest struct {
 	IssuerURL     string
 	Scopes        string
 	ProfileArn    string
+	// UserID is the Kiro Account Manager export's account-level identifier. It
+	// embeds the Azure tenant, so importOne can derive tokenEndpoint/issuerUrl/
+	// scopes from it when the credential omits them.
+	UserID string
+	// ID preserves a pasted record's account id so re-importing a backup updates
+	// rather than duplicates. Ignored when empty or already taken.
+	ID string
 	// Label-only metadata (never used as an auth input).
 	Email    string
 	Nickname string
@@ -62,6 +69,13 @@ type rawCredential struct {
 	Provider string `json:"provider"`
 	IDP      string `json:"idp"`
 	Type     string `json:"type"`
+
+	// Account identity. userId (Kiro Account Manager exports, account level)
+	// embeds the Azure tenant used to derive missing external_idp endpoints; id
+	// preserves an account id across a re-import.
+	UserIDSnake string `json:"user_id"`
+	UserIDCamel string `json:"userId"`
+	ID          string `json:"id"`
 
 	// Label material — email may arrive as a token claim alias.
 	Email             string `json:"email"`
@@ -153,6 +167,8 @@ func normalizeRawCredential(rc rawCredential) importCredentialRequest {
 		IssuerURL:     issuerURL,
 		Scopes:        strings.TrimSpace(rc.Scopes),
 		ProfileArn:    profileArn,
+		UserID:        firstNonEmpty(rc.UserIDSnake, rc.UserIDCamel),
+		ID:            strings.TrimSpace(rc.ID),
 		Email:         firstNonEmpty(rc.Email, rc.PreferredUsername, rc.UPN),
 		Nickname:      strings.TrimSpace(rc.Nickname),
 	}
