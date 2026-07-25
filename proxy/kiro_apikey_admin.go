@@ -201,8 +201,29 @@ func kiroAPIKeyProbeRegions(requested []string) ([]string, error) {
 	return regions, nil
 }
 
+// probeKiroAPIKeyAccount validates a Kiro-issued key by fetching the underlying
+// account info for the region pinned on the throwaway probe account.
+//
+// It deliberately delegates to probeKiroApiKey (admin_bot_api.go) rather than
+// calling RefreshAccountInfo directly. Both were independent seams over the same
+// round-trip, so a test that stubbed one still hit the live network through the
+// other — which is exactly how the api_key import tests ended up failing with a
+// real upstream 403. Funnelling through one seam means stubbing either var
+// covers every api_key probe path (probe/commit, direct add, and import).
 var probeKiroAPIKeyAccount = func(account *config.Account) (*config.AccountInfo, error) {
-	return RefreshAccountInfo(account)
+	if account == nil {
+		return nil, fmt.Errorf("probe account is nil")
+	}
+	key := strings.TrimSpace(account.KiroApiKey)
+	if key == "" {
+		key = strings.TrimSpace(account.AccessToken)
+	}
+	// RegionOverride is the region the probe is pinning; fall back to Region.
+	region := strings.TrimSpace(account.RegionOverride)
+	if region == "" {
+		region = strings.TrimSpace(account.Region)
+	}
+	return probeKiroApiKey(key, region)
 }
 
 func classifyKiroAPIKeyProbeError(err error) string {

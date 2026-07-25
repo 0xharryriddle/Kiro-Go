@@ -5,6 +5,7 @@ package proxy
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"kiro-go/config"
@@ -356,6 +357,29 @@ func validateKiroDispatchProfile(account *config.Account, profileArn string) err
 	return nil
 }
 
+// upstreamError builds a classifiable error from a non-200 Kiro response.
+// 402 is tagged "overage" so the failover layer routes it to overage handling
+// (disableAccountOverage → refresh OverageStatus) instead of falling through to
+// the generic RecordError path. All other codes produce "HTTP <code> ...", which
+// pool.IsAuthFailure reads via its digit-boundary status-token matcher.
+func upstreamError(statusCode int, endpoint, body string) error {
+	if statusCode == 402 {
+		return fmt.Errorf("HTTP 402 overage from %s: %s", endpoint, body)
+	}
+	return fmt.Errorf("HTTP %d from %s: %s", statusCode, endpoint, body)
+}
+
+// parseAndStream wraps parseEventStream so CallKiroAPI's 200 path can defer the
+// upstream body close (closing even on a callback panic, so the TCP connection
+// is returned to the transport pool instead of leaking). Without the defer, a
+// panic in OnText/OnToolUse/parseEventStream unwinds past a plain Close and
+// leaks the connection (repeated panics exhaust MaxIdleConnsPerHost=20 / FDs;
+// net/http's per-request recover catches the panic but the body stays open).
+func parseAndStream(body io.ReadCloser, callback *KiroStreamCallback) error {
+	defer body.Close()
+	return parseEventStream(body, callback)
+}
+
 // CallKiroAPI calls the Kiro streaming API, trying each configured endpoint with automatic fallback.
 //
 // This is a thin wrapper that discards upstream diagnostics. Callers that need
@@ -430,7 +454,12 @@ func CallKiroAPIWithDiagnostics(account *config.Account, payload *KiroPayload, c
 	endpoints := getSortedEndpoints(config.GetPreferredEndpoint())
 
 	var lastErr error
+	// shrunkForLength guards the one-shot payload reduction below. It is declared
+	// outside the endpoint loop so a single request can shrink at most once in
+	// total, never once per endpoint.
+	shrunkForLength := false
 	for _, ep := range endpoints {
+	retryEndpoint:
 		// Update the origin field for the selected endpoint.
 		payload.ConversationState.CurrentMessage.UserInputMessage.Origin = ep.Origin
 
@@ -517,10 +546,35 @@ func CallKiroAPIWithDiagnostics(account *config.Account, payload *KiroPayload, c
 			status := resp.StatusCode
 			header := resp.Header
 			resp.Body.Close()
-			lastErr = fmt.Errorf("HTTP %d from %s: %s", status, ep.Name, string(errBody))
+			// upstreamError tags 402 as "overage" so the failover layer routes it
+			// to overage handling instead of the generic RecordError path.
+			lastErr = upstreamError(status, ep.Name, string(errBody))
 			recordEndpointAttempt(status, header, outcomeError, "", lastErr)
-			// Authentication errors and payment errors are not retried across endpoints.
+			// Auth failures (401/403) and overage (402) are account-level: do not
+			// retry across endpoints. Other status codes fall through to the next
+			// endpoint.
 			if status == 401 || status == 403 || status == 402 {
+				return lastErr
+			}
+			// The request was too large for the model. Rotating endpoints or
+			// accounts cannot help — every one of them rejects the same bytes —
+			// so shrink the payload once and retry the SAME endpoint. Nothing
+			// has streamed to the client yet on this path (the non-200 branch
+			// runs before parseAndStream), which is what makes retrying safe
+			// here and nowhere later.
+			//
+			// This is the recovery net for a body ceiling that is now derived
+			// from each model's declared window rather than one hand-tuned
+			// constant: if that derivation ever over-estimates what Kiro will
+			// accept, the request degrades to a smaller context instead of
+			// failing outright.
+			if isInputTooLongErrorMessage(lastErr.Error()) && !shrunkForLength {
+				shrunkForLength = true
+				if shrinkPayloadAfterLengthRejection(payload) {
+					logger.Warnf("[KiroAPI] Endpoint %s rejected the request as too long; retrying once with a reduced payload", ep.Name)
+					goto retryEndpoint
+				}
+				logger.Warnf("[KiroAPI] Endpoint %s rejected the request as too long and it could not be reduced further", ep.Name)
 				return lastErr
 			}
 			logger.Warnf("[KiroAPI] Endpoint %s error: %v", ep.Name, lastErr)
@@ -528,8 +582,10 @@ func CallKiroAPIWithDiagnostics(account *config.Account, payload *KiroPayload, c
 		}
 
 		streamHeader := resp.Header
-		err = parseEventStream(resp.Body, callback)
-		resp.Body.Close()
+		// parseAndStream defers resp.Body.Close(), so a panic in a streaming
+		// callback (OnText/OnToolUse/parseEventStream) still returns the upstream
+		// TCP connection to the transport pool instead of leaking it.
+		err = parseAndStream(resp.Body, callback)
 		if err != nil {
 			recordEndpointAttempt(200, streamHeader, outcomeError, "", err)
 		} else {
@@ -569,15 +625,20 @@ func retryAfterFromHeader(raw string) string {
 
 // ==================== Event Stream Parsing ====================
 
-// maxEventStreamFrameBytes caps the size of a single AWS event-stream frame that
-// parseEventStream is willing to allocate for.
-//
-// The frame length is read from 4 unvalidated bytes on the wire, so without a
-// ceiling a corrupt or hostile prelude can drive an arbitrary allocation. Real
-// frames carry one streamed event (a text delta, a tool-use fragment, a usage
-// block) and are kilobytes at most; 16 MiB leaves several orders of magnitude of
-// headroom while keeping a bad length field from turning into a memory spike.
-const maxEventStreamFrameBytes = 16 << 20
+// maxEventStreamMessageBytes caps a single AWS event-stream message's total
+// length before parseEventStream allocates a buffer for it. Real Kiro/AWS
+// event-stream messages are small (text deltas + tool JSON, low KB); a corrupt
+// or malicious 32-bit totalLength near 2^32 would otherwise drive a multi-GB
+// make([]byte, …) (alloc-panic under net/http's recover → connection dropped
+// with no terminal event → client hang) or hold a multi-GB buffer to the
+// 5-minute client timeout (memory-pressure DoS). 16 MiB is a generous ceiling.
+const maxEventStreamMessageBytes = 16 * 1024 * 1024
+
+// errEventStreamFrameTooLarge is returned by parseEventStream when a frame's
+// totalLength exceeds maxEventStreamMessageBytes, so the caller (CallKiroAPI)
+// funnels it into the upstream-error / response.failed path instead of
+// allocating gigabytes.
+var errEventStreamFrameTooLarge = errors.New("event-stream: frame totalLength exceeds maximum")
 
 // parseEventStream decodes an AWS binary Event Stream response body.
 func parseEventStream(body io.Reader, callback *KiroStreamCallback) error {
@@ -615,16 +676,15 @@ func parseEventStream(body io.Reader, callback *KiroStreamCallback) error {
 		if totalLength < 16 {
 			continue
 		}
-
-		// Bound the allocation by the declared frame length BEFORE allocating.
-		//
-		// totalLength comes straight off the wire as 4 unvalidated bytes, so a
-		// corrupt or hostile frame could declare up to ~2GiB and this loop would
-		// allocate it eagerly — a 12-byte input was measured allocating 192MiB.
-		// A single AWS event-stream frame is orders of magnitude smaller than this
-		// ceiling in practice, so a frame claiming more is malformed, not large.
-		if totalLength > maxEventStreamFrameBytes {
-			return fmt.Errorf("event stream frame length %d exceeds maximum %d", totalLength, maxEventStreamFrameBytes)
+		// Reject a corrupt/malicious totalLength before the multi-GB make — a
+		// single bit-flip in this 32-bit field would otherwise drive
+		// make([]byte, ~4GB) (alloc-panic under net/http's per-request recover →
+		// no terminal event → client hang) or hold a multi-GB buffer to the 5-min
+		// client timeout (memory-pressure DoS). Returning an error here funnels
+		// the corrupt frame into the upstream-error / response.failed path
+		// instead of allocating gigabytes.
+		if totalLength > maxEventStreamMessageBytes {
+			return errEventStreamFrameTooLarge
 		}
 
 		// Read the remaining message bytes.
@@ -769,7 +829,17 @@ func updateTokensFromEvent(event map[string]interface{}, currentInputTokens, cur
 // contextUsagePercentage into an absolute input-token count that clients rely
 // on to decide when to compact; an undersized window under-reports tokens and
 // prevents clients from compacting in time.
+//
+// An upstream-DECLARED limit wins over the name heuristic below. Kiro reports
+// maxInputTokens per model in ListAvailableModels, which is authoritative and
+// arrives without a code change when a new flagship ships; the version regex can
+// only guess from the name and necessarily lags the product. The heuristic
+// remains the fallback for models upstream said nothing about (and for every
+// unit test that calls this without a populated registry).
 func getContextWindowSize(model string) int {
+	if declared, ok := declaredModelInputLimit(model); ok {
+		return declared
+	}
 	if isLargeContextModel(model) {
 		return 1_000_000
 	}

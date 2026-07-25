@@ -58,6 +58,10 @@ func buildKiroHeaderValues(account *config.Account, host, apiName, sdkVersion, m
 
 func applyKiroBaseHeaders(req *http.Request, account *config.Account, values kiroHeaderValues) {
 	if account != nil {
+		// UpstreamBearerToken covers both credential kinds: it returns KiroApiKey
+		// for "api_key" accounts and AccessToken for OAuth/external-IdP accounts,
+		// so no separate branch per kind is needed. Kiro API keys additionally
+		// require the API_KEY token-type header to be recognized upstream.
 		if bearer := account.UpstreamBearerToken(); bearer != "" {
 			req.Header.Set("Authorization", "Bearer "+bearer)
 			if account.IsKiroAPIKeyCredential() {

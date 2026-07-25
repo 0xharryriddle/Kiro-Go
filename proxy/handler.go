@@ -3,6 +3,7 @@ package proxy
 import (
 	"crypto/subtle"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"kiro-go/auth"
@@ -183,6 +184,13 @@ type Handler struct {
 	// an overlapping poll could observe a transient "session not found" and a
 	// concurrent cancel could miss the not-yet-parked credential.
 	kiroSsoLifecycleMu sync.Mutex
+	// custom_api (pool-linking) real-cost billing: tracks the last known upstream
+	// creditsUsed per account so each forwarded request is billed the real delta
+	// the upstream pool deducted, not a flat token-derived price.
+	customApiLedger *customApiCreditLedger
+	// proxyRotator rotates the global outbound proxy through a configured pool on a
+	// timer (round-robin). Inert when no pool is configured.
+	proxyRotator *proxyRotator
 }
 
 type thinkingStreamSource int
@@ -359,9 +367,6 @@ func validateOpenAIRequestShape(req *OpenAIRequest) string {
 }
 
 func NewHandler() *Handler {
-	// 启动时应用代理配置
-	applyProxyConfig(config.GetProxyURL())
-
 	totalReq, successReq, failedReq, totalTokens, totalCredits := config.GetStats()
 	h := &Handler{
 		pool:            pool.GetPool(),
@@ -378,11 +383,22 @@ func NewHandler() *Handler {
 		responseCache:   newResponseCache(),
 		traceStore:      newTraceStore(tracesDir(), 0),
 		traceBodies:     newTraceBodyStore(traceBodiesDir()),
+		customApiLedger: newCustomApiCreditLedger(),
 	}
 	h.loadRequestLogs()
 	h.loadAuditLogs()
 	// Prune rotated trace files on a slow ticker; retention is by whole file.
 	go h.backgroundTracePrune()
+
+	// 启动时应用代理配置
+	// Outbound proxy: a rotator applies the global proxy, cycling a pool when one is
+	// configured. When no pool is set it just applies the single ProxyURL once.
+	h.proxyRotator = newProxyRotator(applyProxyConfig)
+	h.proxyRotator.configure(config.GetProxyURL(), config.GetProxyURLs(), config.GetProxyRotateMinutes())
+
+	cachePath := filepath.Join(config.GetConfigDir(), "prompt_cache.json")
+	h.promptCache.Load(cachePath)
+	h.promptCache.startSaveLoop(cachePath, 30*time.Second)
 	// 启动后台刷新
 	go h.backgroundRefresh()
 	// 启动后台统计保存 (每30秒保存一次)
@@ -423,6 +439,20 @@ func (h *Handler) refreshAllAccounts() {
 	for i := range accounts {
 		account := &accounts[i]
 		if !account.Enabled || !account.HasUpstreamCredential() {
+			continue
+		}
+		// Custom API accounts have no Kiro token/usage: refresh their quota from the
+		// linked upstream pool's /api/me instead of AWS (which would 403 and auto-ban).
+		if account.IsBedrock() {
+			continue // static IAM creds: no Kiro quota to refresh
+		}
+		if account.IsCustomApi() {
+			quota, err := probeCustomApiQuota(account.BaseURL, account.KiroApiKey)
+			if err != nil {
+				logger.Warnf("[BackgroundRefresh] custom_api quota fetch failed for %s: %v", account.ID, err)
+				continue
+			}
+			config.UpdateAccountInfo(account.ID, quota.toAccountInfo(time.Now().Unix()))
 			continue
 		}
 
@@ -648,6 +678,63 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json; charset=utf-8")
 		w.Write([]byte(`{"status":"ok"}`))
 
+	// 客户自助端点（用客户自己的 API Key 鉴权，只暴露该 Key 的数据）
+	// 只读自省端点：同时接受 GET 与 POST，方便机器人用任一动词查询（POST 请求体忽略）。
+	case path == "/api/stats" && (r.Method == "GET" || r.Method == "POST"):
+		h.handleCustomerStats(w, r)
+	case path == "/api/me" && (r.Method == "GET" || r.Method == "POST"):
+		h.handleCustomerMe(w, r)
+	case path == "/api/logs" && (r.Method == "GET" || r.Method == "POST"):
+		h.handleCustomerLogs(w, r)
+
+	// 机器集成管理端点（Telegram 机器人等；管理密钥鉴权）。
+	// 必须放在通用 /admin/ 静态文件路由之前，否则会被误当作静态资源。
+	case path == "/admin/new_api_key" && r.Method == "POST":
+		if !h.authenticateAdminKey(w, r) {
+			return
+		}
+		h.handleAdminNewApiKey(w, r)
+	case path == "/admin/delete_api_key" && r.Method == "POST":
+		if !h.authenticateAdminKey(w, r) {
+			return
+		}
+		h.handleAdminDeleteApiKey(w, r)
+	case path == "/admin/recharge_api_key" && r.Method == "POST":
+		if !h.authenticateAdminKey(w, r) {
+			return
+		}
+		h.handleAdminRechargeApiKey(w, r)
+	case path == "/admin/stats" && r.Method == "POST":
+		if !h.authenticateAdminKey(w, r) {
+			return
+		}
+		h.handleAdminBotStats(w, r)
+	case path == "/admin/pool" && r.Method == "GET":
+		if !h.authenticateAdminKey(w, r) {
+			return
+		}
+		h.handleAdminPool(w, r)
+	case path == "/admin/add_kiro_api_key" && r.Method == "POST":
+		if !h.authenticateAdminKey(w, r) {
+			return
+		}
+		h.handleAdminAddKiroApiKey(w, r)
+	case path == "/admin/add_kiro_account" && r.Method == "POST":
+		if !h.authenticateAdminKey(w, r) {
+			return
+		}
+		h.handleAdminAddKiroAccount(w, r)
+	case path == "/admin/add_custom_api_account" && r.Method == "POST":
+		if !h.authenticateAdminKey(w, r) {
+			return
+		}
+		h.handleAdminAddCustomApiAccount(w, r)
+	case path == "/admin/add_bedrock_account" && r.Method == "POST":
+		if !h.authenticateAdminKey(w, r) {
+			return
+		}
+		h.handleAdminAddBedrockAccount(w, r)
+
 	// 管理端点
 	case path == "/admin" || path == "/admin/":
 		h.serveAdminPage(w, r)
@@ -698,6 +785,11 @@ func (h *Handler) handleStats(w http.ResponseWriter, r *http.Request) {
 		"failedRequests":  atomic.LoadInt64(&h.failedRequests),
 		"totalTokens":     atomic.LoadInt64(&h.totalTokens),
 		"totalCredits":    h.getCredits(),
+		"cache":           h.promptCache.Stats(),
+		// Customer-safe latency distribution (no account identities): with session
+		// affinity on, warm accounts pull the mean/min down over time.
+		"dispatchLatency": h.pool.LatencyAggregate(),
+		"sessionAffinity": config.GetSessionAffinityEnabled(),
 		"uptime":          time.Now().Unix() - h.startTime,
 	})
 }
@@ -754,8 +846,18 @@ func buildAnthropicModelsResponse(cached []ModelInfo, thinkingSuffix string) []m
 	return models
 }
 
+// fallbackAnthropicModels is served when the upstream model list is unavailable
+// (no enabled account, or every ListAvailableModels probe failed).
+//
+// It must lead with the current flagship. This list previously topped out at
+// opus-4.7 and contained no 5.x entry at all, so whenever the upstream fetch
+// failed the proxy advertised a fleet whose best model was two releases stale —
+// and a client picking from it would never select Opus 5. Keeping the newest
+// flagship here is what makes the degraded path still usable.
 func fallbackAnthropicModels(thinkingSuffix string) []map[string]interface{} {
 	return []map[string]interface{}{
+		buildModelInfo("claude-opus-5", "anthropic", true),
+		buildModelInfo("claude-opus-5"+thinkingSuffix, "anthropic", true),
 		buildModelInfo("claude-sonnet-4.6", "anthropic", true),
 		buildModelInfo("claude-sonnet-4.6"+thinkingSuffix, "anthropic", true),
 		buildModelInfo("claude-opus-4.6", "anthropic", true),
@@ -793,10 +895,42 @@ func buildModelInfo(id, ownedBy string, supportsImage bool) map[string]interface
 		"output": []string{"text"},
 	}
 
-	return map[string]interface{}{
+	// Advertise the input context window. This listing previously carried NO
+	// window field at all, so a client had no way to learn that e.g. Opus 5
+	// accepts 1M input tokens and fell back to its own built-in default —
+	// typically a far smaller number — then compacted the conversation long
+	// before the model was anywhere near full. Upstream reported only ~8%
+	// context usage at the point clients stopped growing the conversation.
+	//
+	// The same value is published under several key names because clients
+	// disagree on the spelling: context_window / context_length (OpenAI-ish
+	// tooling), max_input_tokens (Anthropic-ish), and the nested info.meta
+	// shape some UIs read.
+	//
+	// The advertised number is truncationContextWindow, NOT getContextWindowSize.
+	// Those two deliberately disagree: getContextWindowSize reports a model's
+	// nominal window, while truncationContextWindow is what this proxy will
+	// actually put on the wire — and it pins the sonnet/haiku families to 200K
+	// because that is what Kiro serves them behind, regardless of the version's
+	// advertised window.
+	//
+	// Advertising the nominal number for those families would be a promise this
+	// proxy cannot keep: a client told sonnet-4.6 holds 1M would fill to 1M, and
+	// truncatePayloadToLimit would silently discard ~80% of it before dispatch.
+	// Under-promising costs a slightly early compaction; over-promising costs the
+	// user's context without telling them. Both functions still prefer an
+	// upstream-DECLARED limit over any heuristic, so a declared 1M sonnet is
+	// advertised as 1M.
+	contextWindow := truncationContextWindow(id)
+	maxOutput, hasOutput := declaredModelOutputLimit(id)
+
+	info := map[string]interface{}{
 		"id":               id,
 		"object":           "model",
 		"owned_by":         ownedBy,
+		"context_window":   contextWindow,
+		"context_length":   contextWindow,
+		"max_input_tokens": contextWindow,
 		"supports_image":   supportsImage,
 		"input_modalities": modalities,
 		"modalities":       modalitiesMap,
@@ -811,9 +945,21 @@ func buildModelInfo(id, ownedBy string, supportsImage bool) map[string]interface
 					"vision":       supportsImage,
 					"image_vision": supportsImage,
 				},
+				"context_window": contextWindow,
+				"context_length": contextWindow,
 			},
 		},
 	}
+
+	// Only publish an output ceiling when upstream actually declared one.
+	// Inventing a number here would be worse than saying nothing: a client that
+	// trusts it would cap max_tokens below what the model can really emit.
+	if hasOutput {
+		info["max_output_tokens"] = maxOutput
+		info["max_tokens"] = maxOutput
+	}
+
+	return info
 }
 
 // filterModelsByAllowList returns the subset of models the account is permitted
@@ -844,6 +990,26 @@ func (h *Handler) refreshModelsCache() {
 	aggregated := make([]ModelInfo, 0)
 	for i := range accounts {
 		account := &accounts[i]
+		// Custom API accounts load their model list from the linked upstream pool's
+		// /v1/models (not Kiro/AWS): fetch, cache for routing, and aggregate into the
+		// global model list. On failure, skip without banning.
+		if account.IsBedrock() {
+			continue // Bedrock models resolved locally; no upstream probe
+		}
+		if account.IsCustomApi() {
+			models, err := probeCustomApiModels(account.BaseURL, account.KiroApiKey)
+			if err != nil {
+				logger.Warnf("[ModelsCache] custom_api %s model fetch failed: %v", account.ID, err)
+				continue
+			}
+			modelIDs := make([]string, 0, len(models))
+			for _, m := range models {
+				modelIDs = append(modelIDs, m.ModelId)
+			}
+			h.pool.SetModelList(account.ID, modelIDs)
+			aggregated = mergeUniqueModels(aggregated, models)
+			continue
+		}
 		if err := h.ensureValidToken(account); err != nil {
 			logger.Warnf("[ModelsCache] Skip %s token refresh failed: %v", account.Email, err)
 			h.handleAccountFailure(account, err)
@@ -862,6 +1028,11 @@ func (h *Handler) refreshModelsCache() {
 		accountModels, modelIDs := filterModelsByAllowList(account, models)
 		h.pool.SetModelList(account.ID, modelIDs)
 		aggregated = mergeUniqueModels(aggregated, accountModels)
+		// Capture upstream's declared per-model token limits. Recorded from the
+		// UNFILTERED list: the per-account allow-list controls what this account
+		// may ROUTE, not what a model's window is, so filtering here would make
+		// a model's window depend on which account happened to list it.
+		recordModelTokenLimits(models)
 	}
 
 	// Always replace the aggregate, including with an empty result. Retaining the
@@ -886,6 +1057,38 @@ func (h *Handler) invalidateAggregatedModelsCache() {
 // fetchAndCacheAccountModels 为单个账号拉取并写入模型缓存。
 // 同时更新 pool 的路由缓存与全局聚合模型列表。
 func (h *Handler) fetchAndCacheAccountModels(account *config.Account) error {
+	// Custom API accounts load their model list from the linked upstream pool's
+	// /v1/models (not Kiro/AWS), then cache it for routing.
+	if account.IsBedrock() {
+		// Bedrock has no Kiro/AWS /v1/models endpoint: resolve the callable model
+		// list via control-plane discovery (falling back to the account/default
+		// map) and cache it so the panel's cached-models view and routing work.
+		ids := h.cachedOrDiscoverBedrockModels(account)
+		if len(ids) == 0 {
+			for _, v := range account.BedrockModelMap {
+				ids = append(ids, v)
+			}
+		}
+		if len(ids) == 0 {
+			for _, v := range defaultBedrockModelMap {
+				ids = append(ids, v)
+			}
+		}
+		h.pool.SetModelList(account.ID, ids)
+		return nil
+	}
+	if account.IsCustomApi() {
+		models, err := probeCustomApiModels(account.BaseURL, account.KiroApiKey)
+		if err != nil {
+			return err
+		}
+		modelIDs := make([]string, 0, len(models))
+		for _, m := range models {
+			modelIDs = append(modelIDs, m.ModelId)
+		}
+		h.pool.SetModelList(account.ID, modelIDs)
+		return nil
+	}
 	if err := h.ensureValidToken(account); err != nil {
 		return fmt.Errorf("token refresh failed: %w", err)
 	}
@@ -895,6 +1098,8 @@ func (h *Handler) fetchAndCacheAccountModels(account *config.Account) error {
 	}
 	accountModels, modelIDs := filterModelsByAllowList(account, models)
 	h.pool.SetModelList(account.ID, modelIDs)
+	// See refreshModelsCache: limits come from the unfiltered upstream list.
+	recordModelTokenLimits(models)
 
 	// 合并到聚合缓存
 	h.modelsCacheMu.Lock()
@@ -928,6 +1133,16 @@ func (h *Handler) apiRefreshAccountModels(w http.ResponseWriter, r *http.Request
 		account.RefreshToken = latest.RefreshToken
 		account.ExpiresAt = latest.ExpiresAt
 		account.ProfileArn = latest.ProfileArn
+	}
+	// An explicit refresh should re-run Bedrock discovery, not reuse the cache, and
+	// re-learn which region each model is callable in.
+	if account.IsBedrock() {
+		clearBedrockModelCache(account.ID)
+		clearBedrockRegionRoutes(account.ID)
+		// Prewarm the per-model callable region in the background (opt-in cost: one
+		// tiny invoke per model per candidate region). The response returns as soon
+		// as discovery is cached; the region map fills in shortly after.
+		go func(acc config.Account) { h.prewarmBedrockRegions(&acc) }(*account)
 	}
 	if err := h.fetchAndCacheAccountModels(account); err != nil {
 		w.WriteHeader(500)
@@ -1185,8 +1400,12 @@ func (h *Handler) handleClaudeMessagesInternal(w http.ResponseWriter, r *http.Re
 
 	// Stream or non-stream
 	apiKeyID := apiKeyIDFromContext(r.Context())
+	// forwarded marks a request that already passed through one Kiro-Go pool, so a
+	// custom_api account cannot add another hop (loop guard, see forwardToUpstream).
+	forwarded := r.Header.Get(forwardHeader) != ""
 	if req.Stream {
-		h.handleClaudeStream(w, kiroPayload, req.Model, thinking, thinkingResponseOpts, estimatedInputTokens, cacheProfile, apiKeyID)
+		// Streaming returns here: the response cache below is non-stream only.
+		h.handleClaudeStream(w, kiroPayload, req.Model, thinking, thinkingResponseOpts, estimatedInputTokens, cacheProfile, apiKeyID, body, forwarded)
 		return
 	}
 
@@ -1219,17 +1438,17 @@ func (h *Handler) handleClaudeMessagesInternal(w http.ResponseWriter, r *http.Re
 	}
 	if cacheKey != "" {
 		cw := newCaptureWriter(w)
-		h.handleClaudeNonStream(cw, kiroPayload, req.Model, thinking, thinkingResponseOpts, estimatedInputTokens, cacheProfile, apiKeyID)
+		h.handleClaudeNonStream(cw, kiroPayload, req.Model, thinking, thinkingResponseOpts, estimatedInputTokens, cacheProfile, apiKeyID, body, forwarded)
 		if cw.status == http.StatusOK && len(cw.buf) > 0 {
 			h.responseCache.Set(cacheKey, cw.buf, config.GetResponseCacheTTLSeconds(), time.Now().Unix())
 		}
 		return
 	}
-	h.handleClaudeNonStream(w, kiroPayload, req.Model, thinking, thinkingResponseOpts, estimatedInputTokens, cacheProfile, apiKeyID)
+	h.handleClaudeNonStream(w, kiroPayload, req.Model, thinking, thinkingResponseOpts, estimatedInputTokens, cacheProfile, apiKeyID, body, forwarded)
 }
 
 // handleClaudeStream Claude 流式响应
-func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload, model string, thinking bool, thinkingOpts claudeThinkingResponseOptions, estimatedInputTokens int, cacheProfile *promptCacheProfile, apiKeyID string) {
+func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload, model string, thinking bool, thinkingOpts claudeThinkingResponseOptions, estimatedInputTokens int, cacheProfile *promptCacheProfile, apiKeyID string, rawBody []byte, forwarded bool) {
 	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
@@ -1273,7 +1492,7 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 	}
 
 	for attempt := 0; attempt < maxAccountRetryAttempts; attempt++ {
-		account := h.pool.GetNextForModelExcluding(model, excluded)
+		account := h.pool.GetNextForModelWithApiKey(model, excluded, apiKeyID)
 		if account == nil {
 			break
 		}
@@ -1284,6 +1503,50 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 			tr.endAttempt(att, err)
 			h.handleAccountFailure(account, err)
 			continue
+		}
+		// Custom API accounts are transparent proxies to another Kiro-Go pool: forward
+		// the raw request instead of translating to Kiro. A successful forward ends the
+		// request; any pre-reply failure falls over to the next account like a Kiro error.
+		if account.IsCustomApi() {
+			// Already forwarded once: don't add another hop, and don't penalize this
+			// healthy account (loop-guard is not a failure) — just skip it. The account
+			// is excluded, so `attempt--` cannot loop forever; it only avoids spending a
+			// real retry on an ineligible account.
+			if forwarded {
+				excluded[account.ID] = true
+				attempt--
+				continue
+			}
+			if fwdErr := h.forwardToUpstream(w, flusher, forwardParams{
+				account: account, body: rawBody, endpoint: "anthropic", streaming: true,
+				model: model, apiKeyID: apiKeyID, forwarded: forwarded,
+			}); fwdErr != nil {
+				lastErr = fwdErr
+				excluded[account.ID] = true
+				h.handleAccountFailure(account, fwdErr)
+				continue
+			}
+			return
+		}
+		// Native Bedrock accounts call the Bedrock Runtime invoke endpoint directly
+		// and re-emit the native Anthropic events. Like custom_api this is a
+		// transparent passthrough that ends the request on success; a pre-stream
+		// failure falls over to the next account.
+		if account.IsBedrock() {
+			if bErr := h.invokeBedrockStream(w, flusher, forwardParams{
+				account: account, body: rawBody, endpoint: "anthropic", streaming: true,
+				model: model, apiKeyID: apiKeyID, forwarded: forwarded,
+			}); bErr != nil {
+				lastErr = bErr
+				excluded[account.ID] = true
+				// A throttle-cooldown skip is advisory (per-model, short); don't
+				// escalate it into an account-wide failure/cooldown.
+				if !errors.Is(bErr, errBedrockThrottled) {
+					h.handleAccountFailure(account, bErr)
+				}
+				continue
+			}
+			return
 		}
 		cacheUsage := h.promptCache.Compute(account.ID, cacheProfile)
 		messageStartUsage = cacheUsage
@@ -1665,6 +1928,12 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 		} else if inputTokens <= 0 {
 			inputTokens = estimatedInputTokens
 		}
+		// Re-anchor the cache split to the real upstream input total so
+		// input+creation+read stays consistent (cacheUsage was computed against
+		// the pre-call token estimate).
+		if cacheProfile != nil && realInputTokens > 0 {
+			cacheUsage = cacheUsage.splitAgainstTotal(cacheProfile.TotalInputTokens, inputTokens)
+		}
 		outputContent, extractedReasoning := extractThinkingFromContent(rawContentBuilder.String())
 		thinkingOutput := rawThinkingBuilder.String()
 		if thinking && thinkingOutput == "" && extractedReasoning != "" {
@@ -1677,6 +1946,7 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 
 		h.recordSuccessForApiKey(apiKeyID, inputTokens, outputTokens, credits, model)
 		h.pool.RecordSuccess(account.ID)
+		h.pool.RecordLatency(account.ID, float64(time.Since(tr.startedAt).Milliseconds()))
 		h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
 		h.promptCache.Update(account.ID, cacheProfile)
 
@@ -1709,6 +1979,10 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 		return
 	}
 
+	// statusForUpstreamError maps the upstream failure onto the client-facing
+	// status (429 stays 429, 402 stays 402) instead of flattening everything to
+	// 500, and applyRetryAfterHeader preserves the upstream Retry-After so a
+	// throttled client backs off instead of retrying immediately.
 	status := statusForUpstreamError(lastErr)
 	h.emitTrace(tr, outcomeError, status)
 	applyRetryAfterHeader(w, lastErr)
@@ -1788,12 +2062,16 @@ func (h *Handler) recordSuccessForApiKey(apiKeyID string, inputTokens, outputTok
 	}
 }
 
-// Request/response logging goes through traceRecorder + Handler.emitTrace
-// (proxy/request_trace_recorder.go). The former recordSuccessLog /
-// recordFailureWithDetails helpers were removed deliberately: they emitted a
-// record per failover attempt (inflating request counts while discarding the
-// cause of each reroute) and offered a second logging path that silently
-// bypassed tracing. Keep exactly one terminal path per client request.
+// The Claude / OpenAI / Responses routes log through traceRecorder +
+// Handler.emitTrace (proxy/request_trace_recorder.go), which emits exactly ONE
+// terminal record per client request with every failover attempt embedded.
+//
+// recordSuccessLog / recordFailureWithDetails below are the flat single-record
+// helpers. They are still the logging path for the subsystems that have no
+// trace-recorder wiring — custom_api forwarding (custom_api_forward.go) and the
+// native Bedrock provider (bedrock.go) — so they must NOT be deleted. Do not
+// reintroduce them on a route that already emits a trace: that route would then
+// log twice and double-count totalRequests.
 
 func requestLogAccountEmail(accountID string) string {
 	if strings.TrimSpace(accountID) == "" {
@@ -1805,6 +2083,48 @@ func requestLogAccountEmail(accountID string) string {
 		}
 	}
 	return ""
+}
+
+// recordFailureWithDetails records a failure and stores it in the request logs.
+// apiKeyID attributes the failed request to the API key entry that issued it so
+// customer-facing log endpoints can show per-key failures; empty on legacy paths.
+func (h *Handler) recordFailureWithDetails(endpoint, model, accountID, apiKeyID string, err error) {
+	atomic.AddInt64(&h.totalRequests, 1)
+	atomic.AddInt64(&h.failedRequests, 1)
+
+	errMsg := err.Error()
+	errType := classifyError(errMsg)
+
+	entry := RequestLog{
+		Time:      time.Now().Unix(),
+		Endpoint:  endpoint,
+		Model:     model,
+		AccountID: accountID,
+		ApiKeyID:  apiKeyID,
+		Status:    "error",
+		Error:     errMsg,
+		ErrorType: errType,
+	}
+
+	h.appendRequestLog(entry)
+}
+
+// recordSuccessLog records a successful request in the request logs.
+// apiKeyID attributes the request to the API key entry that issued it (see above).
+func (h *Handler) recordSuccessLog(endpoint, model, accountID, apiKeyID string, tokens int, credits float64, durationMs int64) {
+	entry := RequestLog{
+		Time:      time.Now().Unix(),
+		Endpoint:  endpoint,
+		Model:     model,
+		AccountID: accountID,
+		ApiKeyID:  apiKeyID,
+		Status:    "success",
+		Tokens:    tokens,
+		Credits:   credits,
+		Duration:  durationMs,
+	}
+
+	h.appendRequestLog(entry)
 }
 
 func (h *Handler) appendRequestLog(entry RequestLog) {
@@ -1992,7 +2312,7 @@ func classifyError(msg string) string {
 		return "overage"
 	case isSuspensionErrorMessage(msg):
 		return "suspended"
-	case isAuthErrorMessage(msg):
+	case pool.IsAuthFailure(errors.New(msg)):
 		return "auth"
 	case isProfileUnavailableErrorMessage(msg):
 		return "profile"
@@ -2016,14 +2336,14 @@ func (h *Handler) getRequestLogs() []RequestLog {
 }
 
 // handleClaudeNonStream Claude 非流式响应
-func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayload, model string, thinking bool, thinkingOpts claudeThinkingResponseOptions, estimatedInputTokens int, cacheProfile *promptCacheProfile, apiKeyID string) {
+func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayload, model string, thinking bool, thinkingOpts claudeThinkingResponseOptions, estimatedInputTokens int, cacheProfile *promptCacheProfile, apiKeyID string, rawBody []byte, forwarded bool) {
 	excluded := make(map[string]bool)
 	var lastErr error
 	// The trace recorder owns request-level timing from here on.
 	tr := newTraceRecorder("claude", model, false, apiKeyID)
 
 	for attempt := 0; attempt < maxAccountRetryAttempts; attempt++ {
-		account := h.pool.GetNextForModelExcluding(model, excluded)
+		account := h.pool.GetNextForModelWithApiKey(model, excluded, apiKeyID)
 		if account == nil {
 			break
 		}
@@ -2034,6 +2354,43 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayl
 			tr.endAttempt(att, err)
 			h.handleAccountFailure(account, err)
 			continue
+		}
+		// Custom API accounts proxy to another Kiro-Go pool (see handleClaudeStream).
+		if account.IsCustomApi() {
+			// Already forwarded once: don't add another hop, and don't penalize this
+			// healthy account (loop-guard is not a failure) — just skip it. The account
+			// is excluded, so `attempt--` cannot loop forever; it only avoids spending a
+			// real retry on an ineligible account.
+			if forwarded {
+				excluded[account.ID] = true
+				attempt--
+				continue
+			}
+			if fwdErr := h.forwardToUpstream(w, nil, forwardParams{
+				account: account, body: rawBody, endpoint: "anthropic", streaming: false,
+				model: model, apiKeyID: apiKeyID, forwarded: forwarded,
+			}); fwdErr != nil {
+				lastErr = fwdErr
+				excluded[account.ID] = true
+				h.handleAccountFailure(account, fwdErr)
+				continue
+			}
+			return
+		}
+		// Native Bedrock non-streaming invoke (see streaming counterpart above).
+		if account.IsBedrock() {
+			if bErr := h.invokeBedrockNonStream(w, forwardParams{
+				account: account, body: rawBody, endpoint: "anthropic", streaming: false,
+				model: model, apiKeyID: apiKeyID, forwarded: forwarded,
+			}); bErr != nil {
+				lastErr = bErr
+				excluded[account.ID] = true
+				if !errors.Is(bErr, errBedrockThrottled) {
+					h.handleAccountFailure(account, bErr)
+				}
+				continue
+			}
+			return
 		}
 		cacheUsage := h.promptCache.Compute(account.ID, cacheProfile)
 
@@ -2104,10 +2461,17 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayl
 		} else if inputTokens <= 0 {
 			inputTokens = estimatedInputTokens
 		}
+		// Re-anchor the cache split to the real upstream input total so
+		// input+creation+read stays consistent (cacheUsage was computed against
+		// the pre-call token estimate).
+		if cacheProfile != nil && realInputTokens > 0 {
+			cacheUsage = cacheUsage.splitAgainstTotal(cacheProfile.TotalInputTokens, inputTokens)
+		}
 		outputTokens = estimateClaudeOutputTokens(finalContent, rawThinkingContent, toolUses)
 
 		h.recordSuccessForApiKey(apiKeyID, inputTokens, outputTokens, credits, model)
 		h.pool.RecordSuccess(account.ID)
+		h.pool.RecordLatency(account.ID, float64(time.Since(tr.startedAt).Milliseconds()))
 		h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
 		h.promptCache.Update(account.ID, cacheProfile)
 		stopReason := "end_turn"
@@ -2157,6 +2521,8 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayl
 		return
 	}
 
+	// Preserve the upstream status (429/402 stay themselves rather than
+	// flattening to 500) and carry Retry-After through to the client.
 	status := statusForUpstreamError(lastErr)
 	h.emitTrace(tr, outcomeError, status)
 	applyRetryAfterHeader(w, lastErr)
@@ -2207,8 +2573,12 @@ func (h *Handler) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
 	kiroPayload := OpenAIToKiro(&req, thinking)
 
 	apiKeyID := apiKeyIDFromContext(r.Context())
+	// forwarded marks a request that already passed through one Kiro-Go pool, so a
+	// custom_api account cannot add another hop (loop guard, see forwardToUpstream).
+	forwarded := r.Header.Get(forwardHeader) != ""
 	if req.Stream {
-		h.handleOpenAIStream(w, kiroPayload, req.Model, thinking, estimatedInputTokens, apiKeyID)
+		// Streaming returns here: the response cache below is non-stream only.
+		h.handleOpenAIStream(w, kiroPayload, req.Model, thinking, estimatedInputTokens, apiKeyID, body, forwarded)
 		return
 	}
 
@@ -2235,17 +2605,17 @@ func (h *Handler) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
 	}
 	if cacheKey != "" {
 		cw := newCaptureWriter(w)
-		h.handleOpenAINonStream(cw, kiroPayload, req.Model, thinking, estimatedInputTokens, apiKeyID)
+		h.handleOpenAINonStream(cw, kiroPayload, req.Model, thinking, estimatedInputTokens, apiKeyID, body, forwarded)
 		if cw.status == http.StatusOK && len(cw.buf) > 0 {
 			h.responseCache.Set(cacheKey, cw.buf, config.GetResponseCacheTTLSeconds(), time.Now().Unix())
 		}
 		return
 	}
-	h.handleOpenAINonStream(w, kiroPayload, req.Model, thinking, estimatedInputTokens, apiKeyID)
+	h.handleOpenAINonStream(w, kiroPayload, req.Model, thinking, estimatedInputTokens, apiKeyID, body, forwarded)
 }
 
 // handleOpenAIStream OpenAI 流式响应
-func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload, model string, thinking bool, estimatedInputTokens int, apiKeyID string) {
+func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload, model string, thinking bool, estimatedInputTokens int, apiKeyID string, rawBody []byte, forwarded bool) {
 	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
@@ -2266,7 +2636,7 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 	tr := newTraceRecorder("openai", model, true, apiKeyID)
 
 	for attempt := 0; attempt < maxAccountRetryAttempts; attempt++ {
-		account := h.pool.GetNextForModelExcluding(model, excluded)
+		account := h.pool.GetNextForModelWithApiKey(model, excluded, apiKeyID)
 		if account == nil {
 			break
 		}
@@ -2277,6 +2647,47 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 			tr.endAttempt(att, err)
 			h.handleAccountFailure(account, err)
 			continue
+		}
+
+		// Native Bedrock accounts serve the OpenAI wire format by converting the
+		// request to Anthropic Messages, invoking Bedrock, and converting the
+		// Anthropic SSE back to OpenAI chunks. Same passthrough/failover contract
+		// as custom_api: success ends the request; a pre-stream error fails over.
+		if account.IsBedrock() {
+			if bErr := h.invokeBedrockOpenAIStream(w, flusher, forwardParams{
+				account: account, body: rawBody, endpoint: "openai", streaming: true,
+				model: model, apiKeyID: apiKeyID, forwarded: forwarded,
+			}); bErr != nil {
+				lastErr = bErr
+				excluded[account.ID] = true
+				if !errors.Is(bErr, errBedrockThrottled) {
+					h.handleAccountFailure(account, bErr)
+				}
+				continue
+			}
+			return
+		}
+		// Custom API accounts proxy to another Kiro-Go pool (see handleClaudeStream).
+		if account.IsCustomApi() {
+			// Already forwarded once: don't add another hop, and don't penalize this
+			// healthy account (loop-guard is not a failure) — just skip it. The account
+			// is excluded, so `attempt--` cannot loop forever; it only avoids spending a
+			// real retry on an ineligible account.
+			if forwarded {
+				excluded[account.ID] = true
+				attempt--
+				continue
+			}
+			if fwdErr := h.forwardToUpstream(w, flusher, forwardParams{
+				account: account, body: rawBody, endpoint: "openai", streaming: true,
+				model: model, apiKeyID: apiKeyID, forwarded: forwarded,
+			}); fwdErr != nil {
+				lastErr = fwdErr
+				excluded[account.ID] = true
+				h.handleAccountFailure(account, fwdErr)
+				continue
+			}
+			return
 		}
 
 		var toolCalls []ToolCall
@@ -2585,11 +2996,13 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 				continue
 			}
 			h.emitTrace(tr, outcomeError, statusForUpstreamError(err))
-			// Terminate the SSE stream. Returning here simply stopped writing, so
-			// a client that had already received content saw the connection end
-			// with no error payload, no finish_reason, and no [DONE] sentinel: the
-			// partial answer looked like a COMPLETE one. Emit an explicit error
-			// chunk, a finish_reason, and [DONE] so the failure is unambiguous.
+			// Stream already started: cannot retry or send a JSON error. Returning
+			// here simply stopped writing, so a client that had already received
+			// content saw the connection end with no error payload, no
+			// finish_reason, and no [DONE] sentinel: the partial answer looked like
+			// a COMPLETE one. Emit an explicit error chunk, a finish_reason, and
+			// [DONE] so the failure is unambiguous (mirrors handleClaudeStream's
+			// error SSE and handleResponsesStream's response.failed).
 			errChunk := map[string]interface{}{
 				"id":      chatID,
 				"object":  "chat.completion.chunk",
@@ -2600,6 +3013,9 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 					"delta":         map[string]interface{}{},
 					"finish_reason": "error",
 				}},
+				// The error object tells the client WHY the stream ended; a bare
+				// finish_reason:"error" is indistinguishable from a normal stop
+				// for clients that only read the delta.
 				"error": map[string]string{
 					"type":    errorTypeForOpenAIStatus(statusForUpstreamError(err)),
 					"message": err.Error(),
@@ -2639,6 +3055,7 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 
 		h.recordSuccessForApiKey(apiKeyID, inputTokens, outputTokens, credits, model)
 		h.pool.RecordSuccess(account.ID)
+		h.pool.RecordLatency(account.ID, float64(time.Since(tr.startedAt).Milliseconds()))
 		h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
 		finishReason := "stop"
 		if len(toolCalls) > 0 {
@@ -2677,6 +3094,8 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 		return
 	}
 
+	// Preserve the upstream status (429/402 stay themselves rather than
+	// flattening to 500) and carry Retry-After through to the client.
 	status := statusForUpstreamError(lastErr)
 	h.emitTrace(tr, outcomeError, status)
 	applyRetryAfterHeader(w, lastErr)
@@ -2684,14 +3103,14 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 }
 
 // handleOpenAINonStream OpenAI 非流式响应
-func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, payload *KiroPayload, model string, thinking bool, estimatedInputTokens int, apiKeyID string) {
+func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, payload *KiroPayload, model string, thinking bool, estimatedInputTokens int, apiKeyID string, rawBody []byte, forwarded bool) {
 	excluded := make(map[string]bool)
 	var lastErr error
 	// The trace recorder owns request-level timing from here on.
 	tr := newTraceRecorder("openai", model, false, apiKeyID)
 
 	for attempt := 0; attempt < maxAccountRetryAttempts; attempt++ {
-		account := h.pool.GetNextForModelExcluding(model, excluded)
+		account := h.pool.GetNextForModelWithApiKey(model, excluded, apiKeyID)
 		if account == nil {
 			break
 		}
@@ -2702,6 +3121,46 @@ func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, payload *KiroPayl
 			tr.endAttempt(att, err)
 			h.handleAccountFailure(account, err)
 			continue
+		}
+
+		// Native Bedrock accounts serve OpenAI by converting to Anthropic, invoking
+		// Bedrock, and converting the Anthropic JSON response back to an OpenAI
+		// chat.completion. Success ends the request; a pre-reply error fails over.
+		if account.IsBedrock() {
+			if bErr := h.invokeBedrockOpenAINonStream(w, forwardParams{
+				account: account, body: rawBody, endpoint: "openai", streaming: false,
+				model: model, apiKeyID: apiKeyID, forwarded: forwarded,
+			}); bErr != nil {
+				lastErr = bErr
+				excluded[account.ID] = true
+				if !errors.Is(bErr, errBedrockThrottled) {
+					h.handleAccountFailure(account, bErr)
+				}
+				continue
+			}
+			return
+		}
+		// Custom API accounts proxy to another Kiro-Go pool (see handleClaudeStream).
+		if account.IsCustomApi() {
+			// Already forwarded once: don't add another hop, and don't penalize this
+			// healthy account (loop-guard is not a failure) — just skip it. The account
+			// is excluded, so `attempt--` cannot loop forever; it only avoids spending a
+			// real retry on an ineligible account.
+			if forwarded {
+				excluded[account.ID] = true
+				attempt--
+				continue
+			}
+			if fwdErr := h.forwardToUpstream(w, nil, forwardParams{
+				account: account, body: rawBody, endpoint: "openai", streaming: false,
+				model: model, apiKeyID: apiKeyID, forwarded: forwarded,
+			}); fwdErr != nil {
+				lastErr = fwdErr
+				excluded[account.ID] = true
+				h.handleAccountFailure(account, fwdErr)
+				continue
+			}
+			return
 		}
 
 		var content string
@@ -2766,6 +3225,7 @@ func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, payload *KiroPayl
 
 		h.recordSuccessForApiKey(apiKeyID, inputTokens, outputTokens, credits, model)
 		h.pool.RecordSuccess(account.ID)
+		h.pool.RecordLatency(account.ID, float64(time.Since(tr.startedAt).Milliseconds()))
 		h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
 		finishReason := "stop"
 		if len(toolUses) > 0 {
@@ -2788,6 +3248,8 @@ func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, payload *KiroPayl
 		return
 	}
 
+	// Preserve the upstream status (429/402 stay themselves rather than
+	// flattening to 500) and carry Retry-After through to the client.
 	status := statusForUpstreamError(lastErr)
 	h.emitTrace(tr, outcomeError, status)
 	applyRetryAfterHeader(w, lastErr)
@@ -2807,7 +3269,14 @@ func (h *Handler) sendOpenAIError(w http.ResponseWriter, status int, errType, me
 
 // ensureValidToken 确保 token 有效
 func (h *Handler) ensureValidToken(account *config.Account) error {
-	if account == nil || account.IsKiroAPIKeyCredential() {
+	// Nil guard FIRST: every branch below dereferences the account.
+	//
+	// Three credential kinds have no OAuth token to refresh and no expiry to
+	// honor, so they short-circuit here:
+	//   - Kiro API-key accounts: the ksk_ key IS the upstream bearer.
+	//   - custom_api accounts: a static upstream bearer for another Kiro-Go pool.
+	//   - Bedrock accounts: per-request SigV4 with a static IAM access key.
+	if account == nil || account.IsKiroAPIKeyCredential() || account.IsCustomApi() || account.IsBedrock() {
 		return nil
 	}
 	if account.ExpiresAt == 0 || time.Now().Unix() < account.ExpiresAt-tokenRefreshSkewSeconds {
@@ -2944,6 +3413,13 @@ func (h *Handler) handleAdminAPI(w http.ResponseWriter, r *http.Request) {
 	case strings.HasPrefix(path, "/accounts/") && strings.HasSuffix(path, "/test") && r.Method == "POST":
 		id := strings.TrimSuffix(strings.TrimPrefix(path, "/accounts/"), "/test")
 		h.apiTestAccount(w, r, id)
+	// Kiro profile discovery/switch for an existing account (external_idp multi-region).
+	case strings.HasPrefix(path, "/accounts/") && strings.HasSuffix(path, "/kiro-profiles") && r.Method == "GET":
+		id := strings.TrimSuffix(strings.TrimPrefix(path, "/accounts/"), "/kiro-profiles")
+		h.apiListAccountKiroProfiles(w, r, id)
+	case strings.HasPrefix(path, "/accounts/") && strings.HasSuffix(path, "/kiro-profiles") && r.Method == "POST":
+		id := strings.TrimSuffix(strings.TrimPrefix(path, "/accounts/"), "/kiro-profiles")
+		h.apiSwitchAccountKiroProfile(w, r, id)
 	case strings.HasPrefix(path, "/accounts/") && strings.HasSuffix(path, "/models/cached") && r.Method == "GET":
 		id := strings.TrimSuffix(strings.TrimPrefix(path, "/accounts/"), "/models/cached")
 		h.apiGetAccountModelsCached(w, r, id)
@@ -2981,6 +3457,8 @@ func (h *Handler) handleAdminAPI(w http.ResponseWriter, r *http.Request) {
 		h.apiFinalizeKiroSsoProfile(w, r)
 	case path == "/auth/kiro-sso/cancel" && r.Method == "POST":
 		h.apiCancelKiroSso(w, r)
+	case path == "/auth/kiro-sso/select-profile" && r.Method == "POST":
+		h.apiSelectKiroSsoProfile(w, r)
 	case path == "/auth/kiro-api-key/probe" && r.Method == "POST":
 		h.apiProbeKiroAPIKey(w, r)
 	case path == "/auth/kiro-api-key/commit" && r.Method == "POST":
@@ -3411,17 +3889,73 @@ func (h *Handler) apiAddAccount(w http.ResponseWriter, r *http.Request) {
 	if account.ID == "" {
 		account.ID = auth.GenerateAccountID()
 	}
+
+	// Kiro API-key accounts: the key IS the credential. Validate it, normalize the
+	// auth method, and mirror it into AccessToken so pool routing / model refresh
+	// (which gate on a non-empty AccessToken) treat the account as ready. ExpiresAt
+	// stays 0 so the token-refresh paths skip it — API keys are never refreshed.
+	// Detection is case-insensitive (matching IsApiKeyCredential) and also triggers
+	// when a bare kiroApiKey is supplied without an explicit authMethod.
+	account.KiroApiKey = strings.TrimSpace(account.KiroApiKey)
+	if account.IsApiKeyCredential() || account.KiroApiKey != "" {
+		if account.KiroApiKey == "" {
+			w.WriteHeader(400)
+			json.NewEncoder(w).Encode(map[string]string{"error": "kiroApiKey is required"})
+			return
+		}
+		// Reject a contradictory payload: a key plus a different, explicit OAuth
+		// method would otherwise be silently rewritten to api_key.
+		if am := strings.TrimSpace(account.AuthMethod); am != "" && !account.IsApiKeyCredential() {
+			w.WriteHeader(400)
+			json.NewEncoder(w).Encode(map[string]string{"error": "kiroApiKey cannot be combined with authMethod " + am})
+			return
+		}
+		account.AuthMethod = "api_key"
+		account.ExpiresAt = 0
+		account.AccessToken = account.KiroApiKey
+		// Discover the region the key actually serves. The panel deliberately omits
+		// region for api_key adds, so without this an EU-provisioned key would inherit
+		// the us-east-1 default below and 403 on every upstream call, permanently.
+		// A transient upstream failure must not be reported as a bad key, so it maps
+		// to 502 (retry) rather than 400 (caller error).
+		region, info, retryable, err := resolveApiKeyRegion(account.KiroApiKey, account.Region)
+		if err != nil {
+			status := 400
+			if retryable {
+				status = 502
+			}
+			w.WriteHeader(status)
+			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+		account.Region = region
+		// The probe already paid for the identity round-trip; keep it so the account
+		// shows a real email in the panel and can be deduplicated by UserId later.
+		if info != nil {
+			if account.Email == "" {
+				account.Email = info.Email
+			}
+			if account.UserId == "" {
+				account.UserId = info.UserId
+			}
+		}
+	}
+
 	if account.Region == "" {
 		account.Region = "us-east-1"
 	}
-	// Phase 1 establishes safe runtime support only. Do not persist a long-lived
-	// Kiro key through this generic whole-Account decoder; Phase 2 adds a
-	// probe/commit workflow that validates the key and region first.
-	if strings.TrimSpace(account.KiroApiKey) != "" || account.IsKiroAPIKeyCredential() {
-		w.WriteHeader(http.StatusBadRequest)
-		json.NewEncoder(w).Encode(map[string]string{"error": "Kiro API-key onboarding is not enabled on this endpoint"})
-		return
-	}
+	// NOTE: this endpoint previously hard-rejected every api_key account with
+	// "Kiro API-key onboarding is not enabled on this endpoint", deferring to a
+	// future phase that would "validate the key and region first". That
+	// validation is the resolveApiKeyRegion probe above — it verifies the key
+	// against upstream, resolves the real data-plane region (rather than
+	// defaulting to us-east-1 and 403ing forever), and backfills identity. With
+	// it in place the block was rejecting the very requests it was waiting for,
+	// so it is gone. The dedicated probe/commit endpoints
+	// (/auth/kiro-api-key/probe + /commit, kiro_apikey_admin.go) still exist for
+	// the two-step operator flow; this is the direct single-call path.
+	// Locked in by TestApiAddAccountApiKeyBranch and the region tests beside it.
+
 	// Validate/normalize the data-plane region override supplied at creation.
 	if account.RegionOverride != "" {
 		normalized, ok := validateRegionOverride(account.RegionOverride)
@@ -3605,6 +4139,58 @@ func (h *Handler) apiUpdateAccount(w http.ResponseWriter, r *http.Request, id st
 	if v, ok := updates["modelAllowList"]; ok {
 		// Accept an array of model IDs (empty array / null clears the restriction).
 		existing.ModelAllowList = parseModelAllowList(v)
+	}
+
+	// Editable Bedrock fields — only for bedrock accounts. Region and credentials
+	// change which upstream/model set the account resolves, so clear the cached model
+	// discovery when any of them move. (Region is deliberately NOT editable for Kiro
+	// accounts here: their Region drives OIDC endpoints and must not be changed by a
+	// generic field update.)
+	if existing.IsBedrock() {
+		bedrockChanged := false
+		if v, ok := updates["region"].(string); ok && strings.TrimSpace(v) != existing.Region {
+			existing.Region = strings.TrimSpace(v)
+			bedrockChanged = true
+		}
+		if v, ok := updates["bedrockApiKey"].(string); ok {
+			existing.BedrockAPIKey = strings.TrimSpace(v)
+			bedrockChanged = true
+		}
+		if v, ok := updates["bedrockAccessKeyId"].(string); ok {
+			existing.BedrockAccessKeyID = strings.TrimSpace(v)
+			bedrockChanged = true
+		}
+		if v, ok := updates["bedrockSecretAccessKey"].(string); ok {
+			existing.BedrockSecretAccessKey = strings.TrimSpace(v)
+			bedrockChanged = true
+		}
+		if v, ok := updates["bedrockUseConverse"].(bool); ok {
+			existing.BedrockUseConverse = v
+		}
+		// bedrockRegions is a JSON array of extra candidate regions; accept string
+		// items and drop blanks.
+		if v, ok := updates["bedrockRegions"].([]interface{}); ok {
+			var regions []string
+			for _, item := range v {
+				if s, ok := item.(string); ok && strings.TrimSpace(s) != "" {
+					regions = append(regions, strings.TrimSpace(s))
+				}
+			}
+			existing.BedrockRegions = regions
+			bedrockChanged = true
+		}
+		// Guard the same either/or invariant the add endpoint enforces: an update must
+		// not leave the account with no usable credential (it would then fail every
+		// request pre-stream and be perpetually excluded).
+		if existing.BedrockAPIKey == "" && (existing.BedrockAccessKeyID == "" || existing.BedrockSecretAccessKey == "") {
+			w.WriteHeader(400)
+			json.NewEncoder(w).Encode(map[string]string{"error": "bedrock account needs either an API key or an access key + secret"})
+			return
+		}
+		if bedrockChanged {
+			clearBedrockModelCache(existing.ID)
+			clearBedrockRegionRoutes(existing.ID)
+		}
 	}
 
 	if err := config.UpdateAccount(id, *existing); err != nil {
@@ -4065,7 +4651,8 @@ func (h *Handler) apiStartKiroSso(w http.ResponseWriter, r *http.Request) {
 
 // apiCancelKiroSso tears down an in-flight hosted-portal sign-in (operator closed or
 // cancelled the modal), freeing the loopback callback port immediately instead of
-// waiting for the deadline.
+// waiting for the deadline. It also drops any tokens parked awaiting a profile
+// choice, so a dismissed picker doesn't leave credentials in memory for the TTL.
 func (h *Handler) apiCancelKiroSso(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-store")
 	var req struct {
@@ -4076,9 +4663,270 @@ func (h *Handler) apiCancelKiroSso(w http.ResponseWriter, r *http.Request) {
 		h.kiroSsoLifecycleMu.Lock()
 		defer h.kiroSsoLifecycleMu.Unlock()
 		auth.CancelKiroSsoLogin(req.SessionID)
+		// There are TWO independent parking mechanisms for a credential awaiting a
+		// profile choice, and a cancel must clear BOTH or the one left behind keeps
+		// tokens in memory for its full TTL:
+		//   - kiroSsoProfileChoiceStore backs /auth/kiro-sso/profile
+		//     (kiro_sso_profile_admin.go).
+		//   - pendingKiroSsoChoices backs /auth/kiro-sso/select-profile (below).
+		// Both are no-ops when the session parked nothing.
 		h.getKiroSsoProfileChoiceStore().cancel(req.SessionID)
+		dropPendingKiroSsoChoice(req.SessionID)
 	}
 	json.NewEncoder(w).Encode(map[string]interface{}{"success": true})
+}
+
+// --- Deferred profile choice (external_idp multi-region) ---------------------
+//
+// When the eager probe finds 2+ Kiro profiles for a freshly-exchanged
+// external_idp credential, the account is NOT created yet: the exchanged tokens
+// and the discovered profile list are parked here (keyed by the SSO session id)
+// until the operator picks a profile via /auth/kiro-sso/select-profile, cancels,
+// or the TTL expires. The TTL keeps unclaimed tokens from lingering in memory.
+
+// kiroSsoChoiceTTL bounds how long exchanged tokens wait for a profile choice.
+const kiroSsoChoiceTTL = 5 * time.Minute
+
+// pendingKiroSsoChoice parks one exchanged credential awaiting a profile pick.
+type pendingKiroSsoChoice struct {
+	result    *auth.KiroSsoResult
+	machineId string
+	profiles  []KiroProfile
+	// expiresAt is the ACCESS TOKEN's absolute expiry, stamped at exchange time.
+	// It must not be recomputed from ExpiresIn at finalize time: the operator can
+	// sit on the picker for minutes, and an expiry overstated by that gap would
+	// make the proactive refresh (tokenRefreshSkewSeconds) miss the real deadline.
+	expiresAt int64
+	// deadline is when this stash self-destructs. A re-stash (invalid pick keeps
+	// the entry alive for another attempt) reuses the ORIGINAL deadline so
+	// repeated invalid picks cannot extend how long tokens sit in memory.
+	deadline time.Time
+	timer    *time.Timer
+}
+
+var (
+	pendingKiroSsoChoices   = make(map[string]*pendingKiroSsoChoice)
+	pendingKiroSsoChoicesMu sync.Mutex
+)
+
+// stashPendingKiroSsoChoice parks an exchanged credential plus its discovered
+// profiles under the SSO session id, self-expiring at pending.deadline.
+func stashPendingKiroSsoChoice(sessionID string, pending *pendingKiroSsoChoice) {
+	// Identity-checked expiry: only delete the entry if it is still THIS stash.
+	// A plain delete-by-key could race a re-stash — Stop() on an already-fired
+	// timer is a no-op, and the fired callback would then destroy the fresh entry.
+	pending.timer = time.AfterFunc(time.Until(pending.deadline), func() {
+		pendingKiroSsoChoicesMu.Lock()
+		if cur, ok := pendingKiroSsoChoices[sessionID]; ok && cur == pending {
+			delete(pendingKiroSsoChoices, sessionID)
+			logger.Debugf("[KiroSSO] Pending profile choice for session %s expired", sessionID)
+		}
+		pendingKiroSsoChoicesMu.Unlock()
+	})
+	pendingKiroSsoChoicesMu.Lock()
+	// A repeated stash for the same session replaces the previous one; stop the
+	// superseded timer (best-effort — the identity check above covers the rest).
+	if prev, ok := pendingKiroSsoChoices[sessionID]; ok && prev.timer != nil {
+		prev.timer.Stop()
+	}
+	pendingKiroSsoChoices[sessionID] = pending
+	pendingKiroSsoChoicesMu.Unlock()
+}
+
+// takePendingKiroSsoChoice removes and returns the parked credential, or nil.
+func takePendingKiroSsoChoice(sessionID string) *pendingKiroSsoChoice {
+	pendingKiroSsoChoicesMu.Lock()
+	defer pendingKiroSsoChoicesMu.Unlock()
+	pending, ok := pendingKiroSsoChoices[sessionID]
+	if !ok {
+		return nil
+	}
+	delete(pendingKiroSsoChoices, sessionID)
+	if pending.timer != nil {
+		pending.timer.Stop()
+	}
+	return pending
+}
+
+// dropPendingKiroSsoChoice discards a parked credential (cancel / TTL expiry).
+func dropPendingKiroSsoChoice(sessionID string) {
+	if pending := takePendingKiroSsoChoice(sessionID); pending != nil {
+		logger.Debugf("[KiroSSO] Dropped pending profile choice for session %s", sessionID)
+	}
+}
+
+// apiSelectKiroSsoProfile finishes a deferred hosted-portal sign-in: the operator
+// picked one of the discovered profiles, so pin it and create the account.
+func (h *Handler) apiSelectKiroSsoProfile(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		SessionID  string `json:"sessionId"`
+		ProfileArn string `json:"profileArn"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		w.WriteHeader(400)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Invalid JSON"})
+		return
+	}
+	req.ProfileArn = strings.TrimSpace(req.ProfileArn)
+	if req.SessionID == "" || req.ProfileArn == "" {
+		w.WriteHeader(400)
+		json.NewEncoder(w).Encode(map[string]string{"error": "sessionId and profileArn are required"})
+		return
+	}
+
+	pending := takePendingKiroSsoChoice(req.SessionID)
+	if pending == nil {
+		w.WriteHeader(400)
+		json.NewEncoder(w).Encode(map[string]string{"error": "profile choice expired or already completed; sign in again"})
+		return
+	}
+
+	// Only an ARN that was actually offered may be pinned — reject anything else
+	// and re-park the stash so the operator can pick again.
+	valid := false
+	for _, p := range pending.profiles {
+		if p.Arn == req.ProfileArn {
+			valid = true
+			break
+		}
+	}
+	if !valid {
+		// Re-park with the ORIGINAL deadline: an invalid pick must not reset the TTL.
+		stashPendingKiroSsoChoice(req.SessionID, pending)
+		w.WriteHeader(400)
+		json.NewEncoder(w).Encode(map[string]string{"error": "profileArn is not one of the discovered profiles"})
+		return
+	}
+
+	pending.result.ProfileArn = req.ProfileArn
+	h.finalizeKiroSsoAccount(w, pending.result, pending.machineId, pending.expiresAt)
+}
+
+// apiListAccountKiroProfiles GET /accounts/{id}/kiro-profiles
+// Runs the multi-region profile discovery for an EXISTING account so the
+// operator can see every Kiro profile the credential can reach (e.g. a US and
+// an EU profile) and re-pin via POST. external_idp only: other auth methods
+// carry an authoritative region already.
+func (h *Handler) apiListAccountKiroProfiles(w http.ResponseWriter, r *http.Request, id string) {
+	account, status, errMsg := h.lookupAccountForProfileOps(id)
+	if account == nil {
+		w.WriteHeader(status)
+		json.NewEncoder(w).Encode(map[string]string{"error": errMsg})
+		return
+	}
+
+	profiles, err := DiscoverKiroProfiles(account)
+	if err != nil {
+		w.WriteHeader(500)
+		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		return
+	}
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"success":  true,
+		"profiles": profiles,
+		"current":  strings.TrimSpace(account.ProfileArn),
+	})
+}
+
+// apiSwitchAccountKiroProfile POST /accounts/{id}/kiro-profiles {profileArn}
+// Re-pins an existing external_idp account to another discovered profile. The
+// requested ARN is validated against a fresh discovery (stateless: no stash to
+// expire) before overwriting the cached ProfileArn; the pool reload makes the
+// data-plane region switch take effect on the next request.
+func (h *Handler) apiSwitchAccountKiroProfile(w http.ResponseWriter, r *http.Request, id string) {
+	var req struct {
+		ProfileArn string `json:"profileArn"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		w.WriteHeader(400)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Invalid JSON"})
+		return
+	}
+	req.ProfileArn = strings.TrimSpace(req.ProfileArn)
+	if req.ProfileArn == "" {
+		w.WriteHeader(400)
+		json.NewEncoder(w).Encode(map[string]string{"error": "profileArn is required"})
+		return
+	}
+
+	account, status, errMsg := h.lookupAccountForProfileOps(id)
+	if account == nil {
+		w.WriteHeader(status)
+		json.NewEncoder(w).Encode(map[string]string{"error": errMsg})
+		return
+	}
+
+	profiles, err := DiscoverKiroProfiles(account)
+	if err != nil {
+		w.WriteHeader(500)
+		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		return
+	}
+	valid := false
+	for _, p := range profiles {
+		if p.Arn == req.ProfileArn {
+			valid = true
+			break
+		}
+	}
+	if !valid {
+		w.WriteHeader(400)
+		json.NewEncoder(w).Encode(map[string]string{"error": "profileArn is not one of the discovered profiles"})
+		return
+	}
+
+	if err := config.UpdateAccountProfileArn(id, req.ProfileArn); err != nil {
+		w.WriteHeader(500)
+		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		return
+	}
+	h.pool.Reload()
+
+	// The model list is region-scoped: a profile in another region can expose a
+	// different set, so refresh the cache for the new pin right away instead of
+	// serving the old region's models until the next scheduled refresh. Failure
+	// here must not undo the switch — the ARN is already persisted — so it is
+	// reported alongside success rather than as an error status.
+	account.ProfileArn = req.ProfileArn
+	modelsRefreshed := true
+	if err := h.fetchAndCacheAccountModels(account); err != nil {
+		modelsRefreshed = false
+		logger.Warnf("[ProfileArn] Model refresh after profile switch failed for %s: %v", accountEmailForLog(account), err)
+	}
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"success":         true,
+		"profileArn":      req.ProfileArn,
+		"modelsRefreshed": modelsRefreshed,
+	})
+}
+
+// lookupAccountForProfileOps fetches an account copy (with the pool's freshest
+// tokens) for profile discovery/switch, restricted to external_idp accounts.
+// Returns (nil, httpStatus, message) when not found (404) or not eligible (400).
+func (h *Handler) lookupAccountForProfileOps(id string) (*config.Account, int, string) {
+	accounts := config.GetAccounts()
+	var account *config.Account
+	for i := range accounts {
+		if accounts[i].ID == id {
+			account = &accounts[i]
+			break
+		}
+	}
+	if account == nil {
+		return nil, 404, "Account not found"
+	}
+	if !strings.EqualFold(strings.TrimSpace(account.AuthMethod), "external_idp") {
+		return nil, 400, "profile switching is only supported for external_idp accounts"
+	}
+	// 与 apiRefreshAccountModels 一致：用 pool 中运行时最新 token 探测，避免用到
+	// 已被刷新淘汰的磁盘态 token。
+	if latest := h.pool.GetByID(id); latest != nil {
+		account.AccessToken = latest.AccessToken
+		account.RefreshToken = latest.RefreshToken
+		account.ExpiresAt = latest.ExpiresAt
+		account.ProfileArn = latest.ProfileArn
+	}
+	return account, 200, ""
 }
 
 // apiPollKiroSso reports the hosted-portal sign-in status. While the user is signing in it
@@ -4132,6 +4980,14 @@ func (h *Handler) apiPollKiroSso(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Authorization completed. processCompletedKiroSsoResult owns the whole
+	// post-exchange flow for this route: it probes every candidate region for
+	// Kiro profiles and then either creates the account directly (0 or 1
+	// profile found — 0 keeps the historical lazy-resolution behaviour) or parks
+	// the exchanged credential in kiroSsoProfileChoiceStore and offers the
+	// operator a choice (2+ profiles). It also carries the partial-region
+	// warnings, so a region that failed to answer is never presented as an
+	// authoritative empty result.
 	if err := validateCompletedKiroSsoResult(result, status); err != nil {
 		w.WriteHeader(http.StatusBadGateway)
 		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
@@ -4147,6 +5003,48 @@ func (h *Handler) apiPollKiroSso(w http.ResponseWriter, r *http.Request) {
 		writeKiroSsoProfileChoice(w, profiles, warnings, expiresAt)
 		return
 	}
+	writeKiroSsoCompleted(w, account)
+}
+
+// buildKiroSsoAccount assembles the persisted account record from an exchanged
+// hosted-portal credential. Shared by the immediate path (0/1 profile) and the
+// deferred path (operator picked one of several profiles), so both create
+// byte-identical accounts. expiresAt is the absolute token expiry stamped at
+// exchange time — never derived from ExpiresIn here, because on the deferred
+// path minutes may have passed since the exchange.
+func buildKiroSsoAccount(result *auth.KiroSsoResult, machineId string, expiresAt int64) config.Account {
+	return config.Account{
+		ID:            auth.GenerateAccountID(),
+		Email:         result.Email,
+		AccessToken:   result.AccessToken,
+		RefreshToken:  result.RefreshToken,
+		ClientID:      result.ClientID,
+		AuthMethod:    result.AuthMethod,
+		Provider:      result.Provider,
+		Region:        result.Region,
+		ProfileArn:    result.ProfileArn,
+		TokenEndpoint: result.TokenEndpoint,
+		IssuerURL:     result.IssuerURL,
+		Scopes:        result.Scopes,
+		ExpiresAt:     expiresAt,
+		Enabled:       true,
+		MachineId:     machineId,
+	}
+}
+
+// finalizeKiroSsoAccount persists the account and writes the completed response.
+// Used by the deferred path (/auth/kiro-sso/select-profile), where the operator
+// has already picked one of the offered profiles, so there is no choice left to
+// present here.
+func (h *Handler) finalizeKiroSsoAccount(w http.ResponseWriter, result *auth.KiroSsoResult, machineId string, expiresAt int64) {
+	account := buildKiroSsoAccount(result, machineId, expiresAt)
+
+	if err := config.AddAccount(account); err != nil {
+		w.WriteHeader(500)
+		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		return
+	}
+	h.pool.Reload()
 	writeKiroSsoCompleted(w, account)
 }
 
@@ -4254,6 +5152,13 @@ func (h *Handler) apiImportCredentials(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// importOne is the single source of truth for every credential-import path
+	// (this endpoint, /auth/import-cli-json, /auth/import-ide-cache, the batch
+	// apply, and the directory watcher), so the persisted account is identical
+	// no matter how it arrived. It also owns the api_key branch internally
+	// (importKiroAPIKeyCredential: region probe + identity backfill) and the
+	// external_idp endpoint allow-list validation, so the inline per-kind
+	// handling that used to live here would be a second, drifting copy.
 	account, err := h.importOne(req)
 	if err != nil {
 		w.WriteHeader(importErrorStatus(err))
@@ -4395,21 +5300,42 @@ func (h *Handler) importKiroAPIKeyCredential(req importCredentialRequest) (confi
 	if err != nil {
 		return config.Account{}, &importValidationError{err.Error()}
 	}
-	region, ok := validateRegionOverride(req.Region)
-	if !ok || region == "" {
-		return config.Account{}, &importValidationError{"api_key import requires a valid selected region"}
-	}
-	probe := &config.Account{
-		AuthMethod: "api_key", Provider: "KiroAPIKey", KiroApiKey: key,
-		Region: region, RegionOverride: region, MachineId: config.GenerateMachineId(),
-	}
-	info, probeErr := probeKiroAPIKeyAccount(probe)
-	if probeErr != nil || info == nil {
-		if probeErr == nil {
-			probeErr = fmt.Errorf("empty upstream probe result")
+	// Region handling mirrors apiAddAccount: an api_key account NEVER re-probes
+	// after creation, so a wrong region is permanent (every upstream call 403s).
+	// A record that carries no region must therefore DISCOVER the region its key
+	// actually serves rather than inherit a us-east-1 default — resolveApiKeyRegion
+	// walks the candidate regions and also returns the identity it fetched on the
+	// way. A record that does carry one still gets it validated against the key.
+	region, _ := validateRegionOverride(req.Region)
+	var info *config.AccountInfo
+	if region == "" {
+		resolved, probed, retryable, resolveErr := resolveApiKeyRegion(key, "")
+		if resolveErr != nil {
+			// Transient upstream trouble is not a bad key: surface it as a
+			// non-validation error so the caller maps it to 502, not 400.
+			if retryable {
+				return config.Account{}, fmt.Errorf("Kiro API key region discovery failed: %w", resolveErr)
+			}
+			return config.Account{}, &importValidationError{
+				"Kiro API key validation failed: " + classifyKiroAPIKeyProbeError(resolveErr),
+			}
 		}
-		return config.Account{}, &importValidationError{
-			"Kiro API key validation failed: " + classifyKiroAPIKeyProbeError(probeErr),
+		region, info = resolved, probed
+	}
+	if info == nil {
+		probe := &config.Account{
+			AuthMethod: "api_key", Provider: "KiroAPIKey", KiroApiKey: key,
+			Region: region, RegionOverride: region, MachineId: config.GenerateMachineId(),
+		}
+		probeErr := error(nil)
+		info, probeErr = probeKiroAPIKeyAccount(probe)
+		if probeErr != nil || info == nil {
+			if probeErr == nil {
+				probeErr = fmt.Errorf("empty upstream probe result")
+			}
+			return config.Account{}, &importValidationError{
+				"Kiro API key validation failed: " + classifyKiroAPIKeyProbeError(probeErr),
+			}
 		}
 	}
 
@@ -4424,6 +5350,13 @@ func (h *Handler) importKiroAPIKeyCredential(req importCredentialRequest) (confi
 	account := config.Account{
 		ID: accountID, Email: email, UserId: strings.TrimSpace(info.UserId),
 		Nickname: strings.TrimSpace(req.Nickname), KiroApiKey: key,
+		// AccessToken is deliberately left EMPTY. The generic add path mirrors the
+		// key there for legacy pool compatibility, but that duplicates a
+		// long-lived secret into a second persisted field. It is unnecessary here:
+		// config.HasUpstreamCredential and UpstreamBearerToken both special-case
+		// IsKiroAPIKeyCredential and read KiroApiKey, so routing and dispatch work
+		// from the single copy. Locked in by
+		// TestImportKiroAPIKeyCredentialLiveValidatesAndPersists.
 		AuthMethod: "api_key", Provider: "KiroAPIKey", Region: region,
 		RegionOverride: region, MachineId: config.GenerateMachineId(), Enabled: true,
 		BanStatus: "ACTIVE", ExpiresAt: 0, SubscriptionType: info.SubscriptionType,
@@ -4517,7 +5450,11 @@ func buildImportPlan(index int, req importCredentialRequest) importPreviewItem {
 	if plan.Index == 0 {
 		plan.Index = 1
 	}
-	if strings.TrimSpace(req.Region) == "" {
+	// Region defaulting is OAuth-only. An api_key account never re-probes after
+	// creation, so stamping us-east-1 on a region-less key is unrecoverable (every
+	// upstream call 403s forever); leaving it empty lets
+	// importKiroAPIKeyCredential discover the region the key actually serves.
+	if strings.TrimSpace(req.Region) == "" && normalizeAuthMethod(req.AuthMethod, req.TokenEndpoint, req.ClientID, req.ClientSecret) != "api_key" {
 		req.Region = "us-east-1"
 	}
 	req.AuthMethod = normalizeAuthMethod(req.AuthMethod, req.TokenEndpoint, req.ClientID, req.ClientSecret)
@@ -4530,10 +5467,16 @@ func buildImportPlan(index int, req importCredentialRequest) importPreviewItem {
 			strings.TrimSpace(req.TokenEndpoint) != "" {
 			plan.Errors = append(plan.Errors, "api_key import must not include OAuth credential material")
 		}
-		if region, ok := validateRegionOverride(req.Region); !ok || region == "" {
-			plan.Errors = append(plan.Errors, "api_key import requires a valid selected region")
-		} else {
-			req.Region = region
+		// An EMPTY region is valid here and means "discover it": the import then
+		// probes the candidate regions and pins whichever one the key serves. A
+		// region that IS supplied must still be well-formed, because it narrows
+		// the probe to that single region.
+		if strings.TrimSpace(req.Region) != "" {
+			if region, ok := validateRegionOverride(req.Region); !ok || region == "" {
+				plan.Errors = append(plan.Errors, "api_key import region must be a valid AWS region like us-east-1, or empty to discover it")
+			} else {
+				req.Region = region
+			}
 		}
 	} else if req.KiroAPIKey != "" {
 		plan.Errors = append(plan.Errors, "kiroApiKey requires authMethod=api_key")
@@ -5436,6 +6379,42 @@ func (h *Handler) apiTestAccount(w http.ResponseWriter, r *http.Request, id stri
 		return
 	}
 
+	// Custom API accounts have no Kiro credential to exercise; test them by sending a
+	// real minimal chat request THROUGH the linked upstream pool and returning its reply.
+	if account.IsBedrock() {
+		var tReq struct {
+			Model string `json:"model"`
+		}
+		json.NewDecoder(r.Body).Decode(&tReq)
+		// An explicit test must reflect LIVE state, not a cached verdict: drop the
+		// learned region routes so the test re-sweeps every candidate region. Bedrock
+		// per-region access can flap, so a stale "not callable anywhere" negative-cache
+		// entry would otherwise mask a region whose access just reopened.
+		clearBedrockRegionRoutes(account.ID)
+		reply, err := h.bedrockTestReply(account, tReq.Model)
+		if err != nil {
+			w.WriteHeader(502)
+			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+		json.NewEncoder(w).Encode(map[string]interface{}{"success": true, "reply": reply})
+		return
+	}
+	if account.IsCustomApi() {
+		var tReq struct {
+			Model string `json:"model"`
+		}
+		json.NewDecoder(r.Body).Decode(&tReq)
+		reply, err := customApiTestReply(account.BaseURL, account.KiroApiKey, tReq.Model)
+		if err != nil {
+			w.WriteHeader(502)
+			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+		json.NewEncoder(w).Encode(map[string]interface{}{"success": true, "reply": reply})
+		return
+	}
+
 	if err := h.ensureValidToken(account); err != nil {
 		w.WriteHeader(500)
 		json.NewEncoder(w).Encode(map[string]string{"error": "Token refresh failed: " + err.Error()})
@@ -5507,6 +6486,31 @@ func (h *Handler) apiRefreshAccount(w http.ResponseWriter, r *http.Request, id s
 		return
 	}
 
+	// Custom API accounts have no Kiro token/usage to refresh. "Refresh" for them means
+	// re-validating the upstream key against its /api/me quota and reloading the model
+	// list from the upstream /v1/models — never a Kiro/AWS call.
+	if account.IsBedrock() {
+		json.NewEncoder(w).Encode(map[string]interface{}{"success": true, "message": "Bedrock account; nothing to refresh"})
+		return
+	}
+	if account.IsCustomApi() {
+		quota, err := probeCustomApiQuota(account.BaseURL, account.KiroApiKey)
+		if err != nil {
+			w.WriteHeader(502)
+			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+		info := quota.toAccountInfo(time.Now().Unix())
+		if updateErr := config.UpdateAccountInfo(id, info); updateErr != nil {
+			logger.Warnf("[Refresh] custom_api quota persist failed for %s: %v", account.ID, updateErr)
+		}
+		if err := h.fetchAndCacheAccountModels(account); err != nil {
+			logger.Warnf("[Refresh] custom_api model reload failed for %s: %v", account.ID, err)
+		}
+		json.NewEncoder(w).Encode(map[string]interface{}{"success": true, "info": info})
+		return
+	}
+
 	// 先尝试刷新 token（不管是否过期，确保 token 有效）
 	refreshTokenIfNeeded := func() error {
 		if !account.CanRefreshUpstreamCredential() {
@@ -5551,7 +6555,7 @@ func (h *Handler) apiRefreshAccount(w http.ResponseWriter, r *http.Request, id s
 		}
 
 		// 如果是 403/401，说明 token 无效，尝试刷新后重试
-		if strings.Contains(errMsg, "403") || strings.Contains(errMsg, "401") || strings.Contains(errMsg, "invalid") || strings.Contains(errMsg, "expired") {
+		if shouldRetryAccountRefreshOnError(errMsg) {
 			if refreshErr := refreshTokenIfNeeded(); refreshErr == nil {
 				// 重试
 				info, err = RefreshAccountInfo(account)
@@ -5690,6 +6694,55 @@ func (h *Handler) apiGetAccountModels(w http.ResponseWriter, r *http.Request, id
 		return
 	}
 
+	// Custom API accounts serve whatever the linked pool serves: load the model list
+	// from the upstream provider's /v1/models, not from Kiro/AWS.
+	if account.IsBedrock() {
+		// Prefer live-discovered callable models (access agreement AVAILABLE); fall
+		// back to the account/default static map when discovery is unavailable (e.g.
+		// the key lacks bedrock:ListFoundationModels).
+		ids := h.cachedOrDiscoverBedrockModels(account)
+		if len(ids) == 0 {
+			for _, v := range account.BedrockModelMap {
+				ids = append(ids, v)
+			}
+		}
+		if len(ids) == 0 {
+			for _, v := range defaultBedrockModelMap {
+				ids = append(ids, v)
+			}
+		}
+		// The panel expects {success, models:[{modelId}]} (same shape as custom_api),
+		// not a bare string array. Annotate each model with its learned callable
+		// region (from lazy routing / prewarm) when known, so the UI can show where a
+		// model actually works. "region": "" means not yet probed.
+		models := make([]map[string]interface{}, 0, len(ids))
+		for _, mid := range ids {
+			region := ""
+			if r, ok := getBedrockRoute(account.ID, mid); ok && r.callable {
+				region = r.region
+			}
+			models = append(models, map[string]interface{}{"modelId": mid, "region": region})
+		}
+		h.pool.SetModelList(account.ID, ids)
+		json.NewEncoder(w).Encode(map[string]interface{}{"success": true, "models": models, "candidateRegions": candidateRegions(account)})
+		return
+	}
+	if account.IsCustomApi() {
+		models, err := probeCustomApiModels(account.BaseURL, account.KiroApiKey)
+		if err != nil {
+			w.WriteHeader(502)
+			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+		modelIDs := make([]string, 0, len(models))
+		for _, m := range models {
+			modelIDs = append(modelIDs, m.ModelId)
+		}
+		h.pool.SetModelList(id, modelIDs)
+		json.NewEncoder(w).Encode(map[string]interface{}{"success": true, "models": models})
+		return
+	}
+
 	models, err := ListAvailableModels(account)
 	if err != nil {
 		w.WriteHeader(500)
@@ -5702,6 +6755,8 @@ func (h *Handler) apiGetAccountModels(w http.ResponseWriter, r *http.Request, id
 	// admin UI can present the full set for the operator to choose from.
 	accountModels, modelIDs := filterModelsByAllowList(account, models)
 	h.pool.SetModelList(id, modelIDs)
+	// See refreshModelsCache: limits come from the unfiltered upstream list.
+	recordModelTokenLimits(models)
 	h.modelsCacheMu.Lock()
 	h.cachedModels = mergeUniqueModels(h.cachedModels, accountModels)
 	h.modelsCacheTime = time.Now().Unix()
@@ -5829,17 +6884,36 @@ func applyProxyConfig(proxyURL string) {
 	auth.InitHttpClient(proxyURL)
 }
 
-// apiGetProxy 获取当前代理配置
+// apiGetProxy 获取当前代理配置 (single proxy + rotation pool + active proxy)
 func (h *Handler) apiGetProxy(w http.ResponseWriter, r *http.Request) {
-	json.NewEncoder(w).Encode(map[string]string{
-		"proxyURL": config.GetProxyURL(),
+	active := config.GetProxyURL()
+	if h.proxyRotator != nil {
+		active = h.proxyRotator.activeURL()
+	}
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"proxyURL":           config.GetProxyURL(),
+		"proxyURLs":          config.GetProxyURLs(),
+		"proxyRotateMinutes": config.GetProxyRotateMinutes(),
+		"activeProxyURL":     active,
 	})
 }
 
-// apiUpdateProxy 更新代理配置并立即生效
+// isValidProxyScheme reports whether a proxy URL starts with a supported scheme.
+func isValidProxyScheme(u string) bool {
+	return strings.HasPrefix(u, "http://") ||
+		strings.HasPrefix(u, "https://") ||
+		strings.HasPrefix(u, "socks5://") ||
+		strings.HasPrefix(u, "socks5h://")
+}
+
+// apiUpdateProxy 更新代理配置并立即生效. Accepts a single proxyURL plus an optional
+// rotation pool (proxyURLs) and interval (proxyRotateMinutes). When the pool is
+// non-empty the rotator cycles it; otherwise the single proxyURL is applied.
 func (h *Handler) apiUpdateProxy(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		ProxyURL string `json:"proxyURL"`
+		ProxyURL           string   `json:"proxyURL"`
+		ProxyURLs          []string `json:"proxyURLs"`
+		ProxyRotateMinutes int      `json:"proxyRotateMinutes"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		w.WriteHeader(400)
@@ -5848,25 +6922,43 @@ func (h *Handler) apiUpdateProxy(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 验证代理 URL 格式（非空时）
-	if req.ProxyURL != "" {
-		if !strings.HasPrefix(req.ProxyURL, "http://") &&
-			!strings.HasPrefix(req.ProxyURL, "https://") &&
-			!strings.HasPrefix(req.ProxyURL, "socks5://") &&
-			!strings.HasPrefix(req.ProxyURL, "socks5h://") {
+	if req.ProxyURL != "" && !isValidProxyScheme(req.ProxyURL) {
+		w.WriteHeader(400)
+		json.NewEncoder(w).Encode(map[string]string{"error": "proxyURL must start with http://, https://, socks5://, or socks5h://"})
+		return
+	}
+	// Validate and clean every pool entry.
+	cleaned := make([]string, 0, len(req.ProxyURLs))
+	for _, u := range req.ProxyURLs {
+		u = strings.TrimSpace(u)
+		if u == "" {
+			continue
+		}
+		if !isValidProxyScheme(u) {
 			w.WriteHeader(400)
-			json.NewEncoder(w).Encode(map[string]string{"error": "proxyURL must start with http://, https://, socks5://, or socks5h://"})
+			json.NewEncoder(w).Encode(map[string]string{"error": "each proxy must start with http://, https://, socks5://, or socks5h://: " + u})
 			return
 		}
+		cleaned = append(cleaned, u)
+	}
+	if req.ProxyRotateMinutes < 0 {
+		w.WriteHeader(400)
+		json.NewEncoder(w).Encode(map[string]string{"error": "proxyRotateMinutes must be >= 0"})
+		return
 	}
 
-	if err := config.UpdateProxySettings(req.ProxyURL); err != nil {
+	if err := config.UpdateProxySettings(req.ProxyURL, cleaned, req.ProxyRotateMinutes); err != nil {
 		w.WriteHeader(500)
 		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
 		return
 	}
 
-	// 立即应用新的代理配置
-	applyProxyConfig(req.ProxyURL)
+	// 立即应用新的代理配置 (also (re)starts or stops rotation).
+	if h.proxyRotator != nil {
+		h.proxyRotator.configure(req.ProxyURL, cleaned, config.GetProxyRotateMinutes())
+	} else {
+		applyProxyConfig(req.ProxyURL)
+	}
 
 	json.NewEncoder(w).Encode(map[string]bool{"success": true})
 }
@@ -5913,11 +7005,12 @@ func (h *Handler) apiExportAccounts(w http.ResponseWriter, r *http.Request) {
 		RefreshToken string `json:"refreshToken"`
 		ClientID     string `json:"clientId,omitempty"`
 		ClientSecret string `json:"clientSecret,omitempty"`
-		KiroAPIKey   string `json:"kiroApiKey,omitempty"`
-		Region       string `json:"region,omitempty"`
-		ExpiresAt    int64  `json:"expiresAt"`
-		AuthMethod   string `json:"authMethod,omitempty"`
-		Provider     string `json:"provider,omitempty"`
+		// Present for api_key accounts so backup/restore round-trips.
+		KiroAPIKey string `json:"kiroApiKey,omitempty"`
+		Region     string `json:"region,omitempty"`
+		ExpiresAt  int64  `json:"expiresAt"`
+		AuthMethod string `json:"authMethod,omitempty"`
+		Provider   string `json:"provider,omitempty"`
 	}
 
 	type ExportSubscription struct {
@@ -5978,6 +7071,11 @@ func (h *Handler) apiExportAccounts(w http.ResponseWriter, r *http.Request) {
 		if authMethod == "idc" {
 			authMethod = "IdC"
 		}
+		// api_key accounts have no OAuth material; keep the lowercase token so the
+		// importer round-trips it back into the same normalization path.
+		if a.IsApiKeyCredential() {
+			authMethod = "api_key"
+		}
 
 		// 映射订阅类型
 		subType := "Free"
@@ -6008,10 +7106,13 @@ func (h *Handler) apiExportAccounts(w http.ResponseWriter, r *http.Request) {
 				ClientID:     a.ClientID,
 				ClientSecret: a.ClientSecret,
 				KiroAPIKey:   a.KiroApiKey,
-				Region:       exportRegion,
-				ExpiresAt:    a.ExpiresAt * 1000, // 转为毫秒时间戳
-				AuthMethod:   authMethod,
-				Provider:     a.Provider,
+				// exportRegion resolves an api_key account's real data-plane
+				// region rather than the raw stored one, so a restored backup
+				// does not come back pinned to the wrong region.
+				Region:     exportRegion,
+				ExpiresAt:  a.ExpiresAt * 1000, // 转为毫秒时间戳
+				AuthMethod: authMethod,
+				Provider:   a.Provider,
 			},
 			Subscription: ExportSubscription{
 				Type:  subType,

@@ -41,7 +41,7 @@ func TestOpenAIToolDescriptionTruncationKeepsValidUTF8(t *testing.T) {
 	tool.Function.Description = desc
 	tool.Function.Parameters = map[string]interface{}{"type": "object"}
 
-	tools := convertOpenAITools([]OpenAITool{tool})
+	tools, _ := convertOpenAITools([]OpenAITool{tool})
 	if len(tools) != 1 {
 		t.Fatalf("expected 1 tool, got %d", len(tools))
 	}

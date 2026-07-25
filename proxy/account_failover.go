@@ -3,6 +3,7 @@ package proxy
 import (
 	"kiro-go/config"
 	"kiro-go/logger"
+	"kiro-go/pool"
 	"net/http"
 	"regexp"
 	"strconv"
@@ -13,8 +14,12 @@ import (
 const maxAccountRetryAttempts = 3
 
 func isQuotaErrorMessage(msg string) bool {
-	msg = strings.ToLower(msg)
-	return strings.Contains(msg, "429") || strings.Contains(msg, "quota")
+	lower := strings.ToLower(msg)
+	// Match the 429 status code only as a digit-boundary token (parity with
+	// pool.HasStatusToken used by the auth classifier) so a stray "429" inside
+	// an upstream body token/ID can't false-trigger RecordError(true). "quota"
+	// remains a word marker.
+	return pool.HasStatusToken(lower, "429") || strings.Contains(lower, "quota")
 }
 
 func statusForUpstreamError(err error) int {
@@ -27,6 +32,12 @@ func statusForUpstreamError(err error) int {
 		return http.StatusTooManyRequests
 	case isOverageErrorMessage(msg):
 		return http.StatusPaymentRequired
+	case isInputTooLongErrorMessage(msg):
+		// A length rejection is a property of the REQUEST, not the server, so it
+		// must surface as 400. Reporting 500 told the client the service had
+		// failed and that retrying the identical oversized payload was
+		// reasonable; 400 tells it to shrink the conversation instead.
+		return http.StatusBadRequest
 	case isAuthErrorMessage(msg):
 		return http.StatusUnauthorized
 	default:
@@ -68,8 +79,10 @@ func retryAfterFromError(msg string) string {
 }
 
 func isOverageErrorMessage(msg string) bool {
-	msg = strings.ToLower(msg)
-	return strings.Contains(msg, "402") && strings.Contains(msg, "overage")
+	lower := strings.ToLower(msg)
+	// 402 must be a digit-boundary token, not an arbitrary substring (parity
+	// with pool.HasStatusToken), ANDed with the "overage" word marker.
+	return pool.HasStatusToken(lower, "402") && strings.Contains(lower, "overage")
 }
 
 func isSuspensionErrorMessage(msg string) bool {
@@ -84,6 +97,31 @@ func isProfileUnavailableErrorMessage(msg string) bool {
 	return strings.Contains(msg, "no available kiro profile")
 }
 
+// isInputTooLongErrorMessage reports whether upstream rejected the request
+// because the INPUT was too large, as opposed to anything about the account.
+//
+// This condition was previously named only in comments and never detected. That
+// mattered once the body ceiling stopped being a single hardcoded number: the
+// old flat 900KB cap was tuned by hand to sit under the observed threshold, so
+// the error was assumed unreachable. With the ceiling now derived from each
+// model's declared window, an over-estimate is possible, and an undetected
+// length rejection is the worst outcome — it burns the request, counts as a
+// generic failure against the account, and triggers failover to another account
+// that will fail identically.
+//
+// Classifying it enables two correct behaviours: never blame the account (the
+// credential is fine), and shrink-and-retry rather than failing over.
+func isInputTooLongErrorMessage(msg string) bool {
+	lower := strings.ToLower(msg)
+	return strings.Contains(lower, "content_length_exceeds_threshold") ||
+		strings.Contains(lower, "input is too long") ||
+		strings.Contains(lower, "prompt is too long") ||
+		strings.Contains(lower, "too many tokens") ||
+		strings.Contains(lower, "exceeds the maximum") ||
+		strings.Contains(lower, "context length exceeded") ||
+		strings.Contains(lower, "context_length_exceeded")
+}
+
 // upstreamStatusPatterns match the authoritative HTTP status in an upstream error
 // string. The status is structural — the code that formats these errors puts it
 // there — whereas everything after it is an opaque upstream response body.
@@ -95,10 +133,17 @@ func isProfileUnavailableErrorMessage(msg string) bool {
 //	"HTTP 500 from kiro: <body>"                     proxy/kiro.go
 //	"refresh failed: 500 <body>"                     auth/oidc.go
 //	"social token exchange failed (status 503): ..."  auth/kiro_sso.go
+//	"upstream status 502: <body>"                    proxy/bedrock.go
+//	"upstream returned 502: <body>"                  generic forward/gateway errors
+//
+// The last family was NOT matched before, so a 502 whose HTML body happened to
+// contain the word "forbidden" fell through to body-word scanning and
+// permanently banned a healthy account (TestHandleAccountFailureDoesNotBanOnForbiddenInBody).
 var upstreamStatusPatterns = []*regexp.Regexp{
 	regexp.MustCompile(`(?i)\bhttp (\d{3})\b`),
 	regexp.MustCompile(`(?i)refresh failed:\s*(\d{3})\b`),
 	regexp.MustCompile(`(?i)\(status (\d{3})\)`),
+	regexp.MustCompile(`(?i)\bupstream (?:returned|status)\s*:?\s*(\d{3})\b`),
 }
 
 // upstreamStatusFromMessage returns the HTTP status carried by an upstream error
@@ -172,6 +217,20 @@ func containsAny(haystack string, needles []string) bool {
 	return false
 }
 
+// shouldRetryAccountRefreshOnError reports whether a RefreshAccountInfo error
+// looks like a stale/invalid token worth one token-refresh + retry in the admin
+// "refresh account" endpoint (handler.go). This is a RETRY trigger, NOT a ban
+// classifier — a false positive only costs a redundant refresh + retry, so its
+// markers are deliberately broader than isAuthErrorMessage's. Status codes
+// 401/403 are matched by digit boundary (pool.HasStatusToken) for parity with the
+// ban classifiers, so a stray digit in a request ID/token can't fire a spurious
+// refresh+retry; "invalid"/"expired" remain word markers.
+func shouldRetryAccountRefreshOnError(msg string) bool {
+	lower := strings.ToLower(msg)
+	return pool.HasStatusToken(lower, "401") || pool.HasStatusToken(lower, "403") ||
+		strings.Contains(lower, "invalid") || strings.Contains(lower, "expired")
+}
+
 func (h *Handler) disableAccount(account *config.Account, banStatus, banReason string) {
 	if account == nil {
 		return
@@ -222,6 +281,19 @@ func (h *Handler) handleAccountFailure(account *config.Account, err error) {
 
 	errMsg := err.Error()
 	switch {
+	case isInputTooLongErrorMessage(errMsg):
+		// The request was too large for the model. Nothing is wrong with this
+		// account, and every other account in the pool would reject the same
+		// payload identically — so this must NOT record an error against it.
+		// Recording one would cool down a healthy account (and, after enough
+		// oversized requests, walk the whole pool into cooldown) for a fault
+		// that lives entirely in the request we built.
+		//
+		// It is listed first because an upstream length rejection can arrive as
+		// a 400 whose body mentions tokens or limits, which later cases could
+		// otherwise misread.
+		logger.Warnf("[AccountFailover] Upstream rejected the request as too long for %s (account not penalised): %v",
+			accountEmailForLog(account), err)
 	case isOverageErrorMessage(errMsg):
 		h.disableAccountOverage(account)
 		h.pool.RecordError(account.ID, false)

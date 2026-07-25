@@ -44,13 +44,21 @@ type Account struct {
 	UserId   string `json:"userId,omitempty"`   // Kiro user ID
 	Nickname string `json:"nickname,omitempty"` // Display name for admin panel
 
+	// Custom API (pool-linking) fields. Present only when AuthMethod == "custom_api":
+	// the account is a transparent proxy to ANOTHER Kiro-Go pool rather than a direct
+	// Kiro credential. The upstream bearer token is stored in KiroApiKey (its existing
+	// "upstream bearer, never refreshed" role); these fields carry the rest.
+	BaseURL string   `json:"baseUrl,omitempty"` // Upstream pool root, e.g. https://pool.example.com (no trailing /v1)
+	OrderID string   `json:"orderId,omitempty"` // Order id; also used as the account name/nickname
+	Tags    []string `json:"tags,omitempty"`    // Labels; custom_api accounts carry ["Custom API"]
+
 	// Authentication credentials
 	AccessToken   string `json:"accessToken"`             // OAuth access token for API calls
 	RefreshToken  string `json:"refreshToken"`            // OAuth refresh token for token renewal
 	ClientID      string `json:"clientId,omitempty"`      // OIDC client ID (for IdC auth)
 	ClientSecret  string `json:"clientSecret,omitempty"`  // OIDC client secret (for IdC auth)
-	KiroApiKey    string `json:"kiroApiKey,omitempty"`    // Upstream Kiro-issued ksk_ credential. Never mirrored into AccessToken.
-	AuthMethod    string `json:"authMethod"`              // "idc", "social", "external_idp", or "api_key"
+	KiroApiKey    string `json:"kiroApiKey,omitempty"`    // Upstream Kiro-issued ksk_ credential (headless "api_key" auth). Used directly as the upstream bearer token, never refreshed, never mirrored into AccessToken.
+	AuthMethod    string `json:"authMethod"`              // "idc" (AWS IdC), "social" (GitHub/Google), "external_idp" (enterprise SSO, e.g. Azure AD), or "api_key" (headless Kiro API key)
 	Provider      string `json:"provider,omitempty"`      // Identity provider name (e.g., "BuilderId", "GitHub", "AzureAD")
 	Region        string `json:"region"`                  // AWS region for OIDC endpoints
 	StartUrl      string `json:"startUrl,omitempty"`      // AWS SSO start URL
@@ -66,6 +74,34 @@ type Account struct {
 	TokenEndpoint string `json:"tokenEndpoint,omitempty"` // External IdP OAuth2 token endpoint (refresh)
 	IssuerURL     string `json:"issuerUrl,omitempty"`     // External IdP OIDC issuer URL
 	Scopes        string `json:"scopes,omitempty"`        // Space-separated scopes granted by the external IdP
+
+	// Native Amazon Bedrock fields. Present only when AuthMethod == "bedrock":
+	// the account calls the Bedrock Runtime invoke endpoints directly with a static
+	// IAM access key, SigV4-signed. Region reuses the existing Region field above.
+	// BedrockModelMap optionally overrides client-model -> Bedrock-model-id resolution
+	// per account; when nil the env BEDROCK_MODEL_MAP and built-in defaults apply.
+	// NOTE: the secret is stored as-is in the config JSON, matching how OAuth tokens
+	// and Kiro API keys are already persisted here; protect the config file at rest.
+	BedrockAccessKeyID     string `json:"bedrockAccessKeyId,omitempty"`
+	BedrockSecretAccessKey string `json:"bedrockSecretAccessKey,omitempty"`
+	BedrockSessionToken    string `json:"bedrockSessionToken,omitempty"` // set only for STS/temporary credentials
+	// BedrockAPIKey is a Bedrock API key (bearer token, "ABSK..."). When set it is
+	// used as an Authorization: Bearer header and SigV4 is skipped; it authenticates
+	// principals whose raw IAM access key is denied InvokeModel. Either this OR the
+	// access key/secret pair is required for a bedrock account.
+	BedrockAPIKey string `json:"bedrockApiKey,omitempty"`
+	// BedrockRegions are EXTRA candidate regions (beyond Region) to try for this
+	// account. Bedrock model access is per-region: a model denied in the primary
+	// region may be callable in another. The request path tries Region first, then
+	// these, caching the callable region per model. Empty = single-region (Region).
+	BedrockRegions  []string          `json:"bedrockRegions,omitempty"`
+	BedrockModelMap map[string]string `json:"bedrockModelMap,omitempty"`
+	// BedrockUseConverse opts this account into the Bedrock Converse API path
+	// (bedrock-runtime /converse[-stream]) instead of the native Anthropic invoke
+	// path. Required for non-Anthropic models (Nova, Llama, DeepSeek, ...), which do
+	// not accept the Anthropic Messages wire format. Defaults false: Claude models
+	// stay on the zero-translation native invoke path.
+	BedrockUseConverse bool `json:"bedrockUseConverse,omitempty"`
 
 	// Per-account outbound proxy (falls back to global ProxyURL if empty)
 	ProxyURL string `json:"proxyURL,omitempty"`
@@ -244,6 +280,34 @@ func (a *Account) CredentialKind() string {
 	return "none"
 }
 
+// IsApiKeyCredential reports whether the account authenticates with a Kiro API
+// key (ksk_...) rather than an OAuth token. Such accounts use KiroApiKey directly
+// as the upstream bearer token, carry a "tokentype: API_KEY" header, and are never
+// token-refreshed (ExpiresAt stays 0).
+func (a *Account) IsApiKeyCredential() bool {
+	return strings.EqualFold(strings.TrimSpace(a.AuthMethod), "api_key")
+}
+
+// IsCustomApi reports whether the account is a "Custom API" pool-linking account:
+// a transparent proxy to ANOTHER Kiro-Go pool (BaseURL + a key it issued us), not a
+// direct Kiro credential. Such accounts must be excluded from every Kiro/AWS-facing
+// path (token refresh, usage-limit probes, model-list probes, ban classifiers) —
+// their AccessToken mirrors a non-Kiro upstream key, so a Kiro API call would fail
+// and the failure would wrongly auto-ban a healthy account.
+func (a *Account) IsCustomApi() bool {
+	return strings.EqualFold(strings.TrimSpace(a.AuthMethod), "custom_api")
+}
+
+// IsBedrock reports whether the account is a native Amazon Bedrock account:
+// a static IAM access key + region that calls the Bedrock Runtime invoke endpoints
+// directly (SigV4). Like custom_api, such accounts must be excluded from every
+// Kiro/AWS-SSO-facing path (OAuth token refresh, Kiro usage/model probes, ban
+// classifiers) — they have no Kiro credential to refresh and a Kiro API call on
+// their behalf would fail and wrongly ban a healthy account.
+func (a *Account) IsBedrock() bool {
+	return strings.EqualFold(strings.TrimSpace(a.AuthMethod), "bedrock")
+}
+
 // PromptFilterRule defines a single custom prompt sanitization rule.
 // Type can be: "regex" (regexp find/replace within prompt) or
 // "lines-containing" (remove lines containing the match substring).
@@ -378,11 +442,30 @@ type Config struct {
 	// audit-log redaction discipline. Slack/Discord-compatible JSON body.
 	WebhookURL string `json:"webhookURL,omitempty"`
 
+	// AutoRecoverEnabled controls whether disabled accounts (auth failure) are
+	// periodically re-probed with a token refresh. Default true. Set false to
+	// require manual re-enable.
+	AutoRecoverEnabled *bool `json:"autoRecoverEnabled,omitempty"`
+
+	// SessionAffinityEnabled binds consecutive requests from the same API key to
+	// the same account (sticky routing) for a TTL window. Default false.
+	SessionAffinityEnabled bool `json:"sessionAffinityEnabled,omitempty"`
+
 	// Proxy configuration: optional outbound proxy for Kiro API requests
 	// Format: "socks5://host:port", "socks5://user:pass@host:port",
 	//         "http://host:port",  "http://user:pass@host:port"
 	// Leave empty to connect directly.
 	ProxyURL string `json:"proxyURL,omitempty"`
+
+	// ProxyURLs is an optional pool of outbound proxies rotated round-robin every
+	// ProxyRotateMinutes. When non-empty it drives the GLOBAL proxy (the single
+	// ProxyURL above is ignored for routing); per-account ProxyURL overrides still
+	// take precedence. Each entry uses the same scheme format as ProxyURL.
+	ProxyURLs []string `json:"proxyURLs,omitempty"`
+
+	// ProxyRotateMinutes is the round-robin interval for ProxyURLs. <=0 falls back to
+	// DefaultProxyRotateMinutes. Ignored when ProxyURLs is empty.
+	ProxyRotateMinutes int `json:"proxyRotateMinutes,omitempty"`
 
 	// SanitizeClaudeCodePrompt is kept for backward-compatible JSON loading only.
 	// Migrated to FilterClaudeCode on first load. Do not use directly.
@@ -456,6 +539,18 @@ type Config struct {
 	// Accepted values: "debug", "info", "warn", "error". Defaults to "info".
 	// Can be overridden by the LOG_LEVEL environment variable.
 	LogLevel string `json:"logLevel,omitempty"`
+
+	// PromptCacheMaxRatio caps the fraction of input tokens reported as cache_read
+	// in a single turn. Default 0.85. Raise to 0.95 for "continue"-heavy workloads
+	// where the newest content is minimal and >85% of input is genuinely from cache.
+	PromptCacheMaxRatio float64 `json:"promptCacheMaxRatio,omitempty"`
+
+	// PromptCacheMaxEntries bounds the in-memory prompt-cache map; once exceeded,
+	// the least-recently-used entries are evicted (LRU). Default 131072. Sized so
+	// the prefix write-rate × TTL does not evict multi-turn history prefixes
+	// before the next turn reuses them (mirrors kiro-rs's 131072 default). The
+	// tracker clamps explicit small values up to 256.
+	PromptCacheMaxEntries int `json:"promptCacheMaxEntries,omitempty"`
 
 	// Global statistics (persisted across restarts)
 	TotalRequests   int     `json:"totalRequests,omitempty"`   // Total API requests received
@@ -981,6 +1076,20 @@ func GetAccounts() []Account {
 	return accounts
 }
 
+// GetAccountByID returns a copy of the account with the given ID, or ok=false
+// if no such account exists. Used by auth.RefreshToken's double-checked
+// locking to read the canonical token state.
+func GetAccountByID(id string) (Account, bool) {
+	cfgLock.RLock()
+	defer cfgLock.RUnlock()
+	for i := range cfg.Accounts {
+		if cfg.Accounts[i].ID == id {
+			return cfg.Accounts[i], true
+		}
+	}
+	return Account{}, false
+}
+
 // AccountIDExists reports whether an account with the given ID is already stored.
 // Used by the credential-import path to reuse a pasted record's id when it does
 // not collide, so re-importing a backup never creates a duplicate entry.
@@ -996,19 +1105,6 @@ func AccountIDExists(id string) bool {
 		}
 	}
 	return false
-}
-
-// GetAccountByID returns a copy of the account with the given ID and whether it
-// was found.
-func GetAccountByID(id string) (Account, bool) {
-	cfgLock.RLock()
-	defer cfgLock.RUnlock()
-	for _, a := range cfg.Accounts {
-		if a.ID == id {
-			return a, true
-		}
-	}
-	return Account{}, false
 }
 
 func GetEnabledAccounts() []Account {
@@ -1273,6 +1369,9 @@ func SetAccountBanStatus(id, status, reason string) error {
 	return nil
 }
 
+// UpdateAccountProfileArn pins an account's profile ARN and persists it. A
+// missing id is an error (the account may have been deleted concurrently) so
+// callers cannot mistake a no-op for a successful write.
 func UpdateAccountProfileArn(id, profileArn string) error {
 	cfgLock.Lock()
 	defer cfgLock.Unlock()
@@ -1286,7 +1385,7 @@ func UpdateAccountProfileArn(id, profileArn string) error {
 			return Save()
 		}
 	}
-	return nil
+	return fmt.Errorf("account not found: %s", id)
 }
 
 // UpdateAccountProfileSelection atomically changes the operator-visible profile
@@ -1820,6 +1919,10 @@ func UpdateEndpointFallback(enabled bool) error {
 	return Save()
 }
 
+// DefaultProxyRotateMinutes is the round-robin interval used when a proxy pool is
+// configured without an explicit (or with a non-positive) ProxyRotateMinutes.
+const DefaultProxyRotateMinutes = 10
+
 // GetProxyURL 获取出站代理地址
 func GetProxyURL() string {
 	cfgLock.RLock()
@@ -1827,11 +1930,33 @@ func GetProxyURL() string {
 	return cfg.ProxyURL
 }
 
-// UpdateProxySettings 更新出站代理配置
-func UpdateProxySettings(proxyURL string) error {
+// GetProxyURLs returns the outbound proxy rotation pool (may be empty).
+func GetProxyURLs() []string {
+	cfgLock.RLock()
+	defer cfgLock.RUnlock()
+	// Copy so callers cannot mutate the shared config slice.
+	out := make([]string, len(cfg.ProxyURLs))
+	copy(out, cfg.ProxyURLs)
+	return out
+}
+
+// GetProxyRotateMinutes returns the rotation interval, normalized to a positive value.
+func GetProxyRotateMinutes() int {
+	cfgLock.RLock()
+	defer cfgLock.RUnlock()
+	if cfg.ProxyRotateMinutes <= 0 {
+		return DefaultProxyRotateMinutes
+	}
+	return cfg.ProxyRotateMinutes
+}
+
+// UpdateProxySettings 更新出站代理配置 (single proxy + rotation pool + interval).
+func UpdateProxySettings(proxyURL string, proxyURLs []string, rotateMinutes int) error {
 	cfgLock.Lock()
 	defer cfgLock.Unlock()
 	cfg.ProxyURL = proxyURL
+	cfg.ProxyURLs = proxyURLs
+	cfg.ProxyRotateMinutes = rotateMinutes
 	return Save()
 }
 
@@ -1843,6 +1968,36 @@ func GetAllowOverUsage() bool {
 		return false
 	}
 	return cfg.AllowOverUsage
+}
+
+// GetAutoRecoverEnabled returns whether auto-recovery of disabled accounts is
+// enabled. Defaults to true.
+func GetAutoRecoverEnabled() bool {
+	cfgLock.RLock()
+	defer cfgLock.RUnlock()
+	if cfg == nil || cfg.AutoRecoverEnabled == nil {
+		return true
+	}
+	return *cfg.AutoRecoverEnabled
+}
+
+// GetSessionAffinityEnabled returns whether session affinity (sticky routing per
+// API key) is enabled. Defaults to false.
+func GetSessionAffinityEnabled() bool {
+	cfgLock.RLock()
+	defer cfgLock.RUnlock()
+	if cfg == nil {
+		return false
+	}
+	return cfg.SessionAffinityEnabled
+}
+
+// SetSessionAffinityEnabled sets the session-affinity flag and persists it.
+func SetSessionAffinityEnabled(enabled bool) error {
+	cfgLock.Lock()
+	defer cfgLock.Unlock()
+	cfg.SessionAffinityEnabled = enabled
+	return Save()
 }
 
 // UpdateAllowOverUsage sets the over-usage setting and persists the change.
@@ -1937,6 +2092,54 @@ func GetLogLevel() string {
 		return "info"
 	}
 	return cfg.LogLevel
+}
+
+// GetPromptCacheMaxRatio returns the cache-read cap ratio (0.0-1.0). Defaults to 0.85.
+func GetPromptCacheMaxRatio() float64 {
+	cfgLock.RLock()
+	defer cfgLock.RUnlock()
+	if cfg == nil || cfg.PromptCacheMaxRatio <= 0 || cfg.PromptCacheMaxRatio > 1 {
+		return 0.85
+	}
+	return cfg.PromptCacheMaxRatio
+}
+
+// UpdatePromptCacheMaxRatio sets the cache-read cap ratio and persists the change.
+func UpdatePromptCacheMaxRatio(ratio float64) error {
+	cfgLock.Lock()
+	defer cfgLock.Unlock()
+	cfg.PromptCacheMaxRatio = ratio
+	return Save()
+}
+
+const defaultPromptCacheMaxEntries = 131072
+const minPromptCacheEntries = 256
+
+// GetPromptCacheMaxEntries returns the prompt-cache LRU bound. Defaults to
+// 131072 when unset (≤ 0); an explicit small value is clamped up to
+// minPromptCacheEntries (256) so a misconfigured tiny value cannot make the
+// cache useless. This is the production safety floor — the tracker constructor
+// trusts its caller (tests may use any capacity).
+func GetPromptCacheMaxEntries() int {
+	cfgLock.RLock()
+	defer cfgLock.RUnlock()
+	if cfg == nil || cfg.PromptCacheMaxEntries <= 0 {
+		return defaultPromptCacheMaxEntries
+	}
+	if cfg.PromptCacheMaxEntries < minPromptCacheEntries {
+		return minPromptCacheEntries
+	}
+	return cfg.PromptCacheMaxEntries
+}
+
+// UpdatePromptCacheMaxEntries sets the prompt-cache LRU bound and persists it.
+// Applies on the next tracker construction (restart); it does not resize a
+// live tracker.
+func UpdatePromptCacheMaxEntries(n int) error {
+	cfgLock.Lock()
+	defer cfgLock.Unlock()
+	cfg.PromptCacheMaxEntries = n
+	return Save()
 }
 
 // UpdateLogLevel updates the log level setting and persists the change.

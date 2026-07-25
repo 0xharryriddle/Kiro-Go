@@ -156,7 +156,14 @@ func normalizeRawCredential(rc rawCredential) importCredentialRequest {
 	provider := providerWithDefault(authMethod, firstNonEmpty(rc.Provider, rc.IDP))
 
 	region := firstNonEmpty(rc.Region)
-	if region == "" {
+	// Default the region for OAuth credentials only. An api_key account NEVER
+	// re-probes after creation (its profile is key-bound, so ResolveProfileArn
+	// short-circuits), which makes a wrong region permanent: every upstream call
+	// 403s forever. Leaving it empty lets importKiroAPIKeyCredential discover the
+	// region the key actually serves via resolveApiKeyRegion. OAuth credentials
+	// keep the historical us-east-1 default because their region only selects the
+	// OIDC endpoint and is corrected by cross-region profile resolution.
+	if region == "" && authMethod != "api_key" {
 		region = "us-east-1"
 	}
 

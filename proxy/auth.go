@@ -79,14 +79,19 @@ func (h *Handler) authenticate(r *http.Request) (*config.ApiKeyEntry, error) {
 		if entry == nil {
 			return nil, newAuthError(http.StatusUnauthorized, "authentication_error", "Invalid or missing API key")
 		}
-		if !entry.Enabled {
-			return nil, newAuthError(http.StatusUnauthorized, "authentication_error", "API key disabled")
-		}
+		// Over-limit is checked BEFORE Enabled: exhausted keys are auto-disabled
+		// by RecordApiKeyUsage, and "limit exceeded" (429) is the accurate reason
+		// for them — "disabled" (401) is reserved for keys an admin turned off.
 		if overToken, overCredit := config.ApiKeyOverLimit(*entry); overToken || overCredit {
 			if overToken {
 				return nil, newAuthError(http.StatusTooManyRequests, "rate_limit_error", "token limit exceeded")
 			}
 			return nil, newAuthError(http.StatusTooManyRequests, "rate_limit_error", "credit limit exceeded")
+		}
+		// An admin-disabled key is rejected before the rate limiter so a turned-off
+		// key never consumes limiter budget.
+		if !entry.Enabled {
+			return nil, newAuthError(http.StatusUnauthorized, "authentication_error", "API key disabled")
 		}
 		// F6: windowed RPM/TPM rate limit (in-process, best-effort TPM). RPM is
 		// enforced at admission; TPM rejects only when the window is already over

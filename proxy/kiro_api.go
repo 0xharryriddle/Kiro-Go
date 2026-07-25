@@ -7,6 +7,7 @@ import (
 	"kiro-go/auth"
 	"kiro-go/config"
 	"kiro-go/logger"
+	"kiro-go/pool"
 	"net/http"
 	neturl "net/url"
 	"os"
@@ -105,9 +106,18 @@ func acceptRefreshedProfileArn(account *config.Account, arn string) bool {
 			account.EffectiveRegionOverride(), account.Email)
 		return false
 	}
-	if updateErr := config.UpdateAccountProfileArn(account.ID, arn); updateErr != nil {
-		logger.Warnf("[ProfileArn] Failed to cache refreshed profile ARN for %s: %v", account.Email, updateErr)
-		return false
+	// Throwaway probe accounts (profile discovery, api_key region probes, and the
+	// pre-persist login paths) are never in the config store, so there is nothing
+	// to update and UpdateAccountProfileArn would report "account not found".
+	// That is not a resolution failure: the ARN was resolved, and the caller only
+	// needs it on the in-memory account. Persist only when the account is real,
+	// and keep a genuine persist error for a real account fatal so a silently
+	// uncached ARN cannot make every later request re-probe.
+	if strings.TrimSpace(account.ID) != "" && config.AccountIDExists(account.ID) {
+		if updateErr := config.UpdateAccountProfileArn(account.ID, arn); updateErr != nil {
+			logger.Warnf("[ProfileArn] Failed to cache refreshed profile ARN for %s: %v", account.Email, updateErr)
+			return false
+		}
 	}
 	account.ProfileArn = arn
 	return true
@@ -377,6 +387,17 @@ func ResolveProfileArn(account *config.Account) (string, error) {
 	// profile and have no OAuth refresh fallback; callers recognize this as a
 	// soft skip and continue without profileArn.
 	if account.IsKiroAPIKeyCredential() {
+		return "", fmt.Errorf("profile ARN resolution skipped: api_key account uses key-bound profile")
+	}
+
+	// Kiro API-key (ksk_) accounts are headless: the profile is bound to the key
+	// server-side, so ListAvailableProfiles returns nothing and there is no refresh
+	// token to fall back on. Skip resolution entirely and let callers proceed WITHOUT
+	// a profileArn (getUsageLimits / generateAssistantResponse are key-scoped). This
+	// is a soft skip — isProfileArnResolutionSkippedError matches the message — so
+	// ensureRestProfileArn and the data-plane continue instead of hard-failing, and
+	// it avoids a fruitless multi-region probe on every request.
+	if account.IsApiKeyCredential() {
 		return "", fmt.Errorf("profile ARN resolution skipped: api_key account uses key-bound profile")
 	}
 
@@ -785,7 +806,9 @@ func isTransientProfileFetchError(err error) bool {
 // pointed at a specific region (q.{region} for non-us-east-1, the CodeWhisperer
 // REST host for us-east-1). Targeting an explicit region — rather than the account's
 // stored one — is what makes cross-region detection possible: the same credential is
-// probed against each candidate region until one returns a profile.
+// probed against each candidate region until one returns a profile. This single-ARN
+// wrapper keeps the historical "first profile wins" contract for the lazy resolver;
+// callers that need every profile use listProfileArnsInRegion directly.
 func listAvailableProfilesInRegion(account *config.Account, region string) (string, error) {
 	arns, err := listAllAvailableProfilesInRegion(account, region)
 	if err != nil {
@@ -795,10 +818,27 @@ func listAvailableProfilesInRegion(account *config.Account, region string) (stri
 }
 
 // listAllAvailableProfilesInRegion returns every non-empty profile ARN the region
-// exposes for the account. Same request/host semantics as the single-profile
-// helper; it just does not discard the profiles after the first one, so callers
-// can disambiguate multi-profile accounts.
+// exposes for the account, and treats an EMPTY list as an error. This is the
+// strict variant used by the lazy resolver, where "this region has no profile"
+// must fail so the caller probes the next candidate region. Callers doing
+// multi-region discovery (where an empty region is a normal outcome) use
+// listProfileArnsInRegion directly.
 func listAllAvailableProfilesInRegion(account *config.Account, region string) ([]string, error) {
+	arns, err := listProfileArnsInRegion(account, region)
+	if err != nil {
+		return nil, err
+	}
+	if len(arns) == 0 {
+		return nil, fmt.Errorf("empty profile list")
+	}
+	return arns, nil
+}
+
+// listProfileArnsInRegion calls ListAvailableProfiles against a specific region and
+// returns EVERY profile ARN it lists (trimmed, empty entries dropped). An empty
+// list is returned as ([], nil) — for multi-region discovery a region with no
+// profiles is a normal outcome, not an error.
+func listProfileArnsInRegion(account *config.Account, region string) ([]string, error) {
 	endpoint := regionalizeURLForRegion(fmt.Sprintf("%s/ListAvailableProfiles", kiroRestAPIBase), region)
 	req, err := http.NewRequest("POST", endpoint, strings.NewReader(`{"maxResults":10}`))
 	if err != nil {
@@ -832,10 +872,86 @@ func listAllAvailableProfilesInRegion(account *config.Account, region string) ([
 			arns = append(arns, profileArn)
 		}
 	}
-	if len(arns) == 0 {
-		return nil, fmt.Errorf("empty profile list")
-	}
+	// An empty list is NOT an error here: multi-region discovery treats a region
+	// with no profiles as a normal outcome. listAllAvailableProfilesInRegion is
+	// the strict wrapper that converts empty into an error for the lazy resolver.
 	return arns, nil
+}
+
+// listProfileArnsWithRetryInRegion is listProfileArnsInRegion plus the same
+// transient-failure retry policy as listAvailableProfilesWithRetryInRegion
+// (network errors, 5xx, 429 → short backoff; other errors are authoritative).
+func listProfileArnsWithRetryInRegion(account *config.Account, region string) ([]string, error) {
+	const maxAttempts = 3
+	backoff := 200 * time.Millisecond
+
+	var lastErr error
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		arns, err := listProfileArnsInRegion(account, region)
+		if err == nil {
+			return arns, nil
+		}
+		lastErr = err
+		if !isTransientProfileFetchError(err) || attempt == maxAttempts {
+			return nil, err
+		}
+		logger.Debugf("[ProfileArn] ListAvailableProfiles transient failure for %s in %s (attempt %d/%d): %v",
+			accountEmailForLog(account), region, attempt, maxAttempts, err)
+		time.Sleep(backoff)
+		backoff *= 2
+	}
+	return nil, lastErr
+}
+
+// KiroProfile is declared in kiro_profiles.go, which carries the richer
+// operator-facing shape (Arn, Region plus Usable/Current/Pinned). The values
+// built here populate only Arn and Region; the remaining fields are filled by
+// the admin discovery layer that presents the choice.
+
+// DiscoverKiroProfiles probes ListAvailableProfiles against EVERY candidate
+// region (the account's configured region first, then the fallbacks — see
+// kiroProfileRegionCandidates) and returns all profiles found, de-duplicated by
+// ARN. Unlike resolveProfileArnAcrossRegions it does NOT stop at the first
+// region that yields a profile: an Azure-tenant (external_idp) account can hold
+// profiles in several regions (e.g. a US and an EU Kiro profile), and the caller
+// needs the full set to let the operator pick one. Per-region failures are
+// tolerated so one unreachable region cannot hide another region's profiles; an
+// error is returned only when nothing was found AND at least one region failed
+// (a Builder ID "unsupported" 403 is authoritative for all regions and aborts
+// immediately, matching the lazy resolver).
+func DiscoverKiroProfiles(account *config.Account) ([]KiroProfile, error) {
+	var out []KiroProfile
+	seen := make(map[string]bool)
+	var lastErr error
+	for _, region := range kiroProfileRegionCandidates(account) {
+		arns, err := listProfileArnsWithRetryInRegion(account, region)
+		if err != nil {
+			if isBuilderIDProfileUnsupportedError(account, err) {
+				return nil, err
+			}
+			// Surface the failed region: silently skipping it would present a
+			// partial list as complete and hide exactly the profile (e.g. EU)
+			// this discovery exists to find.
+			logger.Warnf("[ProfileArn] Profile discovery failed in %s for %s: %v", region, accountEmailForLog(account), err)
+			lastErr = err
+			continue
+		}
+		for _, arn := range arns {
+			if seen[arn] {
+				continue
+			}
+			seen[arn] = true
+			profileRegion := regionFromProfileArn(arn)
+			if profileRegion == "" {
+				profileRegion = region
+			}
+			out = append(out, KiroProfile{Arn: arn, Region: profileRegion})
+		}
+	}
+	if len(out) == 0 && lastErr != nil {
+		return nil, lastErr
+	}
+	return out, nil
 }
 
 func withProfileArnQuery(rawURL string, account *config.Account) string {
@@ -860,13 +976,70 @@ func setKiroHeaders(req *http.Request, account *config.Account) {
 	applyKiroBaseHeaders(req, account, headerValues)
 }
 
+// classifyAndBanOnUsageError inspects a GetUsageLimits error and disables the
+// account when it signals a hard upstream state (suspension or auth failure).
+// Classification routes through the shared pool.IsSuspensionError /
+// pool.IsAuthFailure helpers (digit-boundary-aware) instead of bare
+// strings.Contains, which previously false-banned accounts when "401"/"403"
+// appeared inside request IDs or timestamps. Returns the caller-facing error.
+func classifyAndBanOnUsageError(account *config.Account, err error) error {
+	// Profile ARN resolution may fail transiently (provisioning lag, cross-region
+	// probe failure). The request path treats this as soft (account_failover.go);
+	// the background refresh path must too, or a good external_idp account is
+	// permanently banned on a transient blip.
+	if isProfileUnavailableErrorMessage(err.Error()) {
+		return fmt.Errorf("GetUsageLimits: %w", err)
+	}
+	// A 403 about the PROFILE/PLAN (wrong profile pinned, no active subscription,
+	// resource not authorized) is NOT a credential failure and must not ban. This
+	// guard is what stops a valid account whose in-plan profile simply had not
+	// been selected from being permanently disabled; the caller already tried to
+	// self-heal by re-resolving the profile before reaching here. It must sit
+	// BEFORE the IsAuthFailure branch, because such a message also carries a 403
+	// and would otherwise fall straight through to the ban.
+	// Locked in by TestRefreshAccountInfoDoesNotBanOnPlan403.
+	if isProfileOrPlanAuthzError(err.Error()) {
+		logger.Warnf("[RefreshAccountInfo] Profile/plan authorization error for %s (not treated as ban): %v", account.Email, err)
+		return fmt.Errorf("GetUsageLimits: %w", err)
+	}
+	switch {
+	case pool.IsSuspensionError(err):
+		logger.Warnf("[RefreshAccountInfo] Account %s is suspended: %v", account.Email, err)
+		banAccountInline(account, "BANNED", "AWS temporarily suspended - unusual user activity detected")
+		return fmt.Errorf("Account suspended: %w", err)
+	case pool.IsAuthFailure(err):
+		logger.Warnf("[RefreshAccountInfo] Authentication error for %s: %v", account.Email, err)
+		banAccountInline(account, "BANNED", "Authentication failed - token invalid or expired")
+	}
+	return fmt.Errorf("GetUsageLimits: %w", err)
+}
+
+// banAccountInline disables an account (banStatus + reason) via config. Used by
+// background-refresh paths that have no Handler/pool handle. No-op if the
+// account is already disabled with the same status/reason.
+func banAccountInline(account *config.Account, banStatus, banReason string) {
+	if account == nil {
+		return
+	}
+	updated := *account
+	if !updated.Enabled && updated.BanStatus == banStatus && updated.BanReason == banReason {
+		return
+	}
+	updated.Enabled = false
+	updated.BanStatus = banStatus
+	updated.BanReason = banReason
+	updated.BanTime = time.Now().Unix()
+	if err := config.UpdateAccount(account.ID, updated); err != nil {
+		logger.Errorf("[RefreshAccountInfo] Failed to update account ban status: %v", err)
+	}
+}
+
 // RefreshAccountInfo 刷新账户信息（使用量、订阅等）
 func RefreshAccountInfo(account *config.Account) (*config.AccountInfo, error) {
 	info := &config.AccountInfo{
 		LastRefresh: time.Now().Unix(),
 	}
 
-	// 获取使用量和订阅信息
 	usage, err := GetUsageLimits(account)
 	if err != nil && !account.IsKiroAPIKeyCredential() {
 		// Self-heal a stale/wrong cached profile before treating the failure as a
@@ -879,60 +1052,21 @@ func RefreshAccountInfo(account *config.Account) (*config.AccountInfo, error) {
 		}
 	}
 	if err != nil {
-		// Kiro API-key credentials cannot self-heal through OAuth refresh, and
-		// throwaway probe accounts may have no persisted ID. Never mutate/ban one
-		// from a single best-effort metadata failure; the request path still
-		// surfaces the real error and normal failover applies a short cooldown.
-		if account.IsKiroAPIKeyCredential() {
+		// API-key accounts cannot self-heal (never token-refreshed), so no upstream
+		// error here should mutate/ban them — a transient blip must not brick a valid,
+		// paid key. This also protects the add-time probe, which reuses a throwaway
+		// api_key account: it must never write config (classifyAndBanOnUsageError
+		// would call UpdateAccount with the throwaway's empty ID). Guard BEFORE the
+		// classify/ban helper so both the suspension and auth-fail branches are skipped.
+		if account.IsApiKeyCredential() || account.IsCustomApi() {
 			return nil, fmt.Errorf("GetUsageLimits: %w", err)
 		}
-
-		// 检测封禁状态
-		errMsg := err.Error()
-		if strings.Contains(errMsg, "TEMPORARILY_SUSPENDED") {
-			// 账户被暂时封禁，自动禁用并标记封禁状态
-			logger.Warnf("[RefreshAccountInfo] Account %s is temporarily suspended: %v", account.Email, err)
-
-			// 更新账户封禁状态并自动禁用
-			updatedAccount := *account
-			updatedAccount.Enabled = false
-			updatedAccount.BanStatus = "BANNED"
-			updatedAccount.BanReason = "AWS temporarily suspended - unusual user activity detected"
-			updatedAccount.BanTime = time.Now().Unix()
-
-			// 保存更新后的账户状态
-			if updateErr := config.UpdateAccount(account.ID, updatedAccount); updateErr != nil {
-				logger.Errorf("[RefreshAccountInfo] Failed to update account ban status: %v", updateErr)
-			}
-
-			return nil, fmt.Errorf("Account suspended: %w", err)
-		} else if isProfileOrPlanAuthzError(errMsg) {
-			// A 403 that is about the PROFILE/PLAN (wrong profile, no active
-			// subscription, resource not authorized) is NOT a token ban. Auto-banning
-			// here is exactly what wrongly disabled a valid account whose in-plan
-			// profile simply had not been selected. Self-heal already tried to switch
-			// to a usable profile above; if it still fails, surface the error without
-			// flipping the account to BANNED.
-			logger.Warnf("[RefreshAccountInfo] Profile/plan authorization error for %s (not treated as ban): %v", account.Email, err)
-		} else if strings.Contains(errMsg, "403") || strings.Contains(errMsg, "401") ||
-			strings.Contains(errMsg, "invalid") || strings.Contains(errMsg, "expired") {
-			// Token 相关错误，可能需要重新认证
-			logger.Warnf("[RefreshAccountInfo] Authentication error for %s: %v", account.Email, err)
-
-			// 更新账户封禁状态为认证失败并自动禁用
-			updatedAccount := *account
-			updatedAccount.Enabled = false
-			updatedAccount.BanStatus = "BANNED"
-			updatedAccount.BanReason = "Authentication failed - token invalid or expired"
-			updatedAccount.BanTime = time.Now().Unix()
-
-			// 保存更新后的账户状态
-			if updateErr := config.UpdateAccount(account.ID, updatedAccount); updateErr != nil {
-				logger.Errorf("[RefreshAccountInfo] Failed to update account ban status: %v", updateErr)
-			}
-		}
-
-		return nil, fmt.Errorf("GetUsageLimits: %w", err)
+		// classifyAndBanOnUsageError owns the suspension / profile-authz / auth-fail
+		// classification. It routes through pool.IsSuspensionError and
+		// pool.IsAuthFailure (digit-boundary aware) and treats a profile/plan 403 as
+		// soft, which is what the inline strings.Contains chain here used to do less
+		// precisely — a "403" appearing inside a request ID false-banned the account.
+		return nil, classifyAndBanOnUsageError(account, err)
 	}
 
 	// 如果成功获取信息，清除封禁状态（如果之前被标记）

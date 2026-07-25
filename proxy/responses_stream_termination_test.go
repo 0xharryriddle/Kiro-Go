@@ -22,7 +22,8 @@ func TestResponsesStreamSendsDoneOnMidStreamFailure(t *testing.T) {
 
 	rec := httptest.NewRecorder()
 	h.handleResponsesStream(rec, midStreamPayload(), "claude-opus-4.6", false, 5, "",
-		"resp_test", &ResponsesRequest{Model: "claude-opus-4.6"}, json.RawMessage(`"hi"`), false)
+		"resp_test", &ResponsesRequest{Model: "claude-opus-4.6"}, json.RawMessage(`"hi"`), false,
+		nil, false)
 
 	body := rec.Body.String()
 	if !strings.Contains(body, "response.failed") {
@@ -52,7 +53,8 @@ func TestResponsesStreamRecordsAccountFailureMidStream(t *testing.T) {
 
 	rec := httptest.NewRecorder()
 	h.handleResponsesStream(rec, midStreamPayload(), "claude-opus-4.6", false, 5, "",
-		"resp_test", &ResponsesRequest{Model: "claude-opus-4.6"}, json.RawMessage(`"hi"`), false)
+		"resp_test", &ResponsesRequest{Model: "claude-opus-4.6"}, json.RawMessage(`"hi"`), false,
+		nil, false)
 
 	body := rec.Body.String()
 	if !strings.Contains(body, "response.failed") {

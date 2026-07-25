@@ -90,7 +90,7 @@ func TestClaudeStreamTerminatesBlocksOnMidStreamFailure(t *testing.T) {
 
 	rec := httptest.NewRecorder()
 	h.handleClaudeStream(rec, midStreamPayload(), "claude-opus-4.6", false,
-		claudeThinkingResponseOptions{Format: "thinking"}, 5, nil, "")
+		claudeThinkingResponseOptions{Format: "thinking"}, 5, nil, "", nil, false)
 
 	body := rec.Body.String()
 	starts := strings.Count(body, `"type":"content_block_start"`)
@@ -118,7 +118,7 @@ func TestOpenAIStreamTerminatesOnMidStreamFailure(t *testing.T) {
 	h := setupMidStreamFailureHandler(t, midStreamLongText)
 
 	rec := httptest.NewRecorder()
-	h.handleOpenAIStream(rec, midStreamPayload(), "claude-opus-4.6", false, 5, "")
+	h.handleOpenAIStream(rec, midStreamPayload(), "claude-opus-4.6", false, 5, "", nil, false)
 
 	body := rec.Body.String()
 	if !strings.Contains(body, "long partial answer") {
