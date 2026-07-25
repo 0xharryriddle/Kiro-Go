@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 // newExternalIdpTokenServer stands up a fake IdP token endpoint that answers the
@@ -20,6 +21,18 @@ func newExternalIdpTokenServer(t *testing.T) *httptest.Server {
 		w.Header().Set("Content-Type", "application/json")
 		fmt.Fprint(w, `{"access_token":"at-watch","refresh_token":"rt-watch-rotated","expires_in":3600}`)
 	}))
+}
+
+// backdateForWatcher rewinds a fixture's mtime past importMinFileAgeSeconds so
+// scanImportDir's "file still being written" guard (proxy/import_watcher.go) does
+// not skip it. Tests write and scan in the same instant, so without this every
+// fixture is ~0s old and always deferred to a later poll that never happens.
+func backdateForWatcher(t *testing.T, path string) {
+	t.Helper()
+	old := time.Now().Add(-(importMinFileAgeSeconds + 1) * time.Second)
+	if err := os.Chtimes(path, old, old); err != nil {
+		t.Fatalf("backdate %s: %v", path, err)
+	}
 }
 
 // writeHelperFile writes a helper-style external_idp credential JSON into dir and
@@ -41,6 +54,7 @@ func writeHelperFile(t *testing.T, dir, name, tokenEndpoint, refreshToken, email
 	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
 		t.Fatalf("write helper file: %v", err)
 	}
+	backdateForWatcher(t, path)
 }
 
 // TestImportWatcherProcessesValidFile verifies a valid drop is imported and the
@@ -92,6 +106,7 @@ func TestImportWatcherMovesInvalidFileToFailed(t *testing.T) {
 	if err := os.WriteFile(path, []byte("{ this is not json"), 0o600); err != nil {
 		t.Fatalf("write broken file: %v", err)
 	}
+	backdateForWatcher(t, path)
 
 	h := &Handler{pool: accountpool.GetPool()}
 	h.scanImportDir(dir)
