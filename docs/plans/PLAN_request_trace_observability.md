@@ -574,8 +574,10 @@ PY
 git diff --check
 ```
 
-Two pre-existing `gofmt` flags (`proxy/usage_anomaly_test.go`,
-`proxy/response_cache_test.go`) are untouched unless a task edits those files.
+One pre-existing `gofmt` flag (`proxy/usage_anomaly_test.go`) is untouched unless a
+task edits that file. (An earlier draft of this plan also listed
+`proxy/response_cache_test.go`; verified against the baseline commit, that file is
+not gofmt-flagged.)
 
 ---
 
