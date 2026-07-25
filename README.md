@@ -102,7 +102,7 @@ curl http://localhost:8080/v1/chat/completions \
 
 ## Operations
 
-See [docs/operator-runbook.md](docs/operator-runbook.md) for production health checks, config backup/restore, credential recovery, account/model diagnostics, request replay dry-runs, logs, metrics, and deployment verification steps. For external IdP import preview, conflict decisions, diagnostics, and audit behavior, see [docs/external-idp-import.md](docs/external-idp-import.md). For upstream Kiro-issued API keys, automatic/manual profile and region selection, hosted-SSO profile choice, model detection/routing, admin endpoints, migrations, and secret-bearing exports, see [docs/kiro-api-key-and-profiles.md](docs/kiro-api-key-and-profiles.md).
+See [docs/operator-runbook.md](docs/operator-runbook.md) for production health checks, config backup/restore, credential recovery, account/model diagnostics, request replay dry-runs, logs, metrics, and deployment verification steps. For external IdP import preview, conflict decisions, diagnostics, and audit behavior, see [docs/external-idp-import.md](docs/external-idp-import.md). For upstream Kiro-issued API keys, automatic/manual profile and region selection, hosted-SSO profile choice, model detection/routing, admin endpoints, migrations, and secret-bearing exports, see [docs/kiro-api-key-and-profiles.md](docs/kiro-api-key-and-profiles.md). For per-request tracing — failover attempt detail, capture modes, what is scrubbed, retention, the query API, and a 60-second debugging walkthrough — see [docs/request-tracing.md](docs/request-tracing.md).
 
 ## Thinking Mode
 

@@ -829,5 +829,27 @@
     "ttfb": "首字延迟",
     "upstreamHost": "上游主机",
     "upstreamRequestId": "上游请求 ID"
+  },
+  "settings": {
+    "traceSettings": "请求追踪",
+    "traceCaptureMode": "捕获模式",
+    "traceCaptureModeHint": "meta 仅存储路由元数据。redacted 与 full 会将请求/响应内容写入磁盘。",
+    "traceModeOff": "off - 不追踪",
+    "traceModeMeta": "meta - 仅元数据（默认）",
+    "traceModeRedacted": "redacted - 内容（PII 已脱敏）",
+    "traceModeFull": "full - 完整原文内容",
+    "traceAckRisk": "我了解 full 模式会原文存储提示词",
+    "traceAckRiskHint": "未确认时 full 会降级为 redacted。凭据始终会被清除。",
+    "traceRetentionHours": "保留时长（小时）",
+    "traceRetentionHoursHint": "超过该时长的轮转追踪文件将被删除。默认 168（7 天）。",
+    "traceMaxBodyBytes": "单条内容上限（字节）",
+    "traceMaxBodyBytesHint": "超出的内容会被截断并标记。默认 262144（256KB）。",
+    "traceIndexFiles": "索引文件",
+    "traceBodyFiles": "内容文件",
+    "traceWritten": "已写入记录",
+    "traceDropped": "丢弃（队列已满）",
+    "traceFullConfirm": "full 模式会将用户提示词原文写入磁盘。确定继续？",
+    "saveTrace": "保存追踪设置",
+    "saved": "已保存"
   }
 }

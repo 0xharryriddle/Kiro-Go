@@ -2629,8 +2629,89 @@
     if ($('metricsEnabled')) $('metricsEnabled').checked = d.metricsEnabled || false;
     if ($('responseCacheEnabled')) $('responseCacheEnabled').checked = d.responseCacheEnabled || false;
     if ($('responseCacheTTLSeconds')) $('responseCacheTTLSeconds').value = String(d.responseCacheTTLSeconds || 300);
-    await Promise.all([loadThinkingConfig(), loadEndpointConfig(), loadProxyConfig(), loadPromptFilter(), loadApiKeys(), loadConfigStatus()]);
+    applyTraceSettings(d);
+    await Promise.all([loadThinkingConfig(), loadEndpointConfig(), loadProxyConfig(), loadPromptFilter(), loadApiKeys(), loadConfigStatus(), loadTraceStorage()]);
     refreshCustomSelects();
+  }
+
+  // ===== Request tracing settings =====
+
+  function applyTraceSettings(d) {
+    const mode = $('traceCaptureMode');
+    if (mode) mode.value = d.traceCaptureMode || 'meta';
+    const ack = $('traceCaptureAcknowledgeRisk');
+    if (ack) ack.checked = !!d.traceCaptureAcknowledgeRisk;
+    const retention = $('traceRetentionHours');
+    if (retention) retention.value = String(d.traceRetentionHours || 168);
+    const maxBody = $('traceMaxBodyBytes');
+    if (maxBody) maxBody.value = String(d.traceMaxBodyBytes || 262144);
+    updateTraceRiskVisibility();
+  }
+
+  // The risk acknowledgement only matters for "full"; showing it for every mode
+  // would invite an operator to tick it without the mode that needs it.
+  function updateTraceRiskVisibility() {
+    const group = $('traceRiskGroup');
+    const mode = $('traceCaptureMode');
+    if (!group || !mode) return;
+    group.classList.toggle('hidden', mode.value !== 'full');
+  }
+
+  function formatBytes(n) {
+    const bytes = Number(n) || 0;
+    if (bytes < 1024) return bytes + ' B';
+    if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB';
+    if (bytes < 1024 * 1024 * 1024) return (bytes / (1024 * 1024)).toFixed(1) + ' MB';
+    return (bytes / (1024 * 1024 * 1024)).toFixed(2) + ' GB';
+  }
+
+  async function loadTraceStorage() {
+    const box = $('traceStorageReadout');
+    if (!box) return;
+    try {
+      const res = await api('/logs/storage');
+      if (!res.ok) return;
+      const d = await res.json();
+      const parts = [
+        '<span>' + escapeHtml(t('settings.traceIndexFiles')) + ': <strong>' + escapeHtml(String(d.indexFiles || 0)) +
+          '</strong> (' + escapeHtml(formatBytes(d.indexBytes)) + ')</span>',
+        '<span>' + escapeHtml(t('settings.traceBodyFiles')) + ': <strong>' + escapeHtml(String(d.bodyFiles || 0)) +
+          '</strong> (' + escapeHtml(formatBytes(d.bodyBytes)) + ')</span>',
+        '<span>' + escapeHtml(t('settings.traceWritten')) + ': <strong>' + escapeHtml(String(d.writtenRecords || 0)) + '</strong></span>',
+      ];
+      if (d.droppedRecords > 0) {
+        // Dropped records mean the queue saturated; surfacing it here explains
+        // a gap in the Logs view rather than leaving it a mystery.
+        parts.push('<span class="danger-text">' + escapeHtml(t('settings.traceDropped')) + ': <strong>' +
+          escapeHtml(String(d.droppedRecords)) + '</strong></span>');
+      }
+      parts.push('<span><code>' + escapeHtml(d.tracesDirectory || '') + '</code></span>');
+      box.innerHTML = parts.join('');
+    } catch (e) {
+      // silent
+    }
+  }
+
+  async function saveTraceSettings() {
+    const mode = $('traceCaptureMode') ? $('traceCaptureMode').value : 'meta';
+    const ack = $('traceCaptureAcknowledgeRisk') ? $('traceCaptureAcknowledgeRisk').checked : false;
+    // Verbatim prompt retention is a deliberate decision: confirm it explicitly.
+    if (mode === 'full' && ack && !confirm(t('settings.traceFullConfirm'))) return;
+    const body = {
+      traceCaptureMode: mode,
+      traceCaptureAcknowledgeRisk: ack,
+      traceRetentionHours: parseInt($('traceRetentionHours') ? $('traceRetentionHours').value : '0', 10) || 0,
+      traceMaxBodyBytes: parseInt($('traceMaxBodyBytes') ? $('traceMaxBodyBytes').value : '0', 10) || 0,
+    };
+    const res = await api('/settings', { method: 'POST', body: JSON.stringify(body) });
+    const d = await res.json().catch(() => ({}));
+    if (!res.ok || d.success === false) {
+      return toastError((d && d.error) || t('common.failed'));
+    }
+    toast(t('settings.saved'), 'success');
+    // Re-read: an unacknowledged "full" is stored as "redacted", so the UI must
+    // show what is actually in effect rather than what was requested.
+    await loadSettings();
   }
   async function loadThinkingConfig() {
     const res = await api('/thinking');
@@ -4511,6 +4592,10 @@
   function bindSettingsEvents() {
     $('saveRequireApiKeyBtn').addEventListener('click', saveRequireApiKey);
     $('saveOverUsageBtn').addEventListener('click', saveOverUsageConfig);
+    const saveTraceBtn = $('saveTraceSettingsBtn');
+    if (saveTraceBtn) saveTraceBtn.addEventListener('click', saveTraceSettings);
+    const traceModeSel = $('traceCaptureMode');
+    if (traceModeSel) traceModeSel.addEventListener('change', updateTraceRiskVisibility);
     $('saveThinkingBtn').addEventListener('click', saveThinkingConfig);
     $('saveEndpointBtn').addEventListener('click', saveEndpointConfig);
     $('changePasswordBtn').addEventListener('click', changePassword);

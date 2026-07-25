@@ -829,5 +829,27 @@
     "ttfb": "Time to first token",
     "upstreamHost": "Upstream host",
     "upstreamRequestId": "Upstream request ID"
+  },
+  "settings": {
+    "traceSettings": "Request tracing",
+    "traceCaptureMode": "Capture mode",
+    "traceCaptureModeHint": "meta stores routing metadata only. redacted and full also store prompt/response bodies on disk.",
+    "traceModeOff": "off - no tracing",
+    "traceModeMeta": "meta - metadata only (default)",
+    "traceModeRedacted": "redacted - bodies with PII redaction",
+    "traceModeFull": "full - verbatim bodies",
+    "traceAckRisk": "I understand full mode stores prompts verbatim",
+    "traceAckRiskHint": "Without this, full mode degrades to redacted. Credentials are always scrubbed.",
+    "traceRetentionHours": "Retention (hours)",
+    "traceRetentionHoursHint": "Rotated trace files older than this are deleted. Default 168 (7 days).",
+    "traceMaxBodyBytes": "Max body bytes",
+    "traceMaxBodyBytesHint": "Larger bodies are truncated and flagged. Default 262144 (256KB).",
+    "traceIndexFiles": "Index files",
+    "traceBodyFiles": "Body files",
+    "traceWritten": "Records written",
+    "traceDropped": "Dropped (queue full)",
+    "traceFullConfirm": "Full capture stores user prompts verbatim on disk. Continue?",
+    "saveTrace": "Save tracing settings",
+    "saved": "Saved"
   }
 }

@@ -98,7 +98,7 @@ curl http://localhost:8080/v1/chat/completions \
 
 ## 运维
 
-生产健康检查、配置备份/恢复、凭据恢复、账号/模型诊断、请求回放 dry-run、日志、指标和部署验证步骤见 [docs/operator-runbook.md](docs/operator-runbook.md)。外部 IdP 导入预览、冲突决策、诊断和审计行为见 [docs/external-idp-import.md](docs/external-idp-import.md)。上游 Kiro API 密钥、多配置文件与区域自动/手动选择、Hosted SSO 配置文件选择、模型检测与路由、管理 API、迁移及敏感导出说明见 [docs/kiro-api-key-and-profiles.md](docs/kiro-api-key-and-profiles.md)。
+生产健康检查、配置备份/恢复、凭据恢复、账号/模型诊断、请求回放 dry-run、日志、指标和部署验证步骤见 [docs/operator-runbook.md](docs/operator-runbook.md)。外部 IdP 导入预览、冲突决策、诊断和审计行为见 [docs/external-idp-import.md](docs/external-idp-import.md)。上游 Kiro API 密钥、多配置文件与区域自动/手动选择、Hosted SSO 配置文件选择、模型检测与路由、管理 API、迁移及敏感导出说明见 [docs/kiro-api-key-and-profiles.md](docs/kiro-api-key-and-profiles.md)。逐请求追踪——故障转移尝试明细、捕获模式、脱敏范围、保留策略、查询 API 以及 60 秒排查流程——见 [docs/request-tracing.md](docs/request-tracing.md)。
 
 ## 思考模式
 

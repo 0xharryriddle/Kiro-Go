@@ -2955,6 +2955,8 @@ func (h *Handler) handleAdminAPI(w http.ResponseWriter, r *http.Request) {
 		h.apiClearLogs(w, r)
 	case path == "/logs/facets" && r.Method == "GET":
 		h.apiGetLogsFacets(w, r)
+	case path == "/logs/storage" && r.Method == "GET":
+		h.apiGetTraceStorage(w, r)
 	case strings.HasPrefix(path, "/logs/") && r.Method == "GET":
 		h.apiGetTraceDetail(w, r, strings.TrimPrefix(path, "/logs/"))
 	case path == "/generate-machine-id" && r.Method == "GET":
@@ -4871,6 +4873,13 @@ func (h *Handler) apiGetSettings(w http.ResponseWriter, r *http.Request) {
 		"metricsEnabled":           config.GetMetricsEnabled(),
 		"responseCacheEnabled":     config.GetResponseCacheEnabled(),
 		"responseCacheTTLSeconds":  config.GetResponseCacheTTLSeconds(),
+		// Request tracing. captureMode is the RESOLVED mode, so a "full"
+		// setting without the risk acknowledgement is reported as the
+		// "redacted" it actually behaves as, rather than the value on disk.
+		"traceCaptureMode":            config.GetTraceCaptureMode(),
+		"traceCaptureAcknowledgeRisk": config.GetTraceCaptureAcknowledgeRisk(),
+		"traceRetentionHours":         config.GetTraceRetentionHours(),
+		"traceMaxBodyBytes":           config.GetTraceMaxBodyBytes(),
 	})
 }
 
@@ -4972,6 +4981,11 @@ func (h *Handler) apiUpdateSettings(w http.ResponseWriter, r *http.Request) {
 		MetricsEnabled           *bool   `json:"metricsEnabled,omitempty"`
 		ResponseCacheEnabled     *bool   `json:"responseCacheEnabled,omitempty"`
 		ResponseCacheTTLSeconds  *int    `json:"responseCacheTTLSeconds,omitempty"`
+
+		TraceCaptureMode            *string `json:"traceCaptureMode,omitempty"`
+		TraceCaptureAcknowledgeRisk *bool   `json:"traceCaptureAcknowledgeRisk,omitempty"`
+		TraceRetentionHours         *int    `json:"traceRetentionHours,omitempty"`
+		TraceMaxBodyBytes           *int    `json:"traceMaxBodyBytes,omitempty"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		w.WriteHeader(400)
@@ -5056,7 +5070,98 @@ func (h *Handler) apiUpdateSettings(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// Request tracing: capture mode, risk acknowledgement, retention, body cap.
+	// Any of the four may arrive alone, so unset fields fall back to the values
+	// currently in effect rather than to zero (which would silently reset
+	// retention to the default or drop the acknowledgement).
+	if req.TraceCaptureMode != nil || req.TraceCaptureAcknowledgeRisk != nil ||
+		req.TraceRetentionHours != nil || req.TraceMaxBodyBytes != nil {
+		mode := config.GetTraceCaptureMode()
+		if req.TraceCaptureMode != nil {
+			mode = *req.TraceCaptureMode
+		}
+		ack := config.GetTraceCaptureAcknowledgeRisk()
+		if req.TraceCaptureAcknowledgeRisk != nil {
+			ack = *req.TraceCaptureAcknowledgeRisk
+		}
+		retention := 0
+		if req.TraceRetentionHours != nil {
+			retention = *req.TraceRetentionHours
+		}
+		maxBody := 0
+		if req.TraceMaxBodyBytes != nil {
+			maxBody = *req.TraceMaxBodyBytes
+		}
+		if err := config.UpdateTraceCaptureConfig(mode, ack, retention, maxBody); err != nil {
+			w.WriteHeader(500)
+			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+		// Changing what is retained about user prompts is a privacy-relevant
+		// action, so it leaves an audit trail alongside the setting itself.
+		h.appendAuditLog(AuditLog{
+			Category: "settings",
+			Action:   "trace-capture",
+			Status:   "success",
+			SafeDetails: map[string]string{
+				"mode":            config.GetTraceCaptureMode(),
+				"acknowledgeRisk": strconv.FormatBool(ack),
+				"retentionHours":  strconv.Itoa(config.GetTraceRetentionHours()),
+				"maxBodyBytes":    strconv.Itoa(config.GetTraceMaxBodyBytes()),
+			},
+		})
+	}
+
 	json.NewEncoder(w).Encode(map[string]bool{"success": true})
+}
+
+// apiGetTraceStorage reports on-disk trace usage so an operator can see the cost
+// of the current capture mode before turning body capture up.
+func (h *Handler) apiGetTraceStorage(w http.ResponseWriter, r *http.Request) {
+	indexFiles, indexBytes := dirUsage(tracesDir(), false)
+	bodyFiles, bodyBytes := dirUsage(traceBodiesDir(), true)
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"success":         true,
+		"captureMode":     config.GetTraceCaptureMode(),
+		"retentionHours":  config.GetTraceRetentionHours(),
+		"maxBodyBytes":    config.GetTraceMaxBodyBytes(),
+		"indexFiles":      indexFiles,
+		"indexBytes":      indexBytes,
+		"bodyFiles":       bodyFiles,
+		"bodyBytes":       bodyBytes,
+		"droppedRecords":  h.traceStore.Dropped(),
+		"writtenRecords":  h.traceStore.Written(),
+		"tracesDirectory": tracesDir(),
+	})
+}
+
+// dirUsage counts files and bytes in a directory. recurse walks day
+// subdirectories (the body tier); otherwise only top-level files are counted.
+func dirUsage(dir string, recurse bool) (int, int64) {
+	var files int
+	var bytes int64
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return 0, 0
+	}
+	for _, entry := range entries {
+		if entry.IsDir() {
+			if !recurse {
+				continue
+			}
+			subFiles, subBytes := dirUsage(filepath.Join(dir, entry.Name()), false)
+			files += subFiles
+			bytes += subBytes
+			continue
+		}
+		info, err := entry.Info()
+		if err != nil {
+			continue
+		}
+		files++
+		bytes += info.Size()
+	}
+	return files, bytes
 }
 
 func (h *Handler) apiGetStats(w http.ResponseWriter, r *http.Request) {

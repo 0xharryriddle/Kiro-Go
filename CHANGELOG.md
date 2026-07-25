@@ -5,8 +5,52 @@ follows [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+### Added
+
+- **Per-request tracing for the Logs view.** Every client request now carries a
+  `trc_`-prefixed trace ID and emits exactly one record that embeds every upstream
+  dispatch attempt, so a failover chain no longer collapses into a single row that
+  hides the quota error which caused the reroute. Records gained routing context
+  (region, profile suffix, upstream host, HTTP status, upstream correlation ID),
+  split input/output token counts, time-to-first-token, stop reason, and tool-call
+  count. Field names transliterate the OpenTelemetry GenAI semantic conventions so a
+  future OTel/Langfuse exporter is mechanical. See
+  [docs/request-tracing.md](docs/request-tracing.md).
+- **Opt-in request/response body capture.** Four modes — `off`, `meta` (default,
+  no prompt text ever reaches disk), `redacted`, and `full`. `full` additionally
+  requires `traceCaptureAcknowledgeRisk`, degrading to `redacted` without it, so
+  retaining verbatim prompts is always a deliberate two-step decision. Credential
+  scrubbing is unconditional in every capturing mode; bodies are gzipped, capped
+  (256 KB default), stored `0600`, and pruned on the same clock as the index.
+- **Structured log query API.** `GET /admin/api/logs` gained `from`/`to`, `limit`
+  (default 100, max 1000), an opaque newest-first `cursor`, and `outcome`/`api`/
+  `model`/`accountId`/`apiKeyId`/`errorType`/`minDurationMs` filters; the limit was
+  previously hardcoded to unbounded. Added `GET /admin/api/logs/facets`,
+  `GET /admin/api/logs/storage`, `GET /admin/api/logs/{traceID}` (bodies, `no-store`),
+  and an attempt-level CSV export with one row per upstream attempt.
+- **Trace detail UI.** Log rows open a drawer with an attempt waterfall (sequence,
+  account, region, HTTP status, duration bar, error badge), collapsible body panes,
+  facet dropdowns, time-range presets, and pagination. Absent bodies state the active
+  capture mode rather than rendering empty.
+
 ### Fixed
 
+- **Requests that were billed but never logged.** Response-cache hits updated the
+  usage counters without emitting any log record, so `logCount` could never be
+  reconciled against `totalRequests`; rejected traffic (invalid/disabled API key,
+  RPM/TPM denial) returned from middleware and produced no evidence at all. Both
+  now emit exactly one record, and rejection records carry a suffix-only credential
+  fingerprint rather than the offending key.
+- **`RequestLog.RequestID` was declared but never assigned**, leaving every log line
+  unjoinable to anything else.
+- **Request-log persistence was O(n) per request and raced on a shared temp path.**
+  Every append re-serialised the whole retained slice with `MarshalIndent` from a
+  fresh goroutine, all writing `data/request_logs.json.tmp`. Replaced with an
+  append-only JSONL store owned by a single writer goroutine, with UTC daily
+  rotation, whole-file pruning, a bounded queue that drops rather than throttling
+  serving, and a visible `dropped` counter. An existing `data/request_logs.json` is
+  imported once and renamed `.migrated`.
+- Clearing the request logs now leaves an audit-log entry, since it destroys evidence.
 - Made credential replacement a single durable config transaction, rolled back ordinary account updates on save failure, rejected cross-region profile discovery mismatches, and prevented stale admin profile/API-key responses from rendering after modal changes.
 - **IAM Identity Center accounts showed the wrong account with no profile.** An IdC
   credential carries the SSO *portal* region, which is independent of the region

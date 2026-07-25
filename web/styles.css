@@ -1611,6 +1611,19 @@ img.brand-icon {
   word-break: break-all;
 }
 
+/* Settings: trace storage readout */
+.trace-storage {
+  display: flex;
+  gap: 1rem;
+  flex-wrap: wrap;
+  padding: 0.5rem 0 0.75rem;
+  font-size: 0.75rem;
+  color: var(--muted-foreground);
+}
+.trace-storage strong {
+  color: var(--foreground);
+}
+
 /* Login screen */
 .login-wrapper {
   min-height: 100dvh;

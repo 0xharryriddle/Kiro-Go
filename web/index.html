@@ -472,6 +472,40 @@
           <button class="btn btn-primary" id="saveOverUsageBtn" data-i18n="settings.saveUsage"></button>
         </div>
 
+        <!-- Request tracing settings -->
+        <div class="card">
+          <div class="card-header"><span class="card-title" data-i18n="settings.traceSettings"></span></div>
+          <div class="form-group">
+            <label data-i18n="settings.traceCaptureMode"></label>
+            <select id="traceCaptureMode">
+              <option value="off" data-i18n="settings.traceModeOff"></option>
+              <option value="meta" data-i18n="settings.traceModeMeta"></option>
+              <option value="redacted" data-i18n="settings.traceModeRedacted"></option>
+              <option value="full" data-i18n="settings.traceModeFull"></option>
+            </select>
+            <small data-i18n="settings.traceCaptureModeHint"></small>
+          </div>
+          <div class="form-group hidden" id="traceRiskGroup">
+            <label class="flex items-center gap-2">
+              <span class="switch"><input type="checkbox" id="traceCaptureAcknowledgeRisk" /><span class="slider"></span></span>
+              <span data-i18n="settings.traceAckRisk"></span>
+            </label>
+            <small class="danger-text" data-i18n="settings.traceAckRiskHint"></small>
+          </div>
+          <div class="form-group">
+            <label data-i18n="settings.traceRetentionHours"></label>
+            <input type="number" id="traceRetentionHours" min="1" step="1" placeholder="168" />
+            <small data-i18n="settings.traceRetentionHoursHint"></small>
+          </div>
+          <div class="form-group">
+            <label data-i18n="settings.traceMaxBodyBytes"></label>
+            <input type="number" id="traceMaxBodyBytes" min="1024" step="1024" placeholder="262144" />
+            <small data-i18n="settings.traceMaxBodyBytesHint"></small>
+          </div>
+          <div class="trace-storage" id="traceStorageReadout"></div>
+          <button class="btn btn-primary" id="saveTraceSettingsBtn" data-i18n="settings.saveTrace"></button>
+        </div>
+
         <!-- Thinking settings -->
         <div class="card">
           <div class="card-header"><span class="card-title" data-i18n="settings.thinkingSettings"></span></div>

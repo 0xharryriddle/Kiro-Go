@@ -90,6 +90,18 @@ func TraceCaptureEnabled() bool {
 	return GetTraceCaptureMode() != TraceCaptureOff
 }
 
+// GetTraceCaptureAcknowledgeRisk reports whether verbatim body capture has been
+// explicitly acknowledged. Exposed so the admin UI can show the operator why a
+// "full" selection is currently behaving as "redacted".
+func GetTraceCaptureAcknowledgeRisk() bool {
+	cfgLock.RLock()
+	defer cfgLock.RUnlock()
+	if cfg == nil {
+		return false
+	}
+	return cfg.TraceCaptureAcknowledgeRisk
+}
+
 // GetTraceRetentionHours returns the trace retention window in hours,
 // defaulting to 7 days.
 func GetTraceRetentionHours() int {
