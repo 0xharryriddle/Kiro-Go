@@ -423,6 +423,35 @@ type Config struct {
 	// PromptFilterRules is a list of user-defined prompt sanitization rules (regex or line-filter).
 	PromptFilterRules []PromptFilterRule `json:"promptFilterRules,omitempty"`
 
+	// TraceCaptureMode controls how much of each request is retained in the
+	// request-trace store:
+	//
+	//   "off"      — no trace records at all.
+	//   "meta"     — DEFAULT. Metadata and per-attempt routing detail only; no
+	//                prompt or response text is ever written to disk.
+	//   "redacted" — additionally stores request/response bodies with PII
+	//                redaction applied.
+	//   "full"     — stores bodies verbatim. Requires TraceCaptureAcknowledgeRisk
+	//                to be true, otherwise it degrades to "redacted".
+	//
+	// Defaults to "meta" so upgrading changes nothing about what is stored.
+	// Prompts are the most sensitive data flowing through this proxy, so body
+	// capture is strictly opt-in. Unrecognised values fail safe to "meta".
+	TraceCaptureMode string `json:"traceCaptureMode,omitempty"`
+
+	// TraceCaptureAcknowledgeRisk must be set explicitly for "full" capture to
+	// take effect. It exists so that retaining verbatim prompts is always a
+	// deliberate two-step decision rather than a single typo.
+	TraceCaptureAcknowledgeRisk bool `json:"traceCaptureAcknowledgeRisk,omitempty"`
+
+	// TraceRetentionHours bounds how long rotated trace files are kept.
+	// Defaults to 168 (7 days). Pruning is by whole rotated file.
+	TraceRetentionHours int `json:"traceRetentionHours,omitempty"`
+
+	// TraceMaxBodyBytes caps each captured body. Defaults to 262144 (256KB);
+	// larger bodies are truncated and flagged on the record.
+	TraceMaxBodyBytes int `json:"traceMaxBodyBytes,omitempty"`
+
 	// LogLevel controls verbosity of application logs.
 	// Accepted values: "debug", "info", "warn", "error". Defaults to "info".
 	// Can be overridden by the LOG_LEVEL environment variable.

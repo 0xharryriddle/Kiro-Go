@@ -11,6 +11,7 @@ import (
 	"kiro-go/pool"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -125,6 +126,12 @@ func tracesDir() string {
 	return tracesDirPath
 }
 
+// traceBodiesDir returns the directory holding captured request/response bodies.
+// Kept under the trace root so a single retention sweep covers both tiers.
+func traceBodiesDir() string {
+	return filepath.Join(tracesDirPath, "bodies")
+}
+
 // Handler HTTP 处理器
 type Handler struct {
 	pool *pool.AccountPool
@@ -152,7 +159,11 @@ type Handler struct {
 	// traceStore owns durable trace persistence. Nil on a zero-value Handler
 	// (unit tests), in which case appendRequestLog falls back to the legacy
 	// whole-file writer.
-	traceStore  *traceStore
+	traceStore *traceStore
+	// traceBodies persists captured request/response payloads. Only written
+	// when the configured capture mode permits it; nil disables body capture
+	// entirely.
+	traceBodies *traceBodyStore
 	auditLogs   []AuditLog
 	auditLogsMu sync.RWMutex
 	// F6: per-API-key sliding-window RPM/TPM limiter (in-process).
@@ -366,6 +377,7 @@ func NewHandler() *Handler {
 		rateLimiter:     newRateLimiter(),
 		responseCache:   newResponseCache(),
 		traceStore:      newTraceStore(tracesDir(), 0),
+		traceBodies:     newTraceBodyStore(traceBodiesDir()),
 	}
 	h.loadRequestLogs()
 	h.loadAuditLogs()
@@ -1595,6 +1607,11 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 			},
 		}
 
+		// Marshal the outbound payload BEFORE dispatch: CallKiroAPI mutates it
+		// in place per endpoint (Origin, ProfileArn), so capturing afterwards
+		// would record post-dispatch state rather than what was sent. No-op
+		// unless the capture mode allows bodies.
+		tr.noteRequestPayload(payload)
 		var diag KiroCallDiagnostics
 		err := CallKiroAPIWithDiagnostics(account, payload, callback, &diag)
 		tr.applyDiagnostics(att, &diag)
@@ -1647,6 +1664,7 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 		}
 		tr.noteUsage(inputTokens, outputTokens, cacheUsage.CacheReadInputTokens, credits)
 		tr.noteResponseShape(stopReason, model, len(toolUses))
+		tr.noteResponseText(outputContent)
 		h.emitTrace(tr, outcomeSuccess, http.StatusOK)
 
 		ensureMessageStart()
@@ -1802,17 +1820,28 @@ func (h *Handler) backgroundTracePrune() {
 		return
 	}
 	// Prune once at startup so a long-stopped instance does not keep stale days.
-	h.traceStore.Prune(traceDefaultRetentionHours, time.Now())
+	h.pruneTraces()
 	ticker := time.NewTicker(tracePruneInterval)
 	defer ticker.Stop()
 	for {
 		select {
 		case <-ticker.C:
-			h.traceStore.Prune(traceDefaultRetentionHours, time.Now())
+			h.pruneTraces()
 		case <-h.stopStatsSaver:
 			return
 		}
 	}
+}
+
+// pruneTraces expires both trace tiers against the configured retention window.
+// Bodies are pruned on the same clock as the index: retaining prompt payloads
+// for longer than the metadata that references them would leave orphaned
+// sensitive data with nothing pointing at it.
+func (h *Handler) pruneTraces() {
+	retention := config.GetTraceRetentionHours()
+	now := time.Now()
+	h.traceStore.Prune(retention, now)
+	h.traceBodies.Prune(retention, now)
 }
 
 // loadRequestLogs repopulates the live ring on boot.
@@ -2016,6 +2045,11 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayl
 			},
 		}
 
+		// Marshal the outbound payload BEFORE dispatch: CallKiroAPI mutates it
+		// in place per endpoint (Origin, ProfileArn), so capturing afterwards
+		// would record post-dispatch state rather than what was sent. No-op
+		// unless the capture mode allows bodies.
+		tr.noteRequestPayload(payload)
 		var diag KiroCallDiagnostics
 		err := CallKiroAPIWithDiagnostics(account, payload, callback, &diag)
 		tr.applyDiagnostics(att, &diag)
@@ -2060,6 +2094,7 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayl
 		}
 		tr.noteUsage(inputTokens, outputTokens, cacheUsage.CacheReadInputTokens, credits)
 		tr.noteResponseShape(stopReason, model, len(toolUses))
+		tr.noteResponseText(finalContent)
 		h.emitTrace(tr, outcomeSuccess, http.StatusOK)
 
 		responseThinkingContent := rawThinkingContent
@@ -2507,6 +2542,11 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 			},
 		}
 
+		// Marshal the outbound payload BEFORE dispatch: CallKiroAPI mutates it
+		// in place per endpoint (Origin, ProfileArn), so capturing afterwards
+		// would record post-dispatch state rather than what was sent. No-op
+		// unless the capture mode allows bodies.
+		tr.noteRequestPayload(payload)
 		var diag KiroCallDiagnostics
 		err := CallKiroAPIWithDiagnostics(account, payload, callback, &diag)
 		tr.applyDiagnostics(att, &diag)
@@ -2556,6 +2596,7 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 		}
 		tr.noteUsage(inputTokens, outputTokens, 0, credits)
 		tr.noteResponseShape(finishReason, model, len(toolCalls))
+		tr.noteResponseText(outputContent)
 		h.emitTrace(tr, outcomeSuccess, http.StatusOK)
 
 		chunk := map[string]interface{}{
@@ -2636,6 +2677,11 @@ func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, payload *KiroPayl
 			},
 		}
 
+		// Marshal the outbound payload BEFORE dispatch: CallKiroAPI mutates it
+		// in place per endpoint (Origin, ProfileArn), so capturing afterwards
+		// would record post-dispatch state rather than what was sent. No-op
+		// unless the capture mode allows bodies.
+		tr.noteRequestPayload(payload)
 		var diag KiroCallDiagnostics
 		err := CallKiroAPIWithDiagnostics(account, payload, callback, &diag)
 		tr.applyDiagnostics(att, &diag)
@@ -2677,6 +2723,7 @@ func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, payload *KiroPayl
 		}
 		tr.noteUsage(inputTokens, outputTokens, 0, credits)
 		tr.noteResponseShape(finishReason, model, len(toolUses))
+		tr.noteResponseText(finalContent)
 		h.emitTrace(tr, outcomeSuccess, http.StatusOK)
 
 		thinkingFormat := config.GetThinkingConfig().OpenAIFormat
@@ -2907,6 +2954,8 @@ func (h *Handler) handleAdminAPI(w http.ResponseWriter, r *http.Request) {
 		h.apiGetAuditLogs(w, r)
 	case path == "/logs" && r.Method == "DELETE":
 		h.apiClearLogs(w, r)
+	case strings.HasPrefix(path, "/logs/") && r.Method == "GET":
+		h.apiGetTraceDetail(w, r, strings.TrimPrefix(path, "/logs/"))
 	case path == "/generate-machine-id" && r.Method == "GET":
 		h.apiGenerateMachineId(w, r)
 	case path == "/thinking" && r.Method == "GET":

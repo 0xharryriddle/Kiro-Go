@@ -169,6 +169,11 @@ func (h *Handler) handleResponsesNonStream(
 			},
 		}
 
+		// Marshal the outbound payload BEFORE dispatch: CallKiroAPI mutates it
+		// in place per endpoint (Origin, ProfileArn), so capturing afterwards
+		// would record post-dispatch state rather than what was sent. No-op
+		// unless the capture mode allows bodies.
+		tr.noteRequestPayload(payload)
 		var diag KiroCallDiagnostics
 		err := CallKiroAPIWithDiagnostics(account, payload, callback, &diag)
 		tr.applyDiagnostics(att, &diag)
@@ -207,6 +212,7 @@ func (h *Handler) handleResponsesNonStream(
 		}
 		tr.noteUsage(inputTokens, outputTokens, 0, credits)
 		tr.noteResponseShape(finishReason, model, len(toolUses))
+		tr.noteResponseText(finalContent)
 		h.emitTrace(tr, outcomeSuccess, http.StatusOK)
 
 		respObj := buildResponsesObject(respID, model, finalContent, toolUses, inputTokens, outputTokens, req)
@@ -495,6 +501,11 @@ func (h *Handler) handleResponsesStream(
 			},
 		}
 
+		// Marshal the outbound payload BEFORE dispatch: CallKiroAPI mutates it
+		// in place per endpoint (Origin, ProfileArn), so capturing afterwards
+		// would record post-dispatch state rather than what was sent. No-op
+		// unless the capture mode allows bodies.
+		tr.noteRequestPayload(payload)
 		var diag KiroCallDiagnostics
 		err := CallKiroAPIWithDiagnostics(account, payload, callback, &diag)
 		tr.applyDiagnostics(att, &diag)
@@ -576,6 +587,7 @@ func (h *Handler) handleResponsesStream(
 		}
 		tr.noteUsage(inputTokens, outputTokens, 0, credits)
 		tr.noteResponseShape(finishReason, model, len(toolUses))
+		tr.noteResponseText(finalContent)
 		h.emitTrace(tr, outcomeSuccess, http.StatusOK)
 
 		respObj := buildResponsesObject(respID, model, finalContent, toolUses, inputTokens, outputTokens, req)

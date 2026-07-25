@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"encoding/json"
 	"net/http"
 	"strconv"
 	"strings"
@@ -9,6 +10,7 @@ import (
 	"time"
 
 	"kiro-go/config"
+	"kiro-go/logger"
 )
 
 // traceRecorder accumulates one client request's trace as it progresses through
@@ -47,6 +49,11 @@ type traceRecorder struct {
 	cacheReadTokens int
 	credits         float64
 	cacheHit        bool
+
+	// Captured payloads, held in memory only until emitTrace decides whether
+	// the configured capture mode allows persisting them.
+	requestBody  []byte
+	responseBody []byte
 }
 
 // traceAttempt is a handle for one in-flight dispatch attempt. It is owned by
@@ -203,6 +210,55 @@ func (tr *traceRecorder) noteUsage(inputTokens, outputTokens, cacheReadTokens in
 	tr.credits = credits
 }
 
+// noteRequestPayload records the upstream request for body capture. The payload
+// is marshalled eagerly because it is mutated in place during endpoint fan-out
+// (Origin and ProfileArn are rewritten per attempt), so a deferred marshal would
+// capture post-dispatch state rather than what was actually sent.
+//
+// Nothing is persisted here: emitTrace decides, based on the configured capture
+// mode, whether these bytes ever reach disk.
+func (tr *traceRecorder) noteRequestPayload(payload *KiroPayload) {
+	if tr == nil || payload == nil {
+		return
+	}
+	if config.GetTraceCaptureMode() == config.TraceCaptureOff ||
+		config.GetTraceCaptureMode() == config.TraceCaptureMeta {
+		// Cheap exit: do not spend a marshal when bodies can never be stored.
+		return
+	}
+	raw, err := json.Marshal(payload)
+	if err != nil {
+		return
+	}
+	tr.mu.Lock()
+	tr.requestBody = raw
+	tr.mu.Unlock()
+}
+
+// noteResponseText records the assembled response for body capture.
+func (tr *traceRecorder) noteResponseText(text string) {
+	if tr == nil || text == "" {
+		return
+	}
+	switch config.GetTraceCaptureMode() {
+	case config.TraceCaptureOff, config.TraceCaptureMeta:
+		return
+	}
+	tr.mu.Lock()
+	tr.responseBody = []byte(text)
+	tr.mu.Unlock()
+}
+
+// bodies returns the captured request/response payloads, if any.
+func (tr *traceRecorder) bodies() ([]byte, []byte) {
+	if tr == nil {
+		return nil, nil
+	}
+	tr.mu.Lock()
+	defer tr.mu.Unlock()
+	return tr.requestBody, tr.responseBody
+}
+
 // markCacheHit flags a response served from the in-process response cache. Cache
 // hits consume tenant quota, so they must appear in the logs rather than being
 // invisible as they were before.
@@ -296,6 +352,23 @@ func (h *Handler) emitTrace(tr *traceRecorder, outcome string, httpStatus int) {
 	if outcome == outcomeError {
 		atomic.AddInt64(&h.totalRequests, 1)
 		atomic.AddInt64(&h.failedRequests, 1)
+	}
+
+	// Body capture is the single place prompt text can reach disk, and it is
+	// gated here rather than at the call sites so no future handler can bypass
+	// the mode check by forgetting it. Capture itself re-checks the mode and
+	// scrubs credentials, so this is defence in depth, not the only guard.
+	if h.traceBodies != nil {
+		if reqBody, respBody := tr.bodies(); len(reqBody) > 0 || len(respBody) > 0 {
+			mode := config.GetTraceCaptureMode()
+			ref, truncated, err := h.traceBodies.Capture(mode, entry.RequestID, reqBody, respBody, config.GetTraceMaxBodyBytes())
+			if err != nil {
+				logger.Warnf("[Trace] failed to capture bodies for %s: %v", entry.RequestID, err)
+			} else if ref != "" {
+				entry.BodyRef = ref
+				entry.BodyTruncated = truncated
+			}
+		}
 	}
 
 	h.appendRequestLog(entry)
