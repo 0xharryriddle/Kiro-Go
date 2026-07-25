@@ -701,6 +701,56 @@
   let logsSearch = '';
   let logsAutoTimer = null;
   let logsCache = [];
+  // Server-side pagination state. The API returns an opaque newest-first cursor;
+  // we keep a stack of them so "previous" works without refetching from scratch.
+  let logsCursor = '';
+  let logsCursorStack = [];
+  let logsHasMore = false;
+  let logsTotal = 0;
+  let logsFacets = null;
+  let logsCaptureMode = '';
+  const LOGS_PREFS_KEY = 'kiroGoLogsPrefs';
+  // Structured filters, persisted so an operator's working view survives reload.
+  let logsExtraFilters = { api: '', model: '', errorType: '', outcome: '', minDurationMs: '', rangeSeconds: '0' };
+
+  function loadLogsPrefs() {
+    try {
+      const raw = localStorage.getItem(LOGS_PREFS_KEY);
+      if (!raw) return;
+      const saved = JSON.parse(raw);
+      if (saved && typeof saved === 'object') {
+        logsExtraFilters = Object.assign(logsExtraFilters, saved.filters || {});
+        if (typeof saved.status === 'string') logsFilter = saved.status;
+      }
+    } catch (e) {
+      // Corrupt prefs must never block the Logs tab from rendering.
+    }
+  }
+
+  function saveLogsPrefs() {
+    try {
+      localStorage.setItem(LOGS_PREFS_KEY, JSON.stringify({ filters: logsExtraFilters, status: logsFilter }));
+    } catch (e) {
+      // Storage can be unavailable (private mode, quota); ignore.
+    }
+  }
+
+  function logsQueryParams(extra) {
+    const params = new URLSearchParams();
+    if (logsFilter !== 'all') params.set('status', logsFilter);
+    if (logsSearch) params.set('q', logsSearch);
+    if (logsExtraFilters.api) params.set('api', logsExtraFilters.api);
+    if (logsExtraFilters.model) params.set('model', logsExtraFilters.model);
+    if (logsExtraFilters.errorType) params.set('errorType', logsExtraFilters.errorType);
+    if (logsExtraFilters.outcome) params.set('outcome', logsExtraFilters.outcome);
+    if (logsExtraFilters.minDurationMs) params.set('minDurationMs', logsExtraFilters.minDurationMs);
+    const range = parseInt(logsExtraFilters.rangeSeconds || '0', 10);
+    if (range > 0) params.set('from', String(Math.floor(Date.now() / 1000) - range));
+    for (const [k, v] of Object.entries(extra || {})) {
+      if (v !== '' && v !== null && v !== undefined) params.set(k, v);
+    }
+    return params;
+  }
 
   function errorTypeLabel(type) {
     if (!type) return '';
@@ -725,19 +775,97 @@
     return id ? id.slice(0, 8) : '-';
   }
 
-  async function loadLogs() {
+  async function loadLogs(opts) {
+    const options = opts || {};
+    // Any filter change invalidates the cursor: resuming mid-stream under a new
+    // predicate would silently skip rows.
+    if (options.resetCursor) {
+      logsCursor = '';
+      logsCursorStack = [];
+    }
     try {
-      const params = new URLSearchParams();
-      if (logsFilter !== 'all') params.set('status', logsFilter);
-      if (logsSearch) params.set('q', logsSearch);
-      const res = await api('/logs' + (params.toString() ? '?' + params.toString() : ''));
+      const params = logsQueryParams({ cursor: logsCursor, limit: 100 });
+      const res = await api('/logs?' + params.toString());
       const d = await res.json();
       const logs = d.logs || [];
+      logsHasMore = !!d.hasMore;
+      logsTotal = typeof d.total === 'number' ? d.total : logs.length;
+      logsNextCursor = d.nextCursor || '';
+      logsDropped = d.dropped || 0;
       renderLogs(logs);
+      renderLogsPager();
       loadMetricsSummary();
+      loadLogsFacets();
     } catch (e) {
       // silent
     }
+  }
+
+  let logsNextCursor = '';
+  let logsDropped = 0;
+
+  async function loadLogsFacets() {
+    try {
+      const res = await api('/logs/facets');
+      if (!res.ok) return;
+      const d = await res.json();
+      logsFacets = d;
+      logsCaptureMode = d.captureMode || '';
+      renderLogsFacetControls();
+    } catch (e) {
+      // silent
+    }
+  }
+
+  // Populate the facet dropdowns from the values actually present, so an
+  // operator picks from reality instead of guessing substrings.
+  function renderLogsFacetControls() {
+    if (!logsFacets) return;
+    const fill = (id, values, current, allLabel) => {
+      const sel = $(id);
+      if (!sel) return;
+      const opts = ['<option value="">' + escapeHtml(allLabel) + '</option>'];
+      for (const v of values || []) {
+        opts.push('<option value="' + escapeAttr(v) + '"' + (v === current ? ' selected' : '') + '>' + escapeHtml(v) + '</option>');
+      }
+      sel.innerHTML = opts.join('');
+    };
+    fill('logsApiSelect', logsFacets.apis, logsExtraFilters.api, t('logs.filterApi'));
+    fill('logsModelSelect', logsFacets.models, logsExtraFilters.model, t('logs.filterModel'));
+    fill('logsErrorTypeSelect', logsFacets.errorTypes, logsExtraFilters.errorType, t('logs.filterErrorType'));
+    fill('logsOutcomeSelect', Object.keys(logsFacets.outcomes || {}).sort(), logsExtraFilters.outcome, t('logs.filterOutcome'));
+  }
+
+  function renderLogsPager() {
+    const box = $('logsPager');
+    if (!box) return;
+    const shown = logsCache.length;
+    const parts = [
+      '<span class="logs-pager-info">' + escapeHtml(t('logs.showing')) + ' <strong>' + shown + '</strong> / <strong>' + logsTotal + '</strong></span>',
+    ];
+    if (logsDropped > 0) {
+      // Surface dropped records: silent loss under load would otherwise look
+      // like the proxy simply handled fewer requests.
+      parts.push('<span class="logs-pager-drop" title="' + escapeAttr(t('logs.droppedHint')) + '">' +
+        escapeHtml(t('logs.dropped')) + ': <strong>' + logsDropped + '</strong></span>');
+    }
+    parts.push('<button class="btn btn-outline btn-sm" id="logsPrevBtn"' + (logsCursorStack.length ? '' : ' disabled') + '>' +
+      '<i class="fa-solid fa-chevron-left"></i><span class="btn-text">' + escapeHtml(t('logs.prev')) + '</span></button>');
+    parts.push('<button class="btn btn-outline btn-sm" id="logsNextBtn"' + (logsHasMore ? '' : ' disabled') + '>' +
+      '<span class="btn-text">' + escapeHtml(t('logs.next')) + '</span><i class="fa-solid fa-chevron-right"></i></button>');
+    box.innerHTML = parts.join('');
+    const prev = $('logsPrevBtn');
+    if (prev) prev.addEventListener('click', () => {
+      logsCursor = logsCursorStack.pop() || '';
+      loadLogs();
+    });
+    const next = $('logsNextBtn');
+    if (next) next.addEventListener('click', () => {
+      if (!logsNextCursor) return;
+      logsCursorStack.push(logsCursor);
+      logsCursor = logsNextCursor;
+      loadLogs();
+    });
   }
 
   async function loadMetricsSummary() {
@@ -785,14 +913,16 @@
       '<th>' + escapeHtml(t('logs.endpoint')) + '</th>' +
       '<th>' + escapeHtml(t('logs.model')) + '</th>' +
       '<th>' + escapeHtml(t('logs.account')) + '</th>' +
+      '<th>' + escapeHtml(t('logs.tries')) + '</th>' +
       '<th>' + escapeHtml(t('logs.tokens')) + '</th>' +
       '<th>' + escapeHtml(t('logs.duration')) + '</th>' +
       '<th>' + escapeHtml(t('logs.detail')) + '</th>' +
       '</tr></thead><tbody>';
     for (const l of filtered) {
       const isErr = l.status === 'error';
+      const outcome = l.outcome || l.status;
       const statusCell = '<span class="log-status log-status--' + escapeAttr(l.status) + '">' +
-        escapeHtml(isErr ? t('logs.statusError') : t('logs.statusSuccess')) + '</span>';
+        escapeHtml(outcomeLabel(outcome)) + '</span>';
       let detailCell;
       if (isErr) {
         detailCell = '<span class="err-badge err-badge--' + escapeAttr(l.errorType || 'unknown') + '">' +
@@ -801,19 +931,178 @@
       } else {
         detailCell = '<span class="text-muted">' + (l.credits ? (l.credits.toFixed(3) + ' cr') : '-') + '</span>';
       }
-      html += '<tr>' +
+      // Attempt count is the headline signal a flat log could never show: >1
+      // means the request was rerouted and the drawer explains why.
+      const tries = l.attemptCount || (l.attempts ? l.attempts.length : 0);
+      const triesCell = tries > 1
+        ? '<span class="log-tries log-tries--multi" title="' + escapeAttr(t('logs.triesHint')) + '">' + tries + '</span>'
+        : '<span class="text-muted">' + (tries || '-') + '</span>';
+      const ttfb = l.ttfbMs ? ('<span class="log-ttfb" title="' + escapeAttr(t('logs.ttfb')) + '">' + l.ttfbMs + 'ms</span> / ') : '';
+      html += '<tr class="logs-row" data-trace="' + escapeAttr(l.requestId || '') + '" tabindex="0">' +
         '<td>' + escapeHtml(formatLogTime(l.time)) + '</td>' +
         '<td>' + statusCell + '</td>' +
-        '<td>' + escapeHtml(l.endpoint) + '</td>' +
+        '<td>' + escapeHtml(l.api || l.endpoint) + '</td>' +
         '<td>' + escapeHtml(l.model || '-') + '</td>' +
         '<td>' + escapeHtml(accountLabel(l.accountId, l.accountEmail)) + '</td>' +
+        '<td>' + triesCell + '</td>' +
         '<td>' + (l.tokens ? formatNum(l.tokens) : '-') + '</td>' +
-        '<td>' + (l.duration ? (l.duration + 'ms') : '-') + '</td>' +
+        '<td>' + ttfb + (l.duration ? (l.duration + 'ms') : '-') + '</td>' +
         '<td>' + detailCell + '</td>' +
         '</tr>';
     }
     html += '</tbody></table>';
     list.innerHTML = html;
+
+    // Row -> drawer. Keyboard activation is wired too so the detail view is not
+    // mouse-only.
+    for (const row of list.querySelectorAll('.logs-row')) {
+      const open = () => openTraceDrawer(row.getAttribute('data-trace'));
+      row.addEventListener('click', open);
+      row.addEventListener('keydown', e => {
+        if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); open(); }
+      });
+    }
+  }
+
+  function outcomeLabel(outcome) {
+    const key = 'logs.outcome' + String(outcome || '').replace(/(^|_)([a-z])/g, (_, __, c) => c.toUpperCase());
+    const label = t(key);
+    if (label && label !== key) return label;
+    return outcome === 'error' ? t('logs.statusError') : t('logs.statusSuccess');
+  }
+
+  // ===== Trace detail drawer =====
+
+  function closeTraceDrawer() {
+    const drawer = $('traceDrawer');
+    const backdrop = $('traceDrawerBackdrop');
+    if (drawer) drawer.classList.add('hidden');
+    if (backdrop) backdrop.classList.add('hidden');
+  }
+
+  async function openTraceDrawer(traceId) {
+    if (!traceId) return;
+    const drawer = $('traceDrawer');
+    const backdrop = $('traceDrawerBackdrop');
+    const body = $('traceDrawerBody');
+    if (!drawer || !body) return;
+    drawer.classList.remove('hidden');
+    if (backdrop) backdrop.classList.remove('hidden');
+    body.innerHTML = '<p class="text-muted">' + escapeHtml(t('diag.loading')) + '</p>';
+    try {
+      const res = await api('/logs/' + encodeURIComponent(traceId));
+      const d = await res.json();
+      if (!res.ok || d.success === false) {
+        body.innerHTML = '<p class="text-muted">' + escapeHtml((d && d.error) || t('common.failed')) + '</p>';
+        return;
+      }
+      body.innerHTML = renderTraceDetail(d);
+      wireTraceCopyButtons(body);
+    } catch (e) {
+      body.innerHTML = '<p class="text-muted">' + escapeHtml(t('common.failed')) + '</p>';
+    }
+  }
+
+  function traceField(label, value) {
+    if (value === '' || value === null || value === undefined) return '';
+    return '<div class="trace-field"><span class="trace-field-label">' + escapeHtml(label) +
+      '</span><span class="trace-field-value">' + escapeHtml(String(value)) + '</span></div>';
+  }
+
+  function renderTraceDetail(d) {
+    const rec = d.record || {};
+    const parts = [];
+
+    parts.push('<div class="trace-section"><div class="trace-section-title">' + escapeHtml(t('logs.overview')) + '</div>');
+    parts.push('<div class="trace-fields">');
+    parts.push(traceField(t('logs.traceId'), rec.requestId));
+    parts.push(traceField(t('logs.time'), rec.time ? formatLogTime(rec.time) : ''));
+    parts.push(traceField(t('logs.status'), outcomeLabel(rec.outcome || rec.status)));
+    parts.push(traceField('HTTP', rec.httpStatus));
+    parts.push(traceField(t('logs.endpoint'), rec.api || rec.endpoint));
+    parts.push(traceField(t('logs.model'), rec.model));
+    parts.push(traceField(t('logs.responseModel'), rec.responseModel));
+    parts.push(traceField(t('logs.stream'), rec.stream ? t('common.yes') : t('common.no')));
+    parts.push(traceField(t('logs.account'), accountLabel(rec.accountId, rec.accountEmail)));
+    parts.push(traceField(t('logs.region'), rec.region));
+    parts.push(traceField(t('logs.profile'), rec.profileArn));
+    parts.push(traceField(t('logs.upstreamHost'), rec.upstreamHost));
+    parts.push(traceField(t('logs.apiKey'), rec.apiKeyId));
+    parts.push(traceField(t('logs.duration'), rec.duration ? rec.duration + 'ms' : ''));
+    parts.push(traceField(t('logs.ttfb'), rec.ttfbMs ? rec.ttfbMs + 'ms' : ''));
+    parts.push(traceField(t('logs.inputTokens'), rec.inputTokens));
+    parts.push(traceField(t('logs.outputTokens'), rec.outputTokens));
+    parts.push(traceField(t('logs.cacheReadTokens'), rec.cacheReadTokens));
+    parts.push(traceField(t('logs.stopReason'), rec.stopReason));
+    parts.push(traceField(t('logs.toolCalls'), rec.toolCallCount));
+    parts.push(traceField(t('logs.credits'), rec.credits ? rec.credits.toFixed(6) : ''));
+    if (rec.cacheHit) parts.push(traceField(t('logs.cacheHit'), t('common.yes')));
+    parts.push('</div></div>');
+
+    if (rec.error) {
+      parts.push('<div class="trace-section"><div class="trace-section-title">' + escapeHtml(t('logs.error')) + '</div>' +
+        '<pre class="trace-pre">' + escapeHtml(rec.error) + '</pre></div>');
+    }
+
+    // Attempt waterfall: the view that makes a failover chain legible.
+    const attempts = rec.attempts || [];
+    if (attempts.length) {
+      const maxDur = Math.max.apply(null, attempts.map(a => a.durationMs || 0).concat([1]));
+      let rows = '';
+      for (const a of attempts) {
+        const pct = Math.max(2, Math.round(((a.durationMs || 0) / maxDur) * 100));
+        const ok = a.outcome !== 'error';
+        rows += '<div class="trace-attempt">' +
+          '<span class="trace-attempt-seq">#' + escapeHtml(String(a.seq || 0)) + '</span>' +
+          '<span class="trace-attempt-acct">' + escapeHtml(accountLabel(a.accountId, a.accountEmail)) + '</span>' +
+          '<span class="trace-attempt-meta">' + escapeHtml(a.region || '-') +
+            (a.profileArn ? ' / ' + escapeHtml(a.profileArn) : '') + '</span>' +
+          '<span class="trace-attempt-status' + (ok ? '' : ' trace-attempt-status--err') + '">' +
+            escapeHtml(a.httpStatus ? String(a.httpStatus) : (ok ? 'OK' : 'ERR')) + '</span>' +
+          '<span class="trace-attempt-bar"><span class="trace-attempt-bar-fill' + (ok ? '' : ' trace-attempt-bar-fill--err') +
+            '" style="width:' + pct + '%"></span></span>' +
+          '<span class="trace-attempt-dur">' + escapeHtml(String(a.durationMs || 0)) + 'ms</span>' +
+          (a.errorType ? '<span class="err-badge err-badge--' + escapeAttr(a.errorType) + '">' + escapeHtml(errorTypeLabel(a.errorType)) + '</span>' : '') +
+          (a.upstreamRequestId ? '<span class="trace-attempt-rid" title="' + escapeAttr(t('logs.upstreamRequestId')) + '">' + escapeHtml(a.upstreamRequestId) + '</span>' : '') +
+          '</div>' +
+          (a.error ? '<pre class="trace-pre trace-pre--attempt">' + escapeHtml(a.error) + '</pre>' : '');
+      }
+      parts.push('<div class="trace-section"><div class="trace-section-title">' +
+        escapeHtml(t('logs.attempts')) + ' (' + attempts.length + ')</div>' + rows + '</div>');
+    }
+
+    // Bodies. Absence is stated explicitly so it is never mistaken for a bug.
+    if (d.bodiesStored) {
+      if (d.bodyTruncated) {
+        parts.push('<p class="trace-note">' + escapeHtml(t('logs.bodyTruncated')) + '</p>');
+      }
+      parts.push(traceBodyPane(t('logs.requestBody'), d.request, 'traceReqBody'));
+      parts.push(traceBodyPane(t('logs.responseBody'), d.response, 'traceRespBody'));
+    } else {
+      parts.push('<p class="trace-note">' + escapeHtml(d.note || t('logs.noBodies')) +
+        ' <code>' + escapeHtml(d.captureMode || logsCaptureMode || 'meta') + '</code></p>');
+    }
+    return parts.join('');
+  }
+
+  function traceBodyPane(label, content, id) {
+    if (!content) return '';
+    return '<details class="trace-section" open><summary class="trace-section-title">' + escapeHtml(label) +
+      ' <button class="btn btn-outline btn-sm trace-copy" data-copy-target="' + escapeAttr(id) + '">' +
+      escapeHtml(t('common.copy')) + '</button></summary>' +
+      '<pre class="trace-pre" id="' + escapeAttr(id) + '">' + escapeHtml(content) + '</pre></details>';
+  }
+
+  function wireTraceCopyButtons(root) {
+    for (const btn of root.querySelectorAll('.trace-copy')) {
+      btn.addEventListener('click', e => {
+        e.preventDefault();
+        e.stopPropagation();
+        const target = document.getElementById(btn.getAttribute('data-copy-target'));
+        if (!target) return;
+        copyText(target.textContent || '');
+      });
+    }
   }
 
   async function clearLogs() {
@@ -825,9 +1114,10 @@
   }
 
   async function exportLogs(format) {
-    const params = new URLSearchParams({ format });
-    if (logsFilter !== 'all') params.set('status', logsFilter);
-    if (logsSearch) params.set('q', logsSearch);
+    // Export honours the active filters and asks for the full retained window
+    // rather than the current page, so a download is not silently truncated to
+    // whatever the operator happened to be paging through.
+    const params = logsQueryParams({ format, limit: 1000 });
     const res = await api('/logs?' + params.toString());
     if (!res.ok) {
       toast(t('logs.exportFailed'), 'error');
@@ -837,7 +1127,9 @@
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;
-    a.download = 'kiro-go-request-logs.' + (format === 'csv' ? 'csv' : 'json');
+    const ext = format === 'csv' || format === 'attempts-csv' ? 'csv' : 'json';
+    const base = format === 'attempts-csv' ? 'kiro-go-request-attempts' : 'kiro-go-request-logs';
+    a.download = base + '.' + ext;
     document.body.appendChild(a);
     a.click();
     a.remove();
@@ -4107,7 +4399,7 @@
 
     // Logs tab
     const logsRefreshBtn = $('logsRefreshBtn');
-    if (logsRefreshBtn) logsRefreshBtn.addEventListener('click', loadLogs);
+    if (logsRefreshBtn) logsRefreshBtn.addEventListener('click', () => loadLogs({ resetCursor: true }));
     const logsClearBtn = $('logsClearBtn');
     if (logsClearBtn) logsClearBtn.addEventListener('click', clearLogs);
     const logsAuto = $('logsAutoRefresh');
@@ -4115,18 +4407,62 @@
     const logsFilterSel = $('logsFilterSelect');
     if (logsFilterSel) logsFilterSel.addEventListener('change', e => {
       logsFilter = e.target.value;
-      loadLogs();
+      saveLogsPrefs();
+      loadLogs({ resetCursor: true });
     });
     const logsSearchInput = $('logsSearchInput');
     if (logsSearchInput) logsSearchInput.addEventListener('input', e => {
       logsSearch = e.target.value.trim();
       clearTimeout(logsSearchInput._timer);
-      logsSearchInput._timer = setTimeout(loadLogs, 250);
+      // Any predicate change must restart pagination: resuming from a cursor
+      // computed under a different filter would skip rows.
+      logsSearchInput._timer = setTimeout(() => loadLogs({ resetCursor: true }), 250);
     });
+
+    // Facet + range filters. Each one resets the cursor and persists.
+    const bindFilter = (id, key, transform) => {
+      const el = $(id);
+      if (!el) return;
+      const evt = el.tagName === 'INPUT' ? 'input' : 'change';
+      el.addEventListener(evt, e => {
+        logsExtraFilters[key] = transform ? transform(e.target.value) : e.target.value;
+        saveLogsPrefs();
+        clearTimeout(el._timer);
+        el._timer = setTimeout(() => loadLogs({ resetCursor: true }), evt === 'input' ? 300 : 0);
+      });
+    };
+    bindFilter('logsApiSelect', 'api');
+    bindFilter('logsModelSelect', 'model');
+    bindFilter('logsErrorTypeSelect', 'errorType');
+    bindFilter('logsOutcomeSelect', 'outcome');
+    bindFilter('logsRangeSelect', 'rangeSeconds');
+    bindFilter('logsMinDurationInput', 'minDurationMs', v => String(v || '').trim());
+
     const exportJsonBtn = $('logsExportJsonBtn');
     if (exportJsonBtn) exportJsonBtn.addEventListener('click', () => exportLogs('json'));
     const exportCsvBtn = $('logsExportCsvBtn');
     if (exportCsvBtn) exportCsvBtn.addEventListener('click', () => exportLogs('csv'));
+    const exportAttemptsBtn = $('logsExportAttemptsBtn');
+    if (exportAttemptsBtn) exportAttemptsBtn.addEventListener('click', () => exportLogs('attempts-csv'));
+
+    // Trace drawer dismissal: button, backdrop, and Escape.
+    const drawerClose = $('traceDrawerClose');
+    if (drawerClose) drawerClose.addEventListener('click', closeTraceDrawer);
+    const drawerBackdrop = $('traceDrawerBackdrop');
+    if (drawerBackdrop) drawerBackdrop.addEventListener('click', closeTraceDrawer);
+    document.addEventListener('keydown', e => {
+      if (e.key !== 'Escape') return;
+      const drawer = $('traceDrawer');
+      if (drawer && !drawer.classList.contains('hidden')) closeTraceDrawer();
+    });
+
+    // Restore the persisted view before the first fetch.
+    loadLogsPrefs();
+    if (logsFilterSel) logsFilterSel.value = logsFilter;
+    const rangeSel = $('logsRangeSelect');
+    if (rangeSel) rangeSel.value = logsExtraFilters.rangeSeconds || '0';
+    const minDur = $('logsMinDurationInput');
+    if (minDur) minDur.value = logsExtraFilters.minDurationMs || '';
   }
 
   function bindAccountEvents() {

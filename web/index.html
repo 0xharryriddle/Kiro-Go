@@ -786,18 +786,44 @@
               <input id="logsSearchInput" class="logs-search" type="search" data-i18n-placeholder="logs.search" />
               <button class="btn btn-outline btn-sm" id="logsExportJsonBtn"><i class="fa-solid fa-file-code"></i><span class="btn-text" data-i18n="logs.exportJson"></span></button>
               <button class="btn btn-outline btn-sm" id="logsExportCsvBtn"><i class="fa-solid fa-file-csv"></i><span class="btn-text" data-i18n="logs.exportCsv"></span></button>
+              <button class="btn btn-outline btn-sm" id="logsExportAttemptsBtn"><i class="fa-solid fa-list-ol"></i><span class="btn-text" data-i18n="logs.exportAttempts"></span></button>
               <button class="btn btn-outline btn-sm" id="logsRefreshBtn"><i class="fa-solid fa-rotate"></i><span class="btn-text" data-i18n="logs.refresh"></span></button>
               <label class="logs-auto-toggle"><input type="checkbox" id="logsAutoRefresh" /> <span data-i18n="logs.autoRefresh"></span></label>
               <button class="btn btn-danger btn-sm" id="logsClearBtn"><i class="fa-solid fa-trash"></i><span class="btn-text" data-i18n="logs.clear"></span></button>
             </div>
+          </div>
+          <div class="logs-filterbar">
+            <select id="logsRangeSelect" class="w-32!" data-i18n-aria-label="logs.range">
+              <option value="0" data-i18n="logs.rangeAll"></option>
+              <option value="900" data-i18n="logs.range15m"></option>
+              <option value="3600" data-i18n="logs.range1h"></option>
+              <option value="86400" data-i18n="logs.range24h"></option>
+              <option value="604800" data-i18n="logs.range7d"></option>
+            </select>
+            <select id="logsApiSelect" class="w-32!" data-i18n-aria-label="logs.filterApi"></select>
+            <select id="logsModelSelect" class="w-40!" data-i18n-aria-label="logs.filterModel"></select>
+            <select id="logsErrorTypeSelect" class="w-32!" data-i18n-aria-label="logs.filterErrorType"></select>
+            <select id="logsOutcomeSelect" class="w-32!" data-i18n-aria-label="logs.filterOutcome"></select>
+            <input id="logsMinDurationInput" class="w-32!" type="number" min="0" step="100" data-i18n-placeholder="logs.minDuration" />
           </div>
           <div class="logs-summary" id="logsSummary"></div>
           <div class="metrics-summary" id="metricsSummary"></div>
           <div id="logsList" class="logs-list">
             <p class="text-muted" data-i18n="logs.empty"></p>
           </div>
+          <div class="logs-pager" id="logsPager"></div>
         </div>
       </div>
+
+      <!-- Trace detail drawer -->
+      <div id="traceDrawer" class="trace-drawer hidden" role="dialog" aria-modal="true" data-i18n-aria-label="logs.detailTitle">
+        <div class="trace-drawer-head">
+          <span class="trace-drawer-title" data-i18n="logs.detailTitle"></span>
+          <button class="btn btn-outline btn-sm" id="traceDrawerClose" aria-label="Close"><i class="fa-solid fa-xmark"></i></button>
+        </div>
+        <div class="trace-drawer-body" id="traceDrawerBody"></div>
+      </div>
+      <div id="traceDrawerBackdrop" class="trace-drawer-backdrop hidden"></div>
     </div>
 
     <!-- Footer -->
