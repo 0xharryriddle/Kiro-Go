@@ -112,7 +112,18 @@ const (
 	requestLogsPath    = "data/request_logs.json"
 	auditLogsMaxSize   = 1000
 	auditLogsPath      = "data/audit_logs.json"
+	// tracesDirPath holds rotated append-only JSONL trace indexes.
+	tracesDirPath = "data/traces"
+	// traceDefaultRetentionHours bounds on-disk trace history (7 days).
+	traceDefaultRetentionHours = 168
+	// tracePruneInterval is how often rotated files are checked for expiry.
+	tracePruneInterval = time.Hour
 )
+
+// tracesDir returns the directory holding rotated trace index files.
+func tracesDir() string {
+	return tracesDirPath
+}
 
 // Handler HTTP 处理器
 type Handler struct {
@@ -134,10 +145,16 @@ type Handler struct {
 	promptCache     *promptCacheTracker
 	tokenRefreshMu  sync.Mutex
 	// 请求日志 (环形缓冲区，包含成功和失败)
+	// The ring backs only the live admin view; durable history lives in
+	// traceStore as append-only JSONL.
 	requestLogs   []RequestLog
 	requestLogsMu sync.RWMutex
-	auditLogs     []AuditLog
-	auditLogsMu   sync.RWMutex
+	// traceStore owns durable trace persistence. Nil on a zero-value Handler
+	// (unit tests), in which case appendRequestLog falls back to the legacy
+	// whole-file writer.
+	traceStore  *traceStore
+	auditLogs   []AuditLog
+	auditLogsMu sync.RWMutex
 	// F6: per-API-key sliding-window RPM/TPM limiter (in-process).
 	rateLimiter *rateLimiter
 	// F5: in-process exact-match response cache (opt-in, non-stream only).
@@ -348,9 +365,12 @@ func NewHandler() *Handler {
 		promptCache:     newPromptCacheTracker(defaultPromptCacheTTL),
 		rateLimiter:     newRateLimiter(),
 		responseCache:   newResponseCache(),
+		traceStore:      newTraceStore(tracesDir(), 0),
 	}
 	h.loadRequestLogs()
 	h.loadAuditLogs()
+	// Prune rotated trace files on a slow ticker; retention is by whole file.
+	go h.backgroundTracePrune()
 	// 启动后台刷新
 	go h.backgroundRefresh()
 	// 启动后台统计保存 (每30秒保存一次)
@@ -1756,12 +1776,63 @@ func (h *Handler) appendRequestLog(entry RequestLog) {
 		h.requestLogs = h.requestLogs[1:]
 	}
 	h.requestLogs = append(h.requestLogs, entry)
-	snapshot := append([]RequestLog(nil), h.requestLogs...)
+	needLegacySnapshot := h.traceStore == nil
+	var snapshot []RequestLog
+	if needLegacySnapshot {
+		snapshot = append([]RequestLog(nil), h.requestLogs...)
+	}
 	h.requestLogsMu.Unlock()
+
+	if h.traceStore != nil {
+		// Append-only JSONL: O(1) per request, single writer, no shared temp
+		// path. Durable history lives on disk; the ring above only backs the
+		// live view.
+		h.traceStore.Append(entry)
+		return
+	}
+	// Legacy whole-file rewrite, retained only for handlers constructed without
+	// a store (zero-value Handler in unit tests).
 	go persistRequestLogs(snapshot)
 }
 
+// backgroundTracePrune expires whole rotated trace files on a slow ticker.
+// Pruning by file keeps the cost O(files) and never rewrites live data.
+func (h *Handler) backgroundTracePrune() {
+	if h.traceStore == nil {
+		return
+	}
+	// Prune once at startup so a long-stopped instance does not keep stale days.
+	h.traceStore.Prune(traceDefaultRetentionHours, time.Now())
+	ticker := time.NewTicker(tracePruneInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			h.traceStore.Prune(traceDefaultRetentionHours, time.Now())
+		case <-h.stopStatsSaver:
+			return
+		}
+	}
+}
+
+// loadRequestLogs repopulates the live ring on boot.
+//
+// When a trace store is present it reads the rotated JSONL indexes and imports a
+// pre-upgrade data/request_logs.json exactly once (renaming it .migrated), so an
+// upgrade does not appear to lose history. Without a store it falls back to the
+// legacy single-array file.
 func (h *Handler) loadRequestLogs() {
+	if h.traceStore != nil {
+		logs := h.traceStore.LoadRecent(requestLogsMaxSize, requestLogsPath)
+		if len(logs) == 0 {
+			return
+		}
+		h.requestLogsMu.Lock()
+		h.requestLogs = logs
+		h.requestLogsMu.Unlock()
+		return
+	}
+
 	raw, err := os.ReadFile(requestLogsPath)
 	if err != nil {
 		return
