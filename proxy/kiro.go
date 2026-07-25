@@ -357,7 +357,21 @@ func validateKiroDispatchProfile(account *config.Account, profileArn string) err
 }
 
 // CallKiroAPI calls the Kiro streaming API, trying each configured endpoint with automatic fallback.
+//
+// This is a thin wrapper that discards upstream diagnostics. Callers that need
+// the per-endpoint HTTP status, upstream correlation ID, or resolved host for
+// tracing should use CallKiroAPIWithDiagnostics instead.
 func CallKiroAPI(account *config.Account, payload *KiroPayload, callback *KiroStreamCallback) error {
+	return CallKiroAPIWithDiagnostics(account, payload, callback, nil)
+}
+
+// CallKiroAPIWithDiagnostics is CallKiroAPI plus per-endpoint upstream detail.
+//
+// diag may be nil, in which case behaviour is identical to CallKiroAPI. When
+// non-nil it accumulates one entry per endpoint tried, including the HTTP status
+// and any upstream correlation ID — detail that was previously read and thrown
+// away, leaving a support escalation with nothing to correlate on.
+func CallKiroAPIWithDiagnostics(account *config.Account, payload *KiroPayload, callback *KiroStreamCallback, diag *KiroCallDiagnostics) error {
 	originalProfileArn := ""
 	if payload != nil {
 		originalProfileArn = payload.ProfileArn
@@ -447,38 +461,80 @@ func CallKiroAPI(account *config.Account, payload *KiroPayload, callback *KiroSt
 		req.Header.Set("Amz-Sdk-Request", "attempt=1; max=3")
 		req.Header.Set("Amz-Sdk-Invocation-Id", uuid.New().String())
 
+		epStart := time.Now()
+		// Base diagnostics for this endpoint attempt. Region comes from the
+		// regionalised URL, so it reflects where the request actually went
+		// rather than the account's (possibly unrelated) auth region.
+		epAttempt := TraceAttempt{
+			UpstreamEndpoint: ep.Name,
+			UpstreamHost:     host,
+			Region:           regionFromKiroHost(host),
+			ProfileArn:       profileArnSuffix(payload.ProfileArn),
+			StartedAtMs:      epStart.UnixMilli(),
+		}
+		recordEndpointAttempt := func(status int, header http.Header, outcome, retryAfter string, callErr error) {
+			epAttempt.HTTPStatus = status
+			epAttempt.Outcome = outcome
+			epAttempt.DurationMs = time.Since(epStart).Milliseconds()
+			epAttempt.RetryAfter = retryAfter
+			if header != nil {
+				epAttempt.UpstreamRequestID = upstreamRequestIDFromHeader(header)
+			}
+			if callErr != nil {
+				msg := callErr.Error()
+				epAttempt.ErrorType = classifyError(msg)
+				epAttempt.Error = scrubTraceText(msg)
+			}
+			diag.record(epAttempt)
+		}
+
 		resp, err := GetClientForProxy(ResolveAccountProxyURL(account)).Do(req)
 		if err != nil {
 			lastErr = err
+			recordEndpointAttempt(0, nil, outcomeError, "", err)
 			logger.Warnf("[KiroAPI] Endpoint %s failed: %v", ep.Name, err)
 			continue
 		}
 
 		if resp.StatusCode == 429 {
 			retryAfter := retryAfterFromHeader(resp.Header.Get("Retry-After"))
+			header := resp.Header
 			resp.Body.Close()
 			if retryAfter != "" {
 				logger.Warnf("[KiroAPI] Endpoint %s throttled/quota exhausted (429, retry after %s); stopping endpoint fan-out for this account", ep.Name, retryAfter)
-				return fmt.Errorf("HTTP 429 from %s: quota exhausted; retry after %s", ep.Name, retryAfter)
+				err := fmt.Errorf("HTTP 429 from %s: quota exhausted; retry after %s", ep.Name, retryAfter)
+				recordEndpointAttempt(429, header, outcomeError, retryAfter, err)
+				return err
 			}
 			logger.Warnf("[KiroAPI] Endpoint %s throttled/quota exhausted (429); stopping endpoint fan-out for this account", ep.Name)
-			return fmt.Errorf("HTTP 429 from %s: quota exhausted", ep.Name)
+			err := fmt.Errorf("HTTP 429 from %s: quota exhausted", ep.Name)
+			recordEndpointAttempt(429, header, outcomeError, "", err)
+			return err
 		}
 
 		if resp.StatusCode != 200 {
 			errBody, _ := io.ReadAll(resp.Body)
+			status := resp.StatusCode
+			header := resp.Header
 			resp.Body.Close()
-			lastErr = fmt.Errorf("HTTP %d from %s: %s", resp.StatusCode, ep.Name, string(errBody))
+			lastErr = fmt.Errorf("HTTP %d from %s: %s", status, ep.Name, string(errBody))
+			recordEndpointAttempt(status, header, outcomeError, "", lastErr)
 			// Authentication errors and payment errors are not retried across endpoints.
-			if resp.StatusCode == 401 || resp.StatusCode == 403 || resp.StatusCode == 402 {
+			if status == 401 || status == 403 || status == 402 {
 				return lastErr
 			}
 			logger.Warnf("[KiroAPI] Endpoint %s error: %v", ep.Name, lastErr)
 			continue
 		}
 
+		streamHeader := resp.Header
 		err = parseEventStream(resp.Body, callback)
 		resp.Body.Close()
+		if err != nil {
+			recordEndpointAttempt(200, streamHeader, outcomeError, "", err)
+		} else {
+			recordEndpointAttempt(200, streamHeader, outcomeSuccess, "", nil)
+		}
 		return err
 	}
 

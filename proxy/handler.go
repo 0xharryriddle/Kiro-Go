@@ -36,6 +36,56 @@ type RequestLog struct {
 	ErrorType    string  `json:"errorType,omitempty"`
 	Duration     int64   `json:"duration"` // milliseconds
 	RequestID    string  `json:"requestId,omitempty"`
+
+	// ---- Trace fields (all omitempty, so pre-existing request_logs.json files
+	// deserialise unchanged and older consumers keep working). Field names are
+	// camelCase transliterations of OpenTelemetry GenAI semantic-convention
+	// attributes where one exists, so a future OTel/Langfuse exporter is
+	// mechanical rather than a re-modelling exercise.
+
+	// Outcome refines Status: success | error | cache_hit | rejected. Status
+	// stays success/error for backward compatibility with the account-health and
+	// usage-anomaly aggregations.
+	Outcome string `json:"outcome,omitempty"`
+	// API is the client-facing surface: claude | openai | responses.
+	API string `json:"api,omitempty"`
+	// Stream reports whether the client asked for SSE (gen_ai.request.stream).
+	Stream bool `json:"stream,omitempty"`
+	// HTTPStatus is the status returned to the client.
+	HTTPStatus int `json:"httpStatus,omitempty"`
+	// ApiKeyID attributes the request to a configured API key (never the secret).
+	ApiKeyID string `json:"apiKeyId,omitempty"`
+
+	// Attempts records every upstream dispatch within this one client request.
+	// A failover across three accounts yields three attempts on a single record,
+	// so per-attempt quota errors stay visible without inflating row counts.
+	Attempts     []TraceAttempt `json:"attempts,omitempty"`
+	AttemptCount int            `json:"attemptCount,omitempty"`
+
+	// Token detail. Tokens (above) remains the sum for backward compatibility.
+	InputTokens     int `json:"inputTokens,omitempty"`     // gen_ai.usage.input_tokens
+	OutputTokens    int `json:"outputTokens,omitempty"`    // gen_ai.usage.output_tokens
+	CacheReadTokens int `json:"cacheReadTokens,omitempty"` // prompt-cache reads
+
+	// Response shape.
+	StopReason    string `json:"stopReason,omitempty"`    // gen_ai.response.finish_reasons
+	ResponseModel string `json:"responseModel,omitempty"` // gen_ai.response.model
+	ToolCallCount int    `json:"toolCallCount,omitempty"`
+	TTFBMs        int64  `json:"ttfbMs,omitempty"` // gen_ai.server.time_to_first_token
+
+	// Routing context. This is what makes multi-region/multi-profile behaviour
+	// debuggable after the fact.
+	Region       string `json:"region,omitempty"`
+	ProfileArn   string `json:"profileArn,omitempty"`
+	UpstreamHost string `json:"upstreamHost,omitempty"` // server.address
+
+	// CacheHit marks a response served from the in-process response cache.
+	CacheHit bool `json:"cacheHit,omitempty"`
+
+	// BodyRef is a path relative to the trace directory when body capture is
+	// enabled. Never an absolute filesystem path in an API response.
+	BodyRef       string `json:"bodyRef,omitempty"`
+	BodyTruncated bool   `json:"bodyTruncated,omitempty"`
 }
 
 type AuditLog struct {
@@ -479,6 +529,9 @@ func (h *Handler) authenticateForClaude(w http.ResponseWriter, r *http.Request) 
 		if ae.retryAfter > 0 {
 			w.Header().Set("Retry-After", strconv.FormatInt(ae.retryAfter, 10))
 		}
+		// Rejected before any account was chosen: log it so refused traffic is
+		// visible instead of silently dying in middleware.
+		h.recordRejection("claude", rejectedApiKeyLabel(r), ae.message, ae.status)
 		h.sendClaudeError(w, ae.status, ae.code, ae.message)
 		return nil
 	}
@@ -496,6 +549,9 @@ func (h *Handler) authenticateForOpenAI(w http.ResponseWriter, r *http.Request) 
 		if ae.retryAfter > 0 {
 			w.Header().Set("Retry-After", strconv.FormatInt(ae.retryAfter, 10))
 		}
+		// Rejected before any account was chosen: log it so refused traffic is
+		// visible instead of silently dying in middleware.
+		h.recordRejection("openai", rejectedApiKeyLabel(r), ae.message, ae.status)
 		h.sendOpenAIError(w, ae.status, ae.code, ae.message)
 		return nil
 	}
@@ -1118,6 +1174,13 @@ func (h *Handler) handleClaudeMessagesInternal(w http.ResponseWriter, r *http.Re
 				// token/credit accounting or the RPM/TPM windows.
 				in, out := usageFromCachedClaudeBody(cached)
 				h.recordSuccessForApiKey(apiKeyID, in, out, 0, req.Model)
+				// ...and log it. Previously this path updated the counters
+				// without emitting any record, so logCount could never be
+				// reconciled against totalRequests.
+				ctr := newTraceRecorder("claude", req.Model, false, apiKeyID)
+				ctr.noteUsage(in, out, 0, 0)
+				ctr.markCacheHit()
+				h.emitTrace(ctr, outcomeCacheHit, http.StatusOK)
 				return
 			}
 		}
@@ -1148,12 +1211,12 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 	// 获取 thinking 输出格式配置
 	thinkingFormat := thinkingOpts.Format
 
-	reqStart := time.Now()
+	// The trace recorder owns request-level timing from here on.
+	tr := newTraceRecorder("claude", model, true, apiKeyID)
 	msgID := "msg_" + uuid.New().String()
 	startInputTokens := estimatedInputTokens
 	excluded := make(map[string]bool)
 	var lastErr error
-	var lastAccountID string
 	messageStarted := false
 	var messageStartUsage promptCacheUsage
 
@@ -1182,10 +1245,11 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 		if account == nil {
 			break
 		}
-		lastAccountID = account.ID
+		att := tr.beginAttempt(account)
 		if err := h.ensureValidToken(account); err != nil {
 			lastErr = err
 			excluded[account.ID] = true
+			tr.endAttempt(att, err)
 			h.handleAccountFailure(account, err)
 			continue
 		}
@@ -1260,6 +1324,10 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 				if text == "" {
 					return
 				}
+				// First byte actually emitted to the client: this is the
+				// time-to-first-token an operator cares about, distinct from
+				// total request duration.
+				tr.markFirstByte()
 				startContentBlock("text")
 				h.sendSSE(w, flusher, "content_block_delta", map[string]interface{}{
 					"type":  "content_block_delta",
@@ -1507,21 +1575,25 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 			},
 		}
 
-		err := CallKiroAPI(account, payload, callback)
+		var diag KiroCallDiagnostics
+		err := CallKiroAPIWithDiagnostics(account, payload, callback, &diag)
+		tr.applyDiagnostics(att, &diag)
 		if err != nil {
 			lastErr = err
 			excluded[account.ID] = true
+			tr.endAttempt(att, err)
 			h.handleAccountFailure(account, err)
 			if !messageStarted {
 				continue
 			}
-			h.recordFailureWithDetails("claude", model, account.ID, err)
+			h.emitTrace(tr, outcomeError, statusForUpstreamError(err))
 			h.sendSSE(w, flusher, "error", map[string]interface{}{
 				"type":  "error",
 				"error": map[string]string{"type": "api_error", "message": err.Error()},
 			})
 			return
 		}
+		tr.endAttempt(att, nil)
 
 		processClaudeText("", false, true)
 		if eventThinkingOpen {
@@ -1548,12 +1620,14 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 		h.pool.RecordSuccess(account.ID)
 		h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
 		h.promptCache.Update(account.ID, cacheProfile)
-		h.recordSuccessLog("claude", model, account.ID, inputTokens+outputTokens, credits, time.Since(reqStart).Milliseconds())
 
 		stopReason := "end_turn"
 		if len(toolUses) > 0 {
 			stopReason = "tool_use"
 		}
+		tr.noteUsage(inputTokens, outputTokens, cacheUsage.CacheReadInputTokens, credits)
+		tr.noteResponseShape(stopReason, model, len(toolUses))
+		h.emitTrace(tr, outcomeSuccess, http.StatusOK)
 
 		ensureMessageStart()
 		h.sendSSE(w, flusher, "message_delta", map[string]interface{}{
@@ -1575,8 +1649,8 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 		return
 	}
 
-	h.recordFailureWithDetails("claude", model, lastAccountID, lastErr)
 	status := statusForUpstreamError(lastErr)
+	h.emitTrace(tr, outcomeError, status)
 	applyRetryAfterHeader(w, lastErr)
 	h.sendClaudeError(w, status, "api_error", lastErr.Error())
 }
@@ -1654,48 +1728,12 @@ func (h *Handler) recordSuccessForApiKey(apiKeyID string, inputTokens, outputTok
 	}
 }
 
-// recordFailureWithDetails records a failure and stores it in the request logs.
-func (h *Handler) recordFailureWithDetails(endpoint, model, accountID string, err error) {
-	atomic.AddInt64(&h.totalRequests, 1)
-	atomic.AddInt64(&h.failedRequests, 1)
-
-	if err == nil {
-		return
-	}
-
-	errMsg := err.Error()
-	errType := classifyError(errMsg)
-
-	entry := RequestLog{
-		Time:         time.Now().Unix(),
-		Endpoint:     endpoint,
-		Model:        model,
-		AccountID:    accountID,
-		AccountEmail: requestLogAccountEmail(accountID),
-		Status:       "error",
-		Error:        errMsg,
-		ErrorType:    errType,
-	}
-
-	h.appendRequestLog(entry)
-}
-
-// recordSuccessLog records a successful request in the request logs.
-func (h *Handler) recordSuccessLog(endpoint, model, accountID string, tokens int, credits float64, durationMs int64) {
-	entry := RequestLog{
-		Time:         time.Now().Unix(),
-		Endpoint:     endpoint,
-		Model:        model,
-		AccountID:    accountID,
-		AccountEmail: requestLogAccountEmail(accountID),
-		Status:       "success",
-		Tokens:       tokens,
-		Credits:      credits,
-		Duration:     durationMs,
-	}
-
-	h.appendRequestLog(entry)
-}
+// Request/response logging goes through traceRecorder + Handler.emitTrace
+// (proxy/request_trace_recorder.go). The former recordSuccessLog /
+// recordFailureWithDetails helpers were removed deliberately: they emitted a
+// record per failover attempt (inflating request counts while discarding the
+// cause of each reroute) and offered a second logging path that silently
+// bypassed tracing. Keep exactly one terminal path per client request.
 
 func requestLogAccountEmail(accountID string) string {
 	if strings.TrimSpace(accountID) == "" {
@@ -1859,18 +1897,19 @@ func (h *Handler) getRequestLogs() []RequestLog {
 func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayload, model string, thinking bool, thinkingOpts claudeThinkingResponseOptions, estimatedInputTokens int, cacheProfile *promptCacheProfile, apiKeyID string) {
 	excluded := make(map[string]bool)
 	var lastErr error
-	var lastAccountID string
-	reqStart := time.Now()
+	// The trace recorder owns request-level timing from here on.
+	tr := newTraceRecorder("claude", model, false, apiKeyID)
 
 	for attempt := 0; attempt < maxAccountRetryAttempts; attempt++ {
 		account := h.pool.GetNextForModelExcluding(model, excluded)
 		if account == nil {
 			break
 		}
-		lastAccountID = account.ID
+		att := tr.beginAttempt(account)
 		if err := h.ensureValidToken(account); err != nil {
 			lastErr = err
 			excluded[account.ID] = true
+			tr.endAttempt(att, err)
 			h.handleAccountFailure(account, err)
 			continue
 		}
@@ -1906,13 +1945,17 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayl
 			},
 		}
 
-		err := CallKiroAPI(account, payload, callback)
+		var diag KiroCallDiagnostics
+		err := CallKiroAPIWithDiagnostics(account, payload, callback, &diag)
+		tr.applyDiagnostics(att, &diag)
 		if err != nil {
 			lastErr = err
 			excluded[account.ID] = true
+			tr.endAttempt(att, err)
 			h.handleAccountFailure(account, err)
 			continue
 		}
+		tr.endAttempt(att, nil)
 
 		thinkingFormat := thinkingOpts.Format
 		finalContent, extractedReasoning := extractThinkingFromContent(content)
@@ -1940,7 +1983,13 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayl
 		h.pool.RecordSuccess(account.ID)
 		h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
 		h.promptCache.Update(account.ID, cacheProfile)
-		h.recordSuccessLog("claude", model, account.ID, inputTokens+outputTokens, credits, time.Since(reqStart).Milliseconds())
+		stopReason := "end_turn"
+		if len(toolUses) > 0 {
+			stopReason = "tool_use"
+		}
+		tr.noteUsage(inputTokens, outputTokens, cacheUsage.CacheReadInputTokens, credits)
+		tr.noteResponseShape(stopReason, model, len(toolUses))
+		h.emitTrace(tr, outcomeSuccess, http.StatusOK)
 
 		responseThinkingContent := rawThinkingContent
 		includeEmptyThinkingBlock := thinking && thinkingOpts.OmitDisplay && rawThinkingContent != ""
@@ -1980,8 +2029,8 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayl
 		return
 	}
 
-	h.recordFailureWithDetails("claude", model, lastAccountID, lastErr)
 	status := statusForUpstreamError(lastErr)
+	h.emitTrace(tr, outcomeError, status)
 	applyRetryAfterHeader(w, lastErr)
 	h.sendClaudeError(w, status, "api_error", lastErr.Error())
 }
@@ -2085,18 +2134,19 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 	chatID := "chatcmpl-" + uuid.New().String()
 	excluded := make(map[string]bool)
 	var lastErr error
-	var lastAccountID string
-	reqStart := time.Now()
+	// The trace recorder owns request-level timing from here on.
+	tr := newTraceRecorder("openai", model, true, apiKeyID)
 
 	for attempt := 0; attempt < maxAccountRetryAttempts; attempt++ {
 		account := h.pool.GetNextForModelExcluding(model, excluded)
 		if account == nil {
 			break
 		}
-		lastAccountID = account.ID
+		att := tr.beginAttempt(account)
 		if err := h.ensureValidToken(account); err != nil {
 			lastErr = err
 			excluded[account.ID] = true
+			tr.endAttempt(att, err)
 			h.handleAccountFailure(account, err)
 			continue
 		}
@@ -2120,6 +2170,10 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 			if content == "" && thinkingState == 2 {
 				return
 			}
+			// First byte actually emitted to the client: this is the
+			// time-to-first-token an operator cares about, distinct from
+			// total request duration.
+			tr.markFirstByte()
 
 			var chunk map[string]interface{}
 
@@ -2382,17 +2436,21 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 			},
 		}
 
-		err := CallKiroAPI(account, payload, callback)
+		var diag KiroCallDiagnostics
+		err := CallKiroAPIWithDiagnostics(account, payload, callback, &diag)
+		tr.applyDiagnostics(att, &diag)
 		if err != nil {
 			lastErr = err
 			excluded[account.ID] = true
+			tr.endAttempt(att, err)
 			h.handleAccountFailure(account, err)
 			if !responseStarted {
 				continue
 			}
-			h.recordFailureWithDetails("openai", model, account.ID, err)
+			h.emitTrace(tr, outcomeError, statusForUpstreamError(err))
 			return
 		}
+		tr.endAttempt(att, nil)
 
 		processText("", false, true)
 		if eventThinkingOpen {
@@ -2421,12 +2479,13 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 		h.recordSuccessForApiKey(apiKeyID, inputTokens, outputTokens, credits, model)
 		h.pool.RecordSuccess(account.ID)
 		h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
-		h.recordSuccessLog("openai", model, account.ID, inputTokens+outputTokens, credits, time.Since(reqStart).Milliseconds())
-
 		finishReason := "stop"
 		if len(toolCalls) > 0 {
 			finishReason = "tool_calls"
 		}
+		tr.noteUsage(inputTokens, outputTokens, 0, credits)
+		tr.noteResponseShape(finishReason, model, len(toolCalls))
+		h.emitTrace(tr, outcomeSuccess, http.StatusOK)
 
 		chunk := map[string]interface{}{
 			"id":      chatID,
@@ -2456,8 +2515,8 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 		return
 	}
 
-	h.recordFailureWithDetails("openai", model, lastAccountID, lastErr)
 	status := statusForUpstreamError(lastErr)
+	h.emitTrace(tr, outcomeError, status)
 	applyRetryAfterHeader(w, lastErr)
 	h.sendOpenAIError(w, status, errorTypeForOpenAIStatus(status), lastErr.Error())
 }
@@ -2466,18 +2525,19 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, payload *KiroPayload, model string, thinking bool, estimatedInputTokens int, apiKeyID string) {
 	excluded := make(map[string]bool)
 	var lastErr error
-	var lastAccountID string
-	reqStart := time.Now()
+	// The trace recorder owns request-level timing from here on.
+	tr := newTraceRecorder("openai", model, false, apiKeyID)
 
 	for attempt := 0; attempt < maxAccountRetryAttempts; attempt++ {
 		account := h.pool.GetNextForModelExcluding(model, excluded)
 		if account == nil {
 			break
 		}
-		lastAccountID = account.ID
+		att := tr.beginAttempt(account)
 		if err := h.ensureValidToken(account); err != nil {
 			lastErr = err
 			excluded[account.ID] = true
+			tr.endAttempt(att, err)
 			h.handleAccountFailure(account, err)
 			continue
 		}
@@ -2505,13 +2565,17 @@ func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, payload *KiroPayl
 			},
 		}
 
-		err := CallKiroAPI(account, payload, callback)
+		var diag KiroCallDiagnostics
+		err := CallKiroAPIWithDiagnostics(account, payload, callback, &diag)
+		tr.applyDiagnostics(att, &diag)
 		if err != nil {
 			lastErr = err
 			excluded[account.ID] = true
+			tr.endAttempt(att, err)
 			h.handleAccountFailure(account, err)
 			continue
 		}
+		tr.endAttempt(att, nil)
 
 		finalContent, extractedReasoning := extractThinkingFromContent(content)
 		if thinking && reasoningContent == "" && extractedReasoning != "" {
@@ -2536,7 +2600,13 @@ func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, payload *KiroPayl
 		h.recordSuccessForApiKey(apiKeyID, inputTokens, outputTokens, credits, model)
 		h.pool.RecordSuccess(account.ID)
 		h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
-		h.recordSuccessLog("openai", model, account.ID, inputTokens+outputTokens, credits, time.Since(reqStart).Milliseconds())
+		finishReason := "stop"
+		if len(toolUses) > 0 {
+			finishReason = "tool_calls"
+		}
+		tr.noteUsage(inputTokens, outputTokens, 0, credits)
+		tr.noteResponseShape(finishReason, model, len(toolUses))
+		h.emitTrace(tr, outcomeSuccess, http.StatusOK)
 
 		thinkingFormat := config.GetThinkingConfig().OpenAIFormat
 		resp := KiroToOpenAIResponseWithReasoning(finalContent, reasoningContent, toolUses, inputTokens, outputTokens, model, thinkingFormat)
@@ -2550,8 +2620,8 @@ func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, payload *KiroPayl
 		return
 	}
 
-	h.recordFailureWithDetails("openai", model, lastAccountID, lastErr)
 	status := statusForUpstreamError(lastErr)
+	h.emitTrace(tr, outcomeError, status)
 	applyRetryAfterHeader(w, lastErr)
 	h.sendOpenAIError(w, status, errorTypeForOpenAIStatus(status), lastErr.Error())
 }
@@ -4996,9 +5066,12 @@ func (h *Handler) apiGetAuditLogs(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) apiClearLogs(w http.ResponseWriter, r *http.Request) {
 	h.requestLogsMu.Lock()
+	cleared := len(h.requestLogs)
 	h.requestLogs = h.requestLogs[:0]
 	h.requestLogsMu.Unlock()
 	_ = os.Remove(requestLogsPath)
+	// Clearing destroys evidence, so the action itself must leave a trail.
+	h.auditLogClear(cleared)
 	json.NewEncoder(w).Encode(map[string]bool{"success": true})
 }
 

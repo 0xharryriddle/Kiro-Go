@@ -130,16 +130,19 @@ func (h *Handler) handleResponsesNonStream(
 ) {
 	excluded := make(map[string]bool)
 	var lastErr error
-	reqStart := time.Now()
+	// The trace recorder owns request-level timing from here on.
+	tr := newTraceRecorder("responses", model, false, apiKeyID)
 
 	for attempt := 0; attempt < maxAccountRetryAttempts; attempt++ {
 		account := h.pool.GetNextForModelExcluding(model, excluded)
 		if account == nil {
 			break
 		}
+		att := tr.beginAttempt(account)
 		if err := h.ensureValidToken(account); err != nil {
 			lastErr = err
 			excluded[account.ID] = true
+			tr.endAttempt(att, err)
 			h.handleAccountFailure(account, err)
 			continue
 		}
@@ -166,13 +169,17 @@ func (h *Handler) handleResponsesNonStream(
 			},
 		}
 
-		err := CallKiroAPI(account, payload, callback)
+		var diag KiroCallDiagnostics
+		err := CallKiroAPIWithDiagnostics(account, payload, callback, &diag)
+		tr.applyDiagnostics(att, &diag)
 		if err != nil {
 			lastErr = err
 			excluded[account.ID] = true
+			tr.endAttempt(att, err)
 			h.handleAccountFailure(account, err)
 			continue
 		}
+		tr.endAttempt(att, nil)
 
 		finalContent, _ := extractThinkingFromContent(content)
 		if !thinking {
@@ -194,7 +201,13 @@ func (h *Handler) handleResponsesNonStream(
 		h.recordSuccessForApiKey(apiKeyID, inputTokens, outputTokens, credits, model)
 		h.pool.RecordSuccess(account.ID)
 		h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
-		h.recordSuccessLog("responses", model, account.ID, inputTokens+outputTokens, credits, time.Since(reqStart).Milliseconds())
+		finishReason := "completed"
+		if len(toolUses) > 0 {
+			finishReason = "tool_calls"
+		}
+		tr.noteUsage(inputTokens, outputTokens, 0, credits)
+		tr.noteResponseShape(finishReason, model, len(toolUses))
+		h.emitTrace(tr, outcomeSuccess, http.StatusOK)
 
 		respObj := buildResponsesObject(respID, model, finalContent, toolUses, inputTokens, outputTokens, req)
 		respObj.StoredInput = storedInput
@@ -215,7 +228,7 @@ func (h *Handler) handleResponsesNonStream(
 		h.sendOpenAIError(w, 503, "server_error", "No available accounts")
 		return
 	}
-	h.recordFailureWithDetails("responses", model, "", lastErr)
+	h.emitTrace(tr, outcomeError, http.StatusInternalServerError)
 	h.sendOpenAIError(w, 500, "server_error", lastErr.Error())
 }
 
@@ -320,16 +333,19 @@ func (h *Handler) handleResponsesStream(
 	excluded := make(map[string]bool)
 	var lastErr error
 	responseStarted := false
-	reqStart := time.Now()
+	// The trace recorder owns request-level timing from here on.
+	tr := newTraceRecorder("responses", model, true, apiKeyID)
 
 	for attempt := 0; attempt < maxAccountRetryAttempts; attempt++ {
 		account := h.pool.GetNextForModelExcluding(model, excluded)
 		if account == nil {
 			break
 		}
+		att := tr.beginAttempt(account)
 		if err := h.ensureValidToken(account); err != nil {
 			lastErr = err
 			excluded[account.ID] = true
+			tr.endAttempt(att, err)
 			h.handleAccountFailure(account, err)
 			continue
 		}
@@ -392,6 +408,10 @@ func (h *Handler) handleResponsesStream(
 					return
 				}
 				fullText.WriteString(text)
+				// First byte actually emitted to the client: this is the
+				// time-to-first-token an operator cares about, distinct from
+				// total request duration.
+				tr.markFirstByte()
 				ensureMessageStarted()
 				send("response.output_text.delta", map[string]interface{}{
 					"type":          "response.output_text.delta",
@@ -475,8 +495,11 @@ func (h *Handler) handleResponsesStream(
 			},
 		}
 
-		err := CallKiroAPI(account, payload, callback)
+		var diag KiroCallDiagnostics
+		err := CallKiroAPIWithDiagnostics(account, payload, callback, &diag)
+		tr.applyDiagnostics(att, &diag)
 		if err != nil {
+			tr.endAttempt(att, err)
 			if !responseStarted {
 				lastErr = err
 				excluded[account.ID] = true
@@ -494,9 +517,10 @@ func (h *Handler) handleResponsesStream(
 					},
 				},
 			})
-			h.recordFailureWithDetails("responses", model, account.ID, err)
+			h.emitTrace(tr, outcomeError, statusForUpstreamError(err))
 			return
 		}
+		tr.endAttempt(att, nil)
 
 		finalContent, _ := extractThinkingFromContent(fullText.String())
 		reasoning := reasoningText.String()
@@ -546,7 +570,13 @@ func (h *Handler) handleResponsesStream(
 		h.recordSuccessForApiKey(apiKeyID, inputTokens, outputTokens, credits, model)
 		h.pool.RecordSuccess(account.ID)
 		h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
-		h.recordSuccessLog("responses", model, account.ID, inputTokens+outputTokens, credits, time.Since(reqStart).Milliseconds())
+		finishReason := "completed"
+		if len(toolUses) > 0 {
+			finishReason = "tool_calls"
+		}
+		tr.noteUsage(inputTokens, outputTokens, 0, credits)
+		tr.noteResponseShape(finishReason, model, len(toolUses))
+		h.emitTrace(tr, outcomeSuccess, http.StatusOK)
 
 		respObj := buildResponsesObject(respID, model, finalContent, toolUses, inputTokens, outputTokens, req)
 		respObj.CreatedAt = createdAt
@@ -582,7 +612,7 @@ func (h *Handler) handleResponsesStream(
 		})
 		return
 	}
-	h.recordFailureWithDetails("responses", model, "", lastErr)
+	h.emitTrace(tr, outcomeError, http.StatusInternalServerError)
 	send("response.failed", map[string]interface{}{
 		"type": "response.failed",
 		"response": map[string]interface{}{
