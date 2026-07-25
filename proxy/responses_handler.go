@@ -429,6 +429,10 @@ func (h *Handler) handleResponsesStream(
 				responseStarted = true
 			},
 			OnToolUse: func(tu KiroToolUse) {
+				// A tool-call chunk is a first byte to the client just as much
+				// as a text delta. Hooking only text emission left every
+				// tool-call-only stream with no TTFB at all.
+				tr.markFirstByte()
 				if messageStarted {
 					send("response.content_part.done", map[string]interface{}{
 						"type":          "response.content_part.done",

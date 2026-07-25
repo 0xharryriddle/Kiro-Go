@@ -1555,6 +1555,10 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 				processClaudeText(text, isThinking, false)
 			},
 			OnToolUse: func(tu KiroToolUse) {
+				// A tool-call chunk is a first byte to the client just as much
+				// as a text delta. Hooking only text emission left every
+				// tool-call-only stream with no TTFB at all.
+				tr.markFirstByte()
 				processClaudeText("", false, true)
 				rawContentBuilder.WriteString(tu.Name)
 				if b, err := json.Marshal(tu.Input); err == nil {
@@ -2492,6 +2496,10 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 				processText(text, isThinking, false)
 			},
 			OnToolUse: func(tu KiroToolUse) {
+				// A tool-call chunk is a first byte to the client just as much
+				// as a text delta. Hooking only text emission left every
+				// tool-call-only stream with no TTFB at all.
+				tr.markFirstByte()
 				processText("", false, true)
 
 				args, _ := json.Marshal(tu.Input)
