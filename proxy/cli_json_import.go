@@ -32,6 +32,10 @@ type importCredentialRequest struct {
 	// ID preserves a pasted record's account id so re-importing a backup updates
 	// rather than duplicates. Ignored when empty or already taken.
 	ID string
+	// KiroApiKey carries a Kiro API-key credential (ksk_...). Such accounts have
+	// no refresh token, so apiImportCredentials handles them ahead of the OAuth
+	// path rather than routing them through importOne.
+	KiroApiKey string
 	// Label-only metadata (never used as an auth input).
 	Email    string
 	Nickname string
@@ -77,6 +81,10 @@ type rawCredential struct {
 	UserIDCamel string `json:"userId"`
 	ID          string `json:"id"`
 
+	// Kiro API-key credential (ksk_...), both casings.
+	KiroApiKeySnake string `json:"kiro_api_key"`
+	KiroApiKeyCamel string `json:"kiroApiKey"`
+
 	// Label material — email may arrive as a token claim alias.
 	Email             string `json:"email"`
 	PreferredUsername string `json:"preferred_username"`
@@ -84,8 +92,9 @@ type rawCredential struct {
 	Nickname          string `json:"nickname"`
 }
 
-// firstNonEmpty returns the first argument that is non-empty after trimming.
-func firstNonEmpty(vals ...string) string {
+// firstNonBlank returns the first argument that is non-empty after trimming.
+// Distinct from bedrock_eventstream.go's firstNonEmpty, which does NOT trim.
+func firstNonBlank(vals ...string) string {
 	for _, v := range vals {
 		if s := strings.TrimSpace(v); s != "" {
 			return s
@@ -95,9 +104,9 @@ func firstNonEmpty(vals ...string) string {
 }
 
 // normalizeAuthMethod maps the many ways a caller can spell an auth method onto
-// the three canonical values the rest of the system understands. When the method
-// is absent or unrecognized it is inferred from which credential material is
-// present (external IdP material > IdC client secret > social).
+// the canonical values the rest of the system understands. When the method is
+// absent or unrecognized it is inferred from which credential material is
+// present (Kiro API key > external IdP material > IdC client secret > social).
 func normalizeAuthMethod(raw, tokenEndpoint, clientID, clientSecret string) string {
 	switch strings.ToLower(strings.TrimSpace(raw)) {
 	case "external_idp", "azure", "azuread", "entra", "entraid", "m365", "microsoft365", "microsoft":
@@ -106,6 +115,10 @@ func normalizeAuthMethod(raw, tokenEndpoint, clientID, clientSecret string) stri
 		return "idc"
 	case "social", "google", "github":
 		return "social"
+	case "api_key", "apikey", "kiro_api_key":
+		// Kiro API-key accounts carry no refresh token; apiImportCredentials
+		// handles them ahead of the OAuth path (they never reach importOne).
+		return "api_key"
 	}
 	// Inference for empty/unknown values.
 	if strings.TrimSpace(tokenEndpoint) != "" && strings.TrimSpace(clientID) != "" {
@@ -136,22 +149,27 @@ func providerWithDefault(authMethod, provider string) string {
 
 // normalizeRawCredential resolves a decoded rawCredential into the canonical
 // importCredentialRequest, applying casing precedence, auth-method normalization,
-// provider defaulting, and the us-east-1 region default.
+// provider defaulting, and the us-east-1 region default (OAuth methods only).
 func normalizeRawCredential(rc rawCredential) importCredentialRequest {
-	accessToken := firstNonEmpty(rc.AccessTokenSnake, rc.AccessTokenCamel)
-	refreshToken := firstNonEmpty(rc.RefreshTokenSnake, rc.RefreshTokenCamel)
-	clientID := firstNonEmpty(rc.ClientIDSnake, rc.ClientIDCamel)
-	clientSecret := firstNonEmpty(rc.ClientSecretSnake, rc.ClientSecretCamel)
-	tokenEndpoint := firstNonEmpty(rc.TokenEndpointSnake, rc.TokenEndpointCamel)
-	issuerURL := firstNonEmpty(rc.IssuerURLSnake, rc.IssuerURLCamel)
-	profileArn := firstNonEmpty(rc.ProfileArnSnake, rc.ProfileArnCamel)
-	authMethodRaw := firstNonEmpty(rc.AuthMethodSnake, rc.AuthMethodCamel)
+	accessToken := firstNonBlank(rc.AccessTokenSnake, rc.AccessTokenCamel)
+	refreshToken := firstNonBlank(rc.RefreshTokenSnake, rc.RefreshTokenCamel)
+	clientID := firstNonBlank(rc.ClientIDSnake, rc.ClientIDCamel)
+	clientSecret := firstNonBlank(rc.ClientSecretSnake, rc.ClientSecretCamel)
+	tokenEndpoint := firstNonBlank(rc.TokenEndpointSnake, rc.TokenEndpointCamel)
+	issuerURL := firstNonBlank(rc.IssuerURLSnake, rc.IssuerURLCamel)
+	profileArn := firstNonBlank(rc.ProfileArnSnake, rc.ProfileArnCamel)
+	authMethodRaw := firstNonBlank(rc.AuthMethodSnake, rc.AuthMethodCamel)
 
 	authMethod := normalizeAuthMethod(authMethodRaw, tokenEndpoint, clientID, clientSecret)
-	provider := providerWithDefault(authMethod, firstNonEmpty(rc.Provider, rc.IDP))
+	provider := providerWithDefault(authMethod, firstNonBlank(rc.Provider, rc.IDP))
 
-	region := firstNonEmpty(rc.Region)
-	if region == "" {
+	// Region default is deliberately NOT applied to api_key credentials: those are
+	// never refreshed, so apiImportCredentials probes the key to discover its real
+	// region, and a us-east-1 placeholder here would be validated as the answer and
+	// restore an EU key as a permanently-403ing pool slot. OAuth methods still get
+	// the default (importOne applies the same fallback).
+	region := firstNonBlank(rc.Region)
+	if region == "" && authMethod != "api_key" {
 		region = "us-east-1"
 	}
 
@@ -167,9 +185,10 @@ func normalizeRawCredential(rc rawCredential) importCredentialRequest {
 		IssuerURL:     issuerURL,
 		Scopes:        strings.TrimSpace(rc.Scopes),
 		ProfileArn:    profileArn,
-		UserID:        firstNonEmpty(rc.UserIDSnake, rc.UserIDCamel),
+		UserID:        firstNonBlank(rc.UserIDSnake, rc.UserIDCamel),
 		ID:            strings.TrimSpace(rc.ID),
-		Email:         firstNonEmpty(rc.Email, rc.PreferredUsername, rc.UPN),
+		KiroApiKey:    firstNonBlank(rc.KiroApiKeySnake, rc.KiroApiKeyCamel),
+		Email:         firstNonBlank(rc.Email, rc.PreferredUsername, rc.UPN),
 		Nickname:      strings.TrimSpace(rc.Nickname),
 	}
 }

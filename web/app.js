@@ -23,6 +23,10 @@
   let builderIdPollTimer = null;
   let kiroSsoSession = '';
   let kiroSsoPollTimer = null;
+  // Synchronous re-entrancy guard for startKiroSsoLogin: kiroSsoSession is only
+  // assigned AFTER the slow /start round-trip resolves, so a second click during
+  // that window would fire a second POST /start and orphan the first session.
+  let kiroSsoStarting = false;
   let iamSession = '';
   let exportSelectedIds = new Set();
   let currentVersion = '';
@@ -438,6 +442,14 @@
   function getDisplayEmail(email, id) {
     const raw = email || (id ? id.substring(0, 12) + '...' : '-');
     return maskEmail(raw);
+  }
+  // accountDisplayName prefers the (masked) email, then the nickname (for
+  // account types with no email, e.g. Bedrock / custom_api), then a short id.
+  function accountDisplayName(a) {
+    if (!a) return '-';
+    if (a.email) return getDisplayEmail(a.email, a.id);
+    if (a.nickname && a.nickname.trim()) return a.nickname.trim();
+    return getDisplayEmail('', a.id);
   }
 
   // Toast bridge
@@ -884,6 +896,8 @@
     if (normalized === 'idc') return t('auth.enterprise');
     if (normalized === 'social') return t('auth.social');
     if (normalized === 'builderid') return 'BuilderID';
+    if (normalized === 'api_key') return t('auth.apiKey');
+    if (normalized === 'custom_api') return t('auth.customApi');
     if (normalized === 'github') return t('local.providerGithub');
     if (normalized === 'google') return t('local.providerGoogle');
     return method;
@@ -947,7 +961,7 @@
       const overageBadge = renderOverageBadge(a);
       const banned = a.banStatus && a.banStatus !== 'ACTIVE';
       const idAttr = escapeAttr(a.id);
-      const displayEmail = getDisplayEmail(a.email, a.id);
+      const displayEmail = accountDisplayName(a);
       const selectLabel = t('accounts.selectAccount', displayEmail);
 
       const refreshSvg = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M23 4v6h-6M1 20v-6h6"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg>';
@@ -962,10 +976,10 @@
         '<div class="account-info-text">' +
         '<div class="account-email">' + escapeHtml(displayEmail) + '</div>' +
         '<div class="account-meta">' +
-        getSubBadge(a.subscriptionType) +
-        getTrialBadge(a) +
+        // Custom API accounts are pool proxies, not Kiro subscriptions: no
+        // subscription/trial/overage badges (they'd default to a misleading "Free").
+        (a.authMethod === 'custom_api' ? '' : (getSubBadge(a.subscriptionType) + getTrialBadge(a) + overageBadge)) +
         weightBadge +
-        overageBadge +
         '<span class="badge badge-info">' + escapeHtml(formatAuthMethod(a.provider || a.authMethod)) + '</span>' +
         getStatusBadge(a) +
         '</div>' +
@@ -979,6 +993,11 @@
           '<button class="btn btn-sm ' + (a.enabled ? 'btn-outline' : 'btn-primary') + '" data-action="toggle" data-id="' + idAttr + '" data-enabled="' + (!a.enabled) + '">' +
           escapeHtml(a.enabled ? t('accounts.disable') : t('accounts.enable')) +
           '</button>') +
+        // external_idp (Azure tenant) credentials can hold Kiro profiles in several
+        // regions; expose a switcher so a wrongly-pinned account (e.g. US instead
+        // of EU) can be re-pinned without re-authenticating.
+        (a.authMethod === 'external_idp' ?
+          '<button class="btn btn-sm btn-outline" data-action="switchProfile" data-id="' + idAttr + '">' + escapeHtml(t('kirosso.switchProfile')) + '</button>' : '') +
         '<button class="btn btn-sm btn-secondary" data-action="test" data-id="' + idAttr + '" id="test-' + idAttr + '">' + escapeHtml(t('accounts.test')) + '</button>' +
         '<button class="btn btn-sm btn-danger" data-action="delete" data-id="' + idAttr + '">' + escapeHtml(t('accounts.delete')) + '</button>' +
         '</div>' +
@@ -995,16 +1014,61 @@
           '<div class="usage-bar"><div class="usage-fill ' + trialClass + '" data-usage-pct="' + escapeAttr(trialPct) + '"></div></div>' +
           '<div class="usage-text"><span>' + (a.trialUsageCurrent != null ? a.trialUsageCurrent.toFixed(1) : 0) + ' / ' + (a.trialUsageLimit != null ? a.trialUsageLimit.toFixed(0) : 0) + '</span><span>' + trialPct.toFixed(1) + '%</span></div>' +
           '</div>' : '') +
-        '<div class="account-stats">' +
-        '<div class="account-stat"><div class="account-stat-value">' + (a.requestCount || 0) + '</div><div class="account-stat-label">' + escapeHtml(t('accounts.requests')) + '</div></div>' +
-        '<div class="account-stat"><div class="account-stat-value">' + formatNum(a.totalTokens || 0) + '</div><div class="account-stat-label">' + escapeHtml(t('accounts.tokens')) + '</div></div>' +
-        '<div class="account-stat"><div class="account-stat-value">' + (a.totalCredits || 0).toFixed(1) + '</div><div class="account-stat-label">' + escapeHtml(t('accounts.credits')) + '</div></div>' +
-        '<div class="account-stat"><div class="account-stat-value">' + escapeHtml(formatTokenExpiry(a.expiresAt)) + '</div><div class="account-stat-label">' + escapeHtml(t('accounts.expiry')) + '</div></div>' +
-        '</div>' +
+        // Compact account cards: no per-account stats row. Requests/Tokens/Credits
+        // and token expiry are intentionally omitted here (usage still shown per
+        // API key) so cards stay small enough to pack 2-3 per row.
         '</div>';
     }).join('');
     applyUsageBars(container);
     enhanceCustomSelects(container);
+  }
+
+  // Opens the profile switcher for an existing external_idp account: fetches the
+  // multi-region discovery from the backend, then reuses the add-account modal
+  // shell for a radio picker. POSTing the chosen ARN re-pins the account's
+  // data-plane region (validated server-side against a fresh discovery).
+  async function openSwitchProfileModal(id, btn) {
+    if (btn) btn.disabled = true;
+    let d = {};
+    try {
+      const res = await api('/accounts/' + id + '/kiro-profiles');
+      d = await res.json().catch(() => ({}));
+    } catch (e) { /* handled below via d.success check */ }
+    if (btn) btn.disabled = false;
+    if (!d.success) { toastError(t('common.failed') + ': ' + (d.error || '')); return; }
+    const profiles = d.profiles || [];
+    // "Nothing to switch to" means no profile OTHER than the current pin exists.
+    // A single discovered profile that differs from the current (possibly stale)
+    // pin is exactly the recovery case this switcher exists for — show it.
+    if (!profiles.some(p => p.arn !== (d.current || ''))) { toastPrimary(t('kirosso.noAltProfiles')); return; }
+    const title = $('modalTitle');
+    const body = $('modalBody');
+    title.textContent = t('kirosso.switchProfileTitle');
+    body.innerHTML =
+      '<p class="help-block">' + escapeHtml(t('kirosso.switchProfileDesc')) + '</p>' +
+      '<div id="switchProfileList">' + kiroProfileListHtml(profiles, d.current || '') + '</div>' +
+      '<div class="modal-footer">' +
+      '<button class="btn btn-secondary" data-close-add="1" type="button">' + escapeHtml(t('common.cancel')) + '</button>' +
+      '<button class="btn btn-primary" id="switchProfileConfirmBtn" type="button">' + escapeHtml(t('kirosso.useProfile')) + '</button>' +
+      '</div>';
+    $('switchProfileConfirmBtn').addEventListener('click', async e => {
+      const confirmBtn = e.currentTarget;
+      const sel = body.querySelector('input[name="kiroProfilePick"]:checked');
+      if (!sel || confirmBtn.disabled) return;
+      // The POST triggers a full multi-region discovery server-side; block
+      // double-clicks so it cannot run twice concurrently.
+      confirmBtn.disabled = true;
+      const res2 = await api('/accounts/' + id + '/kiro-profiles', { method: 'POST', body: JSON.stringify({ profileArn: sel.value }) }).catch(() => null);
+      const d2 = res2 ? await res2.json().catch(() => ({})) : {};
+      if (d2.success) {
+        closeModal(); loadAccounts();
+        toastPrimary(t('kirosso.switchSuccess'));
+      } else {
+        toastError(t('common.failed') + ': ' + (d2.error || ''));
+        confirmBtn.disabled = false;
+      }
+    });
+    openDialog('addModal');
   }
 
   // Account actions
@@ -1190,7 +1254,11 @@
       detailItem(t('detail.email'), getDisplayEmail(a.email, null)) +
       detailItem(t('detail.userId'), a.userId || '-') +
       detailItem(t('detail.authMethod'), formatAuthMethod(a.provider || a.authMethod)) +
-      detailItem(t('detail.region'), a.region || 'us-east-1') +
+      (a.authMethod === 'custom_api'
+        ? detailItem(t('customApi.baseUrl'), a.baseUrl || '-') +
+          detailItem(t('customApi.orderId'), a.orderId || '-') +
+          detailItem(t('customApi.tags'), (a.tags && a.tags.length) ? a.tags.join(', ') : '-')
+        : detailItem(t('detail.region'), a.region || 'us-east-1')) +
       '</div></div>' +
 
       '<div class="detail-section"><h4>' + escapeHtml(t('detail.machineId')) + '</h4><div class="machine-id-row">' +
@@ -1198,6 +1266,27 @@
       '<button class="btn btn-sm btn-outline" id="generateMachineIdBtn" type="button">' + escapeHtml(t('detail.generate')) + '</button>' +
       '<button class="btn btn-sm btn-primary" data-detail-action="saveMachineId" data-id="' + idAttr + '" type="button">' + escapeHtml(t('detail.save')) + '</button>' +
       '</div></div>' +
+
+      (a.authMethod === 'bedrock' ?
+        '<div class="detail-section"><h4>Region</h4><div class="machine-id-row">' +
+        '<input type="text" id="regionInput" value="' + escapeAttr(a.region || 'us-east-1') + '" placeholder="us-east-1 / eu-west-1" />' +
+        '<button class="btn btn-sm btn-primary" data-detail-action="saveRegion" data-id="' + idAttr + '" type="button">' + escapeHtml(t('detail.save')) + '</button>' +
+        '</div><p class="help-block">Primary AWS region. A 400 "Operation not allowed" on invoke usually means the model is enabled in a different region. Saving clears the model + region cache.</p></div>' +
+        '<div class="detail-section"><h4>Extra Regions</h4><div class="machine-id-row">' +
+        '<input type="text" id="regionsInput" value="' + escapeAttr((a.bedrockRegions || []).join(', ')) + '" placeholder="eu-west-1, us-west-2" />' +
+        '<button class="btn btn-sm btn-primary" data-detail-action="saveRegions" data-id="' + idAttr + '" type="button">' + escapeHtml(t('detail.save')) + '</button>' +
+        '</div><p class="help-block">Comma-separated fallback regions. On "Operation not allowed" the server tries these (primary first) and learns which region each model is callable in. Refresh Models prewarms the map.</p></div>' +
+        '<div class="detail-section"><h4>Credentials</h4>' +
+        '<p class="help-block">Current: ' + (a.bedrockApiKey ? 'Bedrock API key (bearer)' : (a.bedrockAccessKeyId ? 'IAM access key' : 'none')) + '. Fill a field to replace it; blank fields are left unchanged. Saving clears the model + region cache.</p>' +
+        '<div class="form-group"><label>Bedrock API Key <span class="muted-text">(bearer token, ABSK…)</span></label>' +
+        '<input type="password" id="bedrockApiKeyInput" class="font-mono" placeholder="ABSK..." /></div>' +
+        '<div class="form-group"><label>Access Key ID</label>' +
+        '<input type="text" id="bedrockAkInput" class="font-mono" placeholder="AKIA..." /></div>' +
+        '<div class="form-group"><label>Secret Access Key</label>' +
+        '<input type="password" id="bedrockSkInput" class="font-mono" placeholder="secret" /></div>' +
+        '<button class="btn btn-sm btn-primary" data-detail-action="saveBedrockCreds" data-id="' + idAttr + '" type="button">' + escapeHtml(t('detail.save')) + '</button>' +
+        '</div>'
+        : '') +
 
       '<div class="detail-section"><h4>' + escapeHtml(t('detail.weight')) + '</h4>' +
       '<div class="form-group">' +
@@ -1263,10 +1352,15 @@
         });
         c.innerHTML = sorted.map(m => {
           const ratio = m.rateMultiplier || 1;
+          // Bedrock rows carry a learned callable region ("" = not yet probed).
+          const regionBadge = (m.region !== undefined)
+            ? '<div class="model-info">' + (m.region ? '📍 ' + escapeHtml(m.region) : '<span class="muted-text">region not probed</span>') + '</div>'
+            : '';
           return '<div class="model-item">' +
             '<div class="model-name">' + escapeHtml(m.modelId) + '</div>' +
             '<div class="model-credit"><span class="credit-ratio">' + escapeHtml(t('detail.creditMultiplier', ratio)) + '</span></div>' +
             '<div class="model-info">' + escapeHtml(m.description || '') + '</div>' +
+            regionBadge +
             '</div>';
         }).join('') || '<p class="empty-state">' + escapeHtml(t('detail.noModels')) + '</p>';
       } else {
@@ -1394,6 +1488,26 @@
     }
     await putAccount(id, { proxyURL: url }, t('detail.proxySaved'));
   }
+  async function saveRegion(id) {
+    const region = $('regionInput').value.trim();
+    if (!region) { toast('Region cannot be empty', 'warning'); return; }
+    await putAccount(id, { region: region }, 'Region saved');
+  }
+  async function saveRegions(id) {
+    const regions = $('regionsInput').value.split(',').map(s => s.trim()).filter(Boolean);
+    await putAccount(id, { bedrockRegions: regions }, 'Extra regions saved');
+  }
+  async function saveBedrockCreds(id) {
+    const apiKey = $('bedrockApiKeyInput').value.trim();
+    const ak = $('bedrockAkInput').value.trim();
+    const sk = $('bedrockSkInput').value.trim();
+    const body = {};
+    if (apiKey) body.bedrockApiKey = apiKey;
+    if (ak) body.bedrockAccessKeyId = ak;
+    if (sk) body.bedrockSecretAccessKey = sk;
+    if (Object.keys(body).length === 0) { toast('Fill a credential field to update', 'warning'); return; }
+    await putAccount(id, body, 'Credentials saved');
+  }
   function closeDetailModal() { closeDialog('detailModal'); }
 
   // Test flow
@@ -1434,7 +1548,7 @@
     if (!body) return;
     const acc = getTestAccount(testModalAccountId);
     const idAttr = escapeAttr(testModalAccountId);
-    const email = acc ? getDisplayEmail(acc.email, acc.id) : testModalAccountId;
+    const email = acc ? accountDisplayName(acc) : testModalAccountId;
     const proxy = acc ? (acc.proxyURL || t('accounts.testLog.globalProxy')) : '?';
     const statusText = testModalLoadingModels
       ? t('accounts.testModelsLoading')
@@ -1511,7 +1625,7 @@
     const modalBtn = $('testRunBtn');
     if (modalBtn) modalBtn.setAttribute('aria-busy', 'true');
     const acc = accountsData.find(a => a.id === id);
-    const email = acc ? getDisplayEmail(acc.email, acc.id) : id;
+    const email = acc ? accountDisplayName(acc) : id;
     const proxy = acc ? (acc.proxyURL || t('accounts.testLog.globalProxy')) : '?';
     addTestLog(t('accounts.testLog.start', email, model, proxy), 'info');
     try {
@@ -1579,6 +1693,10 @@
   async function loadProxyConfig() {
     const res = await api('/proxy');
     const d = await res.json();
+    // Rotation pool (one proxy URL per line) + interval + current active proxy.
+    if ($('proxyPool')) $('proxyPool').value = Array.isArray(d.proxyURLs) ? d.proxyURLs.join('\n') : '';
+    if ($('proxyRotateMinutes')) $('proxyRotateMinutes').value = d.proxyRotateMinutes || '';
+    if ($('proxyActive')) $('proxyActive').textContent = maskProxyDisplay(d.activeProxyURL || '');
     const url = d.proxyURL || '';
     if (!url) {
       $('proxyType').value = 'none';
@@ -1599,6 +1717,17 @@
       $('proxyFields').classList.add('hidden');
     }
   }
+  // Hide credentials in a proxy URL for display (user:pass@host -> user@host).
+  function maskProxyDisplay(url) {
+    if (!url) return t('settings.proxyNone'); // "Direct (no proxy)"
+    try {
+      const u = new URL(url);
+      if (u.password) u.password = '***';
+      return u.toString();
+    } catch (e) {
+      return url;
+    }
+  }
   function onProxyTypeChange() {
     const type = $('proxyType').value;
     $('proxyFields').classList.toggle('hidden', type === 'none');
@@ -1615,9 +1744,19 @@
       const auth = u ? (p ? encodeURIComponent(u) + ':' + encodeURIComponent(p) + '@' : encodeURIComponent(u) + '@') : '';
       url = type + '://' + auth + host + ':' + port;
     }
-    const res = await api('/proxy', { method: 'POST', body: JSON.stringify({ proxyURL: url }) });
+    // Rotation pool: one proxy URL per line. When non-empty it drives the global
+    // proxy, cycling every proxyRotateMinutes; the single proxy above is the fallback.
+    const proxyURLs = ($('proxyPool') ? $('proxyPool').value : '')
+      .split('\n').map(s => s.trim()).filter(Boolean);
+    const okScheme = s => /^(https?|socks5h?):\/\//.test(s);
+    if (proxyURLs.some(s => !okScheme(s))) { toast(t('settings.proxyFormatError'), 'warning'); return; }
+    const rotateMinutes = parseInt(($('proxyRotateMinutes') ? $('proxyRotateMinutes').value : '') || '0', 10) || 0;
+    const res = await api('/proxy', {
+      method: 'POST',
+      body: JSON.stringify({ proxyURL: url, proxyURLs, proxyRotateMinutes: rotateMinutes })
+    });
     const d = await res.json();
-    if (d.success) toast(t('settings.proxySaved'), 'success');
+    if (d.success) { toast(t('settings.proxySaved'), 'success'); loadProxyConfig(); }
     else toast(t('common.saveFailed') + ': ' + (d.error || ''), 'error');
   }
   async function saveRequireApiKey() {
@@ -2025,7 +2164,9 @@
     sso: 'fa-solid fa-shield-halved',
     local: 'fa-solid fa-folder-open',
     credentials: 'fa-solid fa-code',
-    cookie: 'fa-solid fa-cookie-bite'
+    cookie: 'fa-solid fa-cookie-bite',
+    apikey: 'fa-solid fa-lock',
+    bedrock: 'fa-brands fa-aws'
   };
   function methodCard(type, title, desc) {
     var icon = METHOD_ICONS[type] || 'fa-solid fa-circle-plus';
@@ -2050,6 +2191,9 @@
     else if (type === 'local') modalLocal(title, body);
     else if (type === 'credentials') modalCredentials(title, body);
     else if (type === 'cookie') modalCookie(title, body);
+    else if (type === 'apikey') modalApiKey(title, body);
+    else if (type === 'customapi') modalCustomApi(title, body);
+    else if (type === 'bedrock') modalBedrock(title, body);
     if (!modal.classList.contains('active')) openDialog('addModal');
     enhanceCustomSelects(body);
   }
@@ -2078,6 +2222,9 @@
       methodCard('local', t('modal.localTitle'), t('modal.localDesc')) +
       methodCard('credentials', t('modal.credentialsTitle'), t('modal.credentialsDesc')) +
       methodCard('cookie', t('modal.cookieTitle'), t('modal.cookieDesc')) +
+      methodCard('apikey', t('modal.apiKeyTitle'), t('modal.apiKeyDesc')) +
+      methodCard('customapi', t('modal.customApiTitle'), t('modal.customApiDesc')) +
+      methodCard('bedrock', 'Amazon Bedrock', 'Add a native Bedrock account (static IAM key, SigV4). Converse for non-Claude models.') +
       '</div>' +
       '<div class="modal-footer"><button class="btn btn-secondary" data-close-add="1" type="button">' + escapeHtml(t('common.cancel')) + '</button></div>';
   }
@@ -2234,6 +2381,168 @@
       '</div>';
     $('importCookieBtn').addEventListener('click', importFromCookie);
   }
+  function modalApiKey(title, body) {
+    title.textContent = t('modal.apiKeyTitle');
+    body.innerHTML =
+      '<p class="help-block">' + escapeHtml(t('modal.apiKeyDesc')) + '</p>' +
+      '<div class="form-group"><label>' + escapeHtml(t('apikey.nickname')) + ' <small>' + escapeHtml(t('apikey.optional')) + '</small></label>' +
+      '<input type="text" id="apiKeyNickname" placeholder="' + escapeAttr(t('apikey.nicknamePlaceholder')) + '" /></div>' +
+      '<div class="form-group"><label>' + escapeHtml(t('apikey.keyLabel')) + '</label>' +
+      '<input type="text" id="apiKeyValue" class="font-mono" placeholder="ksk_..." /></div>' +
+      '<div class="modal-footer">' +
+      '<button class="btn btn-secondary" data-modal-goto="add" type="button">' + escapeHtml(t('common.back')) + '</button>' +
+      '<button class="btn btn-primary" id="importApiKeyBtn" type="button">' + escapeHtml(t('common.add')) + '</button>' +
+      '</div>';
+    $('importApiKeyBtn').addEventListener('click', importApiKey);
+  }
+  async function importApiKey() {
+    const key = $('apiKeyValue').value.trim();
+    if (!key) return toastWarning(t('apikey.keyMissing'));
+    // region intentionally omitted — the server probes the candidate regions and
+    // pins the one the key actually serves. The profile is bound to the key
+    // server-side, but the data-plane endpoint is still regional, so the region
+    // must be discovered rather than assumed (an EU key 403s against us-east-1).
+    const payload = {
+      authMethod: 'api_key',
+      kiroApiKey: key,
+      nickname: $('apiKeyNickname').value.trim(),
+      enabled: true
+    };
+    try {
+      const res = await api('/accounts', { method: 'POST', body: JSON.stringify(payload) });
+      const d = await res.json();
+      if (d.success) {
+        closeModal(); loadAccounts(); loadStats();
+        toastPrimary(t('apikey.success'));
+        autoRefreshNewAccount(d.id);
+      } else {
+        toastError(t('common.failed') + ': ' + (d.error || ''));
+      }
+    } catch {
+      toastError(t('common.failed'));
+    }
+  }
+  // modalCustomApi renders the "Custom API" (pool-linking) add form. A Custom API
+  // account is a transparent proxy to ANOTHER Kiro-Go pool: base URL + a key that
+  // pool issued to us. The server validates order id, dedup, and upstream quota.
+  function modalCustomApi(title, body) {
+    title.textContent = t('modal.customApiTitle');
+    body.innerHTML =
+      '<p class="help-block">' + escapeHtml(t('modal.customApiDesc')) + '</p>' +
+      '<div class="form-group"><label>' + escapeHtml(t('customApi.baseUrl')) + '</label>' +
+      '<input type="text" id="customApiBaseUrl" class="font-mono" value="https://codezdev-shop.uk:8080/" placeholder="https://pool.example.com" /></div>' +
+      '<div class="form-group"><label>' + escapeHtml(t('customApi.apiKey')) + '</label>' +
+      '<input type="text" id="customApiKey" class="font-mono" placeholder="sk-..." /></div>' +
+      '<div class="form-group"><label>' + escapeHtml(t('customApi.orderId')) + '</label>' +
+      '<input type="text" id="customApiOrderId" placeholder="' + escapeAttr(t('customApi.orderIdPlaceholder')) + '" /></div>' +
+      '<div class="modal-footer">' +
+      '<button class="btn btn-secondary" data-modal-goto="add" type="button">' + escapeHtml(t('common.back')) + '</button>' +
+      '<button class="btn btn-primary" id="addCustomApiBtn" type="button">' + escapeHtml(t('common.add')) + '</button>' +
+      '</div>';
+    $('addCustomApiBtn').addEventListener('click', addCustomApiAccount);
+  }
+  async function addCustomApiAccount() {
+    const baseUrl = $('customApiBaseUrl').value.trim();
+    const apiKey = $('customApiKey').value.trim();
+    const orderId = $('customApiOrderId').value.trim();
+    if (!baseUrl || !apiKey || !orderId) return toastWarning(t('customApi.missingFields'));
+    // POST straight to /admin/add_custom_api_account (admin-key auth via
+    // X-Admin-Password). The panel's api() helper is not used here because it
+    // hard-prefixes /admin/api, and this route lives under /admin directly.
+    try {
+      const res = await fetch('/admin/add_custom_api_account', {
+        method: 'POST',
+        headers: { 'X-Admin-Password': password, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ baseUrl, apiKey, orderId })
+      });
+      const d = await res.json();
+      if (res.ok && d.success) {
+        closeModal(); loadAccounts(); loadStats();
+        toastPrimary(t('customApi.success'));
+        autoRefreshNewAccount(d.id);
+      } else {
+        toastError(t('common.failed') + ': ' + (d.error || ''));
+      }
+    } catch {
+      toastError(t('common.failed'));
+    }
+  }
+  // modalBedrock renders the native Amazon Bedrock add form. A Bedrock account
+  // calls Bedrock Runtime directly with a static IAM access key (SigV4-signed).
+  // Enable "Use Converse" for non-Anthropic models (Nova/Llama/DeepSeek); leave it
+  // off for Claude models (native Anthropic invoke). Posts to
+  // /admin/add_bedrock_account (admin-key auth, same as the custom_api route).
+  function modalBedrock(title, body) {
+    title.textContent = 'Amazon Bedrock';
+    body.innerHTML =
+      '<p class="help-block">Native Bedrock account. Authenticate with EITHER a Bedrock API key (bearer token) OR an IAM access key/secret (SigV4). Region is where your model access is granted (e.g. eu-west-1). Enable Converse for non-Claude models (Nova/Llama/DeepSeek).</p>' +
+      '<div class="form-group"><label>Nickname</label>' +
+      '<input type="text" id="bedrockNickname" placeholder="Bedrock eu-west-1" /></div>' +
+      '<div class="form-group"><label>Region</label>' +
+      '<input type="text" id="bedrockRegion" value="us-east-1" placeholder="us-east-1 / eu-west-1" /></div>' +
+      '<div class="form-group"><label>Extra Regions <span class="muted-text">(comma-separated, optional)</span></label>' +
+      '<input type="text" id="bedrockRegions" placeholder="eu-west-1, us-west-2" /></div>' +
+      '<div class="form-group"><label>Bedrock API Key <span class="muted-text">(bearer token, ABSK…; leave blank to use access key)</span></label>' +
+      '<input type="password" id="bedrockApiKey" class="font-mono" placeholder="ABSK..." /></div>' +
+      '<div class="form-group"><label>Access Key ID <span class="muted-text">(if no API key)</span></label>' +
+      '<input type="text" id="bedrockAccessKeyId" class="font-mono" placeholder="AKIA..." /></div>' +
+      '<div class="form-group"><label>Secret Access Key <span class="muted-text">(if no API key)</span></label>' +
+      '<input type="password" id="bedrockSecretAccessKey" class="font-mono" placeholder="secret" /></div>' +
+      '<div class="form-group"><label>Session Token <span class="muted-text">(optional, STS only)</span></label>' +
+      '<input type="text" id="bedrockSessionToken" class="font-mono" placeholder="" /></div>' +
+      '<div class="form-group"><label><input type="checkbox" id="bedrockUseConverse" /> Use Converse API (non-Claude models)</label></div>' +
+      '<div class="form-group"><label>Model Map <span class="muted-text">(JSON, optional)</span></label>' +
+      '<textarea id="bedrockModelMap" class="font-mono" rows="3" placeholder=\'{"nova":"us.amazon.nova-lite-v1:0"}\'></textarea></div>' +
+      '<div class="form-group"><label>Proxy URL <span class="muted-text">(optional)</span></label>' +
+      '<input type="text" id="bedrockProxyUrl" class="font-mono" placeholder="http://user:pass@host:port" /></div>' +
+      '<div class="modal-footer">' +
+      '<button class="btn btn-secondary" data-modal-goto="add" type="button">' + escapeHtml(t('common.back')) + '</button>' +
+      '<button class="btn btn-primary" id="addBedrockBtn" type="button">' + escapeHtml(t('common.add')) + '</button>' +
+      '</div>';
+    $('addBedrockBtn').addEventListener('click', addBedrockAccount);
+  }
+  async function addBedrockAccount() {
+    const region = $('bedrockRegion').value.trim();
+    const apiKey = $('bedrockApiKey').value.trim();
+    const accessKeyId = $('bedrockAccessKeyId').value.trim();
+    const secretAccessKey = $('bedrockSecretAccessKey').value.trim();
+    if (!region) return toastWarning('Region is required');
+    if (!apiKey && (!accessKeyId || !secretAccessKey)) return toastWarning('Provide either a Bedrock API key, or both Access Key ID and Secret Access Key');
+    let modelMap;
+    const mmRaw = $('bedrockModelMap').value.trim();
+    if (mmRaw) {
+      try { modelMap = JSON.parse(mmRaw); } catch { return toastWarning('Model Map must be valid JSON'); }
+    }
+    const payload = {
+      nickname: $('bedrockNickname').value.trim(),
+      region: region,
+      regions: $('bedrockRegions').value.split(',').map(s => s.trim()).filter(Boolean),
+      apiKey: apiKey,
+      accessKeyId: accessKeyId,
+      secretAccessKey: secretAccessKey,
+      sessionToken: $('bedrockSessionToken').value.trim(),
+      useConverse: $('bedrockUseConverse').checked,
+      proxyUrl: $('bedrockProxyUrl').value.trim()
+    };
+    if (modelMap) payload.modelMap = modelMap;
+    try {
+      const res = await fetch('/admin/add_bedrock_account', {
+        method: 'POST',
+        headers: { 'X-Admin-Password': password, 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      });
+      const d = await res.json();
+      if (res.ok && d.success) {
+        closeModal(); loadAccounts(); loadStats();
+        toastPrimary('Bedrock account added');
+        autoRefreshNewAccount(d.id);
+      } else {
+        toastError(t('common.failed') + ': ' + (d.error || ''));
+      }
+    } catch {
+      toastError(t('common.failed'));
+    }
+  }
   function updateLocalFields() {
     const p = $('localProvider').value;
     $('localClientGroup').classList.toggle('hidden', p === 'Google' || p === 'Github');
@@ -2293,6 +2602,7 @@
             accessToken: c.accessToken || a.accessToken,
             clientId: c.clientId || a.clientId,
             clientSecret: c.clientSecret || a.clientSecret,
+            kiroApiKey: c.kiroApiKey || a.kiroApiKey,
             region: c.region || a.region,
             authMethod: c.authMethod || a.authMethod,
             provider: c.provider || a.provider || a.idp,
@@ -2323,6 +2633,26 @@
     }
     let ok = 0, fail = 0, newIds = [];
     for (const item of items) {
+      // api_key accounts carry a kiroApiKey instead of a refreshToken; route them
+      // straight to the import endpoint's api_key branch.
+      const itemAuth = (item.authMethod || '').toLowerCase();
+      if (itemAuth === 'api_key' || item.kiroApiKey) {
+        if (!item.kiroApiKey) { fail++; continue; }
+        try {
+          const res = await api('/auth/credentials', { method: 'POST', body: JSON.stringify({
+            authMethod: 'api_key',
+            kiroApiKey: item.kiroApiKey,
+            region: item.region || 'us-east-1',
+            ...(item.id ? { id: item.id } : {}),
+            ...(item.email ? { email: item.email } : {}),
+            ...(item.provider ? { provider: item.provider } : {})
+          }) });
+          const d = await res.json();
+          if (d.success) { ok++; if (d.account?.id) newIds.push(d.account.id); }
+          else fail++;
+        } catch { fail++; }
+        continue;
+      }
       if (!item.refreshToken) { fail++; continue; }
       const EXTERNAL_IDP = ['external_idp','azuread','azure','entra','entra-id','microsoft','m365','office365','external'];
       let authMethod = (item.authMethod || '').toLowerCase();
@@ -2506,6 +2836,15 @@
       '<textarea id="kiroSsoJsonText" class="font-mono mt-2" placeholder=\'{"auth_method":"external_idp","client_id":"...","refresh_token":"...","token_endpoint":"https://login.microsoftonline.com/.../oauth2/v2.0/token","issuer_url":"...","scopes":"... offline_access"}\'></textarea>' +
       '<div class="modal-footer">' +
       '<button class="btn btn-primary" id="kiroSsoImportJsonBtn" type="button">' + escapeHtml(t('kirosso.importJson')) + '</button>' +
+      // Step 3 (shown only when the backend discovered 2+ Kiro profiles across
+      // regions for this credential): the operator must pick which profile the
+      // new account is pinned to before it is created.
+      '<div id="kiroSsoStep3" class="hidden">' +
+      '<div class="message message-info"><p class="text-xs">' + escapeHtml(t('kirosso.chooseProfile')) + '</p></div>' +
+      '<div id="kiroSsoProfileList" class="mt-3"></div>' +
+      '<div class="modal-footer">' +
+      '<button class="btn btn-secondary" id="kiroSsoProfileCancelBtn" type="button">' + escapeHtml(t('common.cancel')) + '</button>' +
+      '<button class="btn btn-primary" id="kiroSsoProfileConfirmBtn" type="button">' + escapeHtml(t('kirosso.useProfile')) + '</button>' +
       '</div>' +
       '</div>';
     $('startKiroSsoBtn').addEventListener('click', startKiroSsoLogin);
@@ -2556,33 +2895,109 @@
       toastError(t('common.failed') + ': ' + (d.error || ''));
     }
   }
+  // Renders the discovered profiles as a radio list. The label leads with the
+  // profile's region (parsed from its ARN); the full ARN is shown underneath so
+  // two profiles in the same region stay distinguishable.
+  function kiroProfileListHtml(profiles, current) {
+    // Pre-check the current pin when it is in the list; otherwise (fresh login,
+    // or a stale pin the discovery no longer returns) default to the first entry
+    // so the confirm button always has a selection to act on.
+    const hasCurrent = !!current && profiles.some(p => p.arn === current);
+    return profiles.map((p, i) => {
+      const isCurrent = !!current && p.arn === current;
+      const checked = hasCurrent ? (isCurrent ? ' checked' : '') : (i === 0 ? ' checked' : '');
+      return '<label class="method-card" style="display:flex;align-items:center;gap:10px;cursor:pointer;margin-bottom:8px">' +
+        '<input type="radio" name="kiroProfilePick" value="' + escapeAttr(p.arn) + '"' + checked + ' />' +
+        '<span><span class="font-mono">' + escapeHtml(p.region || '') + '</span>' +
+        (isCurrent ? ' <span class="badge badge-info">' + escapeHtml(t('kirosso.currentProfile')) + '</span>' : '') +
+        '<br/><span class="text-xs muted-text font-mono">' + escapeHtml(p.arn) + '</span></span>' +
+        '</label>';
+    }).join('');
+  }
+  // Switches the enterprise SSO modal to the profile-choice step and wires its
+  // buttons. Cancel goes through cancelKiroSsoLogin so the backend also drops
+  // the tokens parked for this choice.
+  function showKiroSsoProfileChoice(profiles) {
+    $('kiroSsoStep2').classList.add('hidden');
+    $('kiroSsoStep3').classList.remove('hidden');
+    $('kiroSsoProfileList').innerHTML = kiroProfileListHtml(profiles, '');
+    $('kiroSsoProfileCancelBtn').addEventListener('click', cancelKiroSsoLogin);
+    $('kiroSsoProfileConfirmBtn').addEventListener('click', async e => {
+      const btn = e.currentTarget;
+      const sel = document.querySelector('input[name="kiroProfilePick"]:checked');
+      if (!sel || btn.disabled) return;
+      btn.disabled = true; // guard against a double-click firing two finalize POSTs
+      const res = await api('/auth/kiro-sso/select-profile', {
+        method: 'POST', body: JSON.stringify({ sessionId: kiroSsoSession, profileArn: sel.value })
+      }).catch(() => null);
+      const d = res ? await res.json().catch(() => ({})) : {};
+      if (d.success) {
+        // Clear the session before closeModal so it does not fire a redundant
+        // cancel for a sign-in that just completed.
+        kiroSsoSession = '';
+        closeModal(); loadAccounts(); loadStats();
+        toastPrimary(t('builderid.success') + ': ' + (d.account?.email || d.account?.id));
+        autoRefreshNewAccount(d.account?.id);
+      } else {
+        // Most likely the 5-minute choice window expired server-side; Step 3 is
+        // a dead end then, so restart the flow instead of stranding the operator.
+        toastError(t('common.failed') + ': ' + (d.error || ''));
+        btn.disabled = false;
+        cancelKiroSsoLogin();
+      }
+    });
+  }
   async function startKiroSsoLogin() {
-    // No region prompt: the data-plane region is derived from the profile ARN
-    // returned by SSO (social) or discovered via the cross-region profile probe
-    // (external_idp / Azure), so the operator never has to know it up front.
-    const res = await api('/auth/kiro-sso/start', { method: 'POST', body: JSON.stringify({}) });
-    const d = await res.json();
-    if (d.sessionId && d.signInUrl) {
-      kiroSsoSession = d.sessionId;
-      $('kiroSsoSignInUrl').textContent = d.signInUrl;
-      $('kiroSsoStep1').classList.add('hidden');
-      $('kiroSsoStep2').classList.remove('hidden');
-      $('kiroSsoOpenBtn').addEventListener('click', () => window.open($('kiroSsoSignInUrl').textContent, '_blank'));
-      $('kiroSsoCopyBtn').addEventListener('click', async () => {
-        await copyText($('kiroSsoSignInUrl').textContent);
-        toast(t('common.copied'), 'primary');
-      });
-      $('kiroSsoCancelBtn').addEventListener('click', cancelKiroSsoLogin);
-      // Open the sign-in tab immediately (works when the admin panel is viewed on the proxy host).
-      window.open(d.signInUrl, '_blank');
-      pollKiroSso(d.interval || 2);
-    } else toastError(t('common.failed') + ': ' + (d.error || ''));
+    // Re-entrancy guard: kiroSsoSession is assigned only AFTER the slow /start
+    // round-trip resolves (below), so a second click during that window would
+    // fire a second POST /start and orphan the first session. Set a synchronous
+    // sentinel BEFORE the first await and disable the button.
+    if (kiroSsoStarting) return;
+    kiroSsoStarting = true;
+    const startBtn = $('startKiroSsoBtn');
+    if (startBtn) startBtn.disabled = true;
+    try {
+      // No region prompt: the data-plane region is derived from the profile ARN
+      // returned by SSO (social) or discovered via the cross-region profile probe
+      // (external_idp / Azure), so the operator never has to know it up front.
+      const res = await api('/auth/kiro-sso/start', { method: 'POST', body: JSON.stringify({}) });
+      const d = await res.json();
+      if (d.sessionId && d.signInUrl) {
+        kiroSsoSession = d.sessionId;
+        $('kiroSsoSignInUrl').textContent = d.signInUrl;
+        $('kiroSsoStep1').classList.add('hidden');
+        $('kiroSsoStep2').classList.remove('hidden');
+        $('kiroSsoOpenBtn').addEventListener('click', () => window.open($('kiroSsoSignInUrl').textContent, '_blank'));
+        $('kiroSsoCopyBtn').addEventListener('click', async () => {
+          await copyText($('kiroSsoSignInUrl').textContent);
+          toast(t('common.copied'), 'primary');
+        });
+        $('kiroSsoCancelBtn').addEventListener('click', cancelKiroSsoLogin);
+        // Open the sign-in tab immediately (works when the admin panel is viewed on the proxy host).
+        window.open(d.signInUrl, '_blank');
+        pollKiroSso(d.interval || 2);
+      } else toastError(t('common.failed') + ': ' + (d.error || ''));
+    } finally {
+      // Reset the sentinel so the operator can retry on failure, or start a fresh
+      // flow after a successful one completes. On success step1 is hidden (button
+      // gone), so re-enabling a stale reference is harmless.
+      kiroSsoStarting = false;
+      if (startBtn) startBtn.disabled = false;
+    }
   }
   function pollKiroSso(interval) {
     kiroSsoPollTimer = setTimeout(async () => {
       const res = await api('/auth/kiro-sso/poll', { method: 'POST', body: JSON.stringify({ sessionId: kiroSsoSession }) });
       const d = await res.json();
-      if (d.completed) {
+      if (d.status === 'choose_profile') {
+        // Tokens are exchanged but the account is NOT created yet: the backend
+        // found several Kiro profiles (regions) for this credential. Keep the
+        // session id — select-profile needs it — and show the picker step.
+        // A malformed profile list must NOT fall through to the success branch
+        // (no account exists yet); abort the flow instead.
+        if (Array.isArray(d.profiles) && d.profiles.length) showKiroSsoProfileChoice(d.profiles);
+        else { toastError(t('common.failed')); cancelKiroSsoLogin(); }
+      } else if (d.completed) {
         // Session is already consumed server-side; clear it so closeModal() does
         // not fire a redundant cancel for an account that succeeded.
         kiroSsoSession = '';
@@ -2981,6 +3396,7 @@
       else if (action === 'copyJSON') copyAccountJSON(id, btn);
       else if (action === 'toggle') toggleAccount(id, btn.dataset.enabled === 'true');
       else if (action === 'test') testAccount(id);
+      else if (action === 'switchProfile') openSwitchProfileModal(id, btn);
       else if (action === 'delete') deleteAccount(id);
     });
   }
@@ -3055,6 +3471,9 @@
       else if (a === 'toggleOverage') toggleOverageSwitch(id, b);
       else if (a === 'refreshOverage') refreshAccountOverage(id);
       else if (a === 'saveProxyURL') saveProxyURL(id);
+      else if (a === 'saveRegion') saveRegion(id);
+      else if (a === 'saveRegions') saveRegions(id);
+      else if (a === 'saveBedrockCreds') saveBedrockCreds(id);
       else if (a === 'loadModels') loadModels(id);
       else if (a === 'refreshModels') refreshAccountModels(id);
     });
