@@ -1444,6 +1444,43 @@ func SetExternalUsageState(id string, st ExternalUsageState) error {
 	return nil
 }
 
+// UpdateAccountIdentity backfills ONLY the upstream identity labels (email and
+// Kiro user ID) for an account. Interactive IAM Identity Center logins resolve
+// identity against the portal region before any profile is known, which fails for
+// tenants whose CodeWhisperer profile lives in a different region — leaving the
+// account with a blank email in the admin UI. This setter exists so that backfill
+// touches nothing else: it must never disturb tokens, usage, ban state, or the
+// atomic profile routing tuple. Blank values are ignored rather than clearing an
+// already-known label. In-memory state rolls back when the durable write fails.
+func UpdateAccountIdentity(id, email, userID string) error {
+	email = strings.TrimSpace(email)
+	userID = strings.TrimSpace(userID)
+	if email == "" && userID == "" {
+		return nil
+	}
+	cfgLock.Lock()
+	defer cfgLock.Unlock()
+	for i := range cfg.Accounts {
+		if cfg.Accounts[i].ID == id {
+			prevEmail := cfg.Accounts[i].Email
+			prevUserID := cfg.Accounts[i].UserId
+			if email != "" {
+				cfg.Accounts[i].Email = email
+			}
+			if userID != "" {
+				cfg.Accounts[i].UserId = userID
+			}
+			if err := Save(); err != nil {
+				cfg.Accounts[i].Email = prevEmail
+				cfg.Accounts[i].UserId = prevUserID
+				return err
+			}
+			return nil
+		}
+	}
+	return nil
+}
+
 // UpdateAccountInfo updates an account's subscription and usage information.
 // Called after refreshing account data from Kiro API.
 func UpdateAccountInfo(id string, info AccountInfo) error {

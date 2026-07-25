@@ -83,16 +83,39 @@ func TestKiroProfileRegionCandidatesNoRegion(t *testing.T) {
 	assertOrder(t, got, []string{"us-east-1", "eu-central-1"})
 }
 
-// TestKiroProfileRegionCandidatesSingleRegionAuthMethods checks that idc/social/
-// Builder ID accounts — which already carry their authoritative region — are probed
-// against that single region only, with no fallback probing.
+// TestKiroProfileRegionCandidatesSingleRegionAuthMethods checks that the auth
+// methods which genuinely carry an authoritative profile region are probed against
+// that single region only, with no fallback probing.
+//
+// idc is deliberately NOT in this set: an IAM Identity Center credential carries
+// the SSO PORTAL region, which is independent of where the tenant's CodeWhisperer
+// profile lives (see TestKiroProfileRegionCandidatesIdCProbesFallbackRegions).
 func TestKiroProfileRegionCandidatesSingleRegionAuthMethods(t *testing.T) {
-	for _, method := range []string{"idc", "social", "builderId", ""} {
+	for _, method := range []string{"social", ""} {
 		got := kiroProfileRegionCandidates(&config.Account{AuthMethod: method, Region: "eu-central-1"})
 		if len(got) != 1 || got[0] != "eu-central-1" {
 			t.Fatalf("authMethod %q: candidate regions = %v, want [eu-central-1] only", method, got)
 		}
 	}
+	// Builder ID cannot list profiles in ANY region, so extra probing would only
+	// repeat a known-403 call.
+	got := kiroProfileRegionCandidates(&config.Account{AuthMethod: "idc", Provider: "BuilderId", Region: "eu-central-1"})
+	if len(got) != 1 || got[0] != "eu-central-1" {
+		t.Fatalf("Builder ID candidate regions = %v, want [eu-central-1] only", got)
+	}
+}
+
+// TestKiroProfileRegionCandidatesIdCProbesFallbackRegions pins the regression that
+// made an imported IAM Identity Center account show no profile. The account's
+// region is the SSO portal region (observed: ssoins-*.us-east-1.portal.amazonaws.com
+// => us-east-1) while ListAvailableProfiles returns ZERO profiles there and the
+// tenant's only profile is in eu-central-1. Probing just the portal region yields an
+// empty list and "no available Kiro profile", so idc must probe fallbacks.
+func TestKiroProfileRegionCandidatesIdCProbesFallbackRegions(t *testing.T) {
+	// No provider label at all: this is exactly what the interactive IAM Identity
+	// Center login records.
+	got := kiroProfileRegionCandidates(&config.Account{AuthMethod: "idc", Region: "us-east-1"})
+	assertOrder(t, got, []string{"us-east-1", "eu-central-1"})
 }
 
 // TestKiroProfileRegionCandidatesEnvOverride checks KIRO_PROFILE_REGIONS replaces
@@ -103,9 +126,13 @@ func TestKiroProfileRegionCandidatesEnvOverride(t *testing.T) {
 	// us-east-1 (account) first; env values de-duplicated and trimmed; no built-in defaults.
 	assertOrder(t, got, []string{"us-east-1", "eu-west-1", "ap-south-1"})
 
-	// A non-external_idp account ignores the env fallbacks entirely.
-	got = kiroProfileRegionCandidates(&config.Account{AuthMethod: "idc", Region: "us-east-1"})
+	// An account whose region IS authoritative ignores the env fallbacks entirely.
+	got = kiroProfileRegionCandidates(&config.Account{AuthMethod: "social", Region: "us-east-1"})
 	assertOrder(t, got, []string{"us-east-1"})
+
+	// An idc account has an unreliable (portal) region, so it honors the env list.
+	got = kiroProfileRegionCandidates(&config.Account{AuthMethod: "idc", Region: "us-east-1"})
+	assertOrder(t, got, []string{"us-east-1", "eu-west-1", "ap-south-1"})
 }
 
 // TestKiroProfileRegionCandidatesEnterpriseIdC checks that a Kiro IDE
@@ -118,10 +145,11 @@ func TestKiroProfileRegionCandidatesEnterpriseIdC(t *testing.T) {
 	got := kiroProfileRegionCandidates(&config.Account{AuthMethod: "idc", Provider: "Enterprise", Region: "eu-central-1"})
 	assertOrder(t, got, []string{"eu-central-1", "us-east-1"})
 
-	// A plain idc account with a non-Enterprise provider stays single-region.
+	// Builder ID is the one idc provider that stays single-region: profile listing
+	// is unsupported for it in every region.
 	got = kiroProfileRegionCandidates(&config.Account{AuthMethod: "idc", Provider: "BuilderId", Region: "eu-central-1"})
 	if len(got) != 1 || got[0] != "eu-central-1" {
-		t.Fatalf("non-Enterprise idc should stay single-region, got %v", got)
+		t.Fatalf("Builder ID idc should stay single-region, got %v", got)
 	}
 }
 

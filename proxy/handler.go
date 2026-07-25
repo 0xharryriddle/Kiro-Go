@@ -3632,7 +3632,10 @@ func (h *Handler) apiCompleteIamSso(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 获取用户信息
+	// Best-effort identity at login time. For an IAM Identity Center tenant whose
+	// CodeWhisperer profile lives outside the SSO portal region this call cannot
+	// succeed yet (no profileArn, wrong region), so a blank result is expected and
+	// is repaired by hydrateAccountAfterLogin below.
 	email, _, _ := auth.GetUserInfo(accessToken)
 
 	// 创建账号
@@ -3655,6 +3658,11 @@ func (h *Handler) apiCompleteIamSso(w http.ResponseWriter, r *http.Request) {
 		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
 		return
 	}
+
+	// Resolve the profile across regions and backfill identity now that the
+	// account is persisted, so the admin UI shows the real account and profile
+	// instead of an unidentified row with no profile.
+	hydrateAccountAfterLogin(&account)
 
 	h.pool.Reload()
 	json.NewEncoder(w).Encode(map[string]interface{}{
@@ -3929,6 +3937,11 @@ func (h *Handler) apiImportSsoToken(w http.ResponseWriter, r *http.Request) {
 			errors = append(errors, err.Error())
 			continue
 		}
+
+		// Same cross-region profile + identity repair as the interactive IdC login:
+		// the pasted SSO token's region is the portal region, not necessarily the
+		// region the CodeWhisperer profile lives in.
+		hydrateAccountAfterLogin(&account)
 
 		imported = append(imported, map[string]interface{}{
 			"id":    account.ID,

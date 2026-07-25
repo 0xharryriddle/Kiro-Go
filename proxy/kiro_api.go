@@ -219,14 +219,20 @@ func shouldProbeFallbackRegions(account *config.Account) bool {
 	if strings.EqualFold(strings.TrimSpace(account.AuthMethod), "external_idp") {
 		return true
 	}
-	// Kiro IDE "Enterprise" imports (authMethod idc, provider Enterprise) store the
-	// SSO/auth region in their credential cache, which is NOT necessarily where the
-	// profile lives (observed: cache region eu-central-1 but the actual profile is in
-	// us-east-1). Their region is therefore just as unreliable as external_idp's, so
-	// probe fallback regions too — otherwise ListAvailableProfiles returns an empty
-	// list in the (wrong) cached region and the account fails with "no available Kiro
-	// profile" even though a usable profile exists in another region.
-	if strings.EqualFold(strings.TrimSpace(account.Provider), "Enterprise") {
+	// IAM Identity Center accounts (authMethod idc) carry the SSO PORTAL region,
+	// which is NOT necessarily where the CodeWhisperer profile lives. Observed on a
+	// real tenant: portal ssoins-*.us-east-1.portal.amazonaws.com (region us-east-1)
+	// while ListAvailableProfiles returns zero profiles in us-east-1 and the only
+	// profile is arn:aws:codewhisperer:eu-central-1:...  Restricting the probe to the
+	// portal region therefore yields an empty list and the account fails with "no
+	// available Kiro profile" even though a usable profile exists elsewhere. This
+	// covers both the Kiro IDE "Enterprise" import (provider Enterprise) and the
+	// interactive IAM Identity Center login, which records no provider label at all.
+	//
+	// Builder ID is deliberately excluded: profile listing is unsupported for it
+	// across every region, so extra probing would only repeat a known-403 call.
+	if strings.EqualFold(strings.TrimSpace(account.AuthMethod), "idc") &&
+		!strings.EqualFold(strings.TrimSpace(account.Provider), "BuilderId") {
 		return true
 	}
 	return false

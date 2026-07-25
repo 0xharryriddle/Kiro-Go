@@ -233,3 +233,46 @@ func TestReplaceAccountAndDeleteIsAtomic(t *testing.T) {
 		t.Fatalf("temporary account survived replacement: %+v", GetAccounts())
 	}
 }
+
+// TestUpdateAccountIdentityBackfillsWithoutDisturbingRouting pins the identity
+// repair used after an IAM Identity Center login: the portal-region identity call
+// fails when the tenant's profile lives elsewhere, leaving a blank email/userId
+// that must be backfilled later without touching tokens or the profile tuple.
+func TestUpdateAccountIdentityBackfillsWithoutDisturbingRouting(t *testing.T) {
+	if err := Init(filepath.Join(t.TempDir(), "config.json")); err != nil {
+		t.Fatalf("init config: %v", err)
+	}
+	account := Account{
+		ID:             "idc-login",
+		AuthMethod:     "idc",
+		Region:         "us-east-1",
+		AccessToken:    "at",
+		ProfileArn:     "arn:aws:codewhisperer:eu-central-1:123456789012:profile/real",
+		ProfilePinned:  true,
+		RegionOverride: "eu-central-1",
+	}
+	if err := AddAccount(account); err != nil {
+		t.Fatalf("add account: %v", err)
+	}
+
+	if err := UpdateAccountIdentity(account.ID, "user@example.com", "d-1.abc"); err != nil {
+		t.Fatalf("backfill identity: %v", err)
+	}
+	got, _ := GetAccountByID(account.ID)
+	if got.Email != "user@example.com" || got.UserId != "d-1.abc" {
+		t.Fatalf("identity not backfilled: %+v", got)
+	}
+	if got.ProfileArn != account.ProfileArn || !got.ProfilePinned ||
+		got.RegionOverride != account.RegionOverride || got.AccessToken != account.AccessToken {
+		t.Fatalf("identity backfill disturbed routing/credential state: %+v", got)
+	}
+
+	// Blank values must never erase an already-known label.
+	if err := UpdateAccountIdentity(account.ID, "", ""); err != nil {
+		t.Fatalf("no-op backfill: %v", err)
+	}
+	got, _ = GetAccountByID(account.ID)
+	if got.Email != "user@example.com" || got.UserId != "d-1.abc" {
+		t.Fatalf("blank backfill cleared identity: %+v", got)
+	}
+}

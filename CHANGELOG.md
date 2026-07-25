@@ -8,6 +8,23 @@ follows [Keep a Changelog](https://keepachangelog.com/).
 ### Fixed
 
 - Made credential replacement a single durable config transaction, rolled back ordinary account updates on save failure, rejected cross-region profile discovery mismatches, and prevented stale admin profile/API-key responses from rendering after modal changes.
+- **IAM Identity Center accounts showed the wrong account with no profile.** An IdC
+  credential carries the SSO *portal* region, which is independent of the region
+  hosting the tenant's CodeWhisperer profile. Profile discovery was pinned to the
+  portal region for every `idc` account, so a tenant whose portal is in `us-east-1`
+  but whose only profile lives in `eu-central-1` got an empty profile list and failed
+  with "no available Kiro profile". `idc` accounts now probe fallback regions like
+  `external_idp` does (Builder ID still stays single-region, since profile listing is
+  unsupported for it everywhere). Previously this fallback was granted only to Kiro
+  IDE imports labelled `provider: Enterprise`, so the interactive IAM Identity Center
+  login — which records no provider label — was left broken.
+- **IdC logins landed with a blank email and user ID.** Identity was fetched at login
+  time against the portal region before any profile was known, which fails with
+  `403 User is not authorized to make this call` for those same tenants, leaving an
+  unidentified account row in the admin UI. Interactive IdC login and SSO-token import
+  now resolve the profile first, then backfill identity from that profile's region via
+  an additive `UpdateAccountIdentity` write that never disturbs tokens, usage, ban
+  state, or the profile routing tuple.
 
 ### Added
 - **Upstream Kiro-issued API-key authentication.** Accounts can now authenticate to
