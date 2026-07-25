@@ -1,7 +1,6 @@
 package proxy
 
 import (
-	"encoding/csv"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -2954,6 +2953,8 @@ func (h *Handler) handleAdminAPI(w http.ResponseWriter, r *http.Request) {
 		h.apiGetAuditLogs(w, r)
 	case path == "/logs" && r.Method == "DELETE":
 		h.apiClearLogs(w, r)
+	case path == "/logs/facets" && r.Method == "GET":
+		h.apiGetLogsFacets(w, r)
 	case strings.HasPrefix(path, "/logs/") && r.Method == "GET":
 		h.apiGetTraceDetail(w, r, strings.TrimPrefix(path, "/logs/"))
 	case path == "/generate-machine-id" && r.Method == "GET":
@@ -5146,31 +5147,68 @@ func filterRequestLogs(logs []RequestLog, status, query string, limit int) []Req
 	return filtered
 }
 
+// apiGetLogs serves GET /admin/api/logs with structured filters and pagination.
+//
+// Previously this ran a linear substring scan over the whole ring with the limit
+// hardcoded to 0 (unbounded), so the UI always fetched every retained record and
+// operators could only narrow by typing substrings. Filters, time windows, a
+// clamped limit, and an opaque newest-first cursor now live in trace_query.go.
+//
+// The legacy logs/count/persistedPath keys are preserved so the existing
+// frontend keeps working while it migrates to the paginated shape.
 func (h *Handler) apiGetLogs(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
-	logs := filterRequestLogs(h.getRequestLogs(), q.Get("status"), q.Get("q"), 0)
+	filter := parseTraceQuery(q.Get)
+	page := queryRequestLogs(h.getRequestLogs(), filter)
+
 	format := strings.ToLower(q.Get("format"))
-	if format == "csv" {
+	switch format {
+	case "csv":
 		w.Header().Set("Content-Type", "text/csv; charset=utf-8")
 		w.Header().Set("Content-Disposition", "attachment; filename=kiro-go-request-logs.csv")
-		cw := csv.NewWriter(w)
-		_ = cw.Write([]string{"time", "endpoint", "model", "accountId", "accountEmail", "status", "errorType", "error", "tokens", "credits", "durationMs"})
-		for _, log := range logs {
-			_ = cw.Write([]string{
-				fmt.Sprintf("%d", log.Time), log.Endpoint, log.Model, log.AccountID, log.AccountEmail, log.Status, log.ErrorType, log.Error,
-				fmt.Sprintf("%d", log.Tokens), fmt.Sprintf("%.6f", log.Credits), fmt.Sprintf("%d", log.Duration),
-			})
-		}
-		cw.Flush()
+		writeTraceCSV(w, page.Logs)
 		return
-	}
-	if format == "json" {
+	case "attempts-csv":
+		// One row per upstream attempt, joined by trace ID: this is the export
+		// that makes a failover chain analysable in a spreadsheet.
+		w.Header().Set("Content-Type", "text/csv; charset=utf-8")
+		w.Header().Set("Content-Disposition", "attachment; filename=kiro-go-request-attempts.csv")
+		writeTraceAttemptsCSV(w, page.Logs)
+		return
+	case "json":
 		w.Header().Set("Content-Disposition", "attachment; filename=kiro-go-request-logs.json")
 	}
-	json.NewEncoder(w).Encode(map[string]interface{}{
-		"logs":          logs,
-		"count":         len(logs),
+
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		"success": true,
+		// Backward-compatible keys.
+		"logs":          page.Logs,
+		"count":         len(page.Logs),
 		"persistedPath": requestLogsPath,
+		// Pagination metadata.
+		"total":      page.Total,
+		"limit":      filter.Limit,
+		"nextCursor": page.NextCursor,
+		"hasMore":    page.HasMore,
+		"dropped":    h.traceStore.Dropped(),
+	})
+}
+
+// apiGetLogsFacets serves GET /admin/api/logs/facets: the distinct values present
+// in the retained window, so the UI can offer dropdowns instead of making an
+// operator guess substrings.
+func (h *Handler) apiGetLogsFacets(w http.ResponseWriter, r *http.Request) {
+	facets := computeTraceFacets(h.getRequestLogs())
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		"success":     true,
+		"models":      facets.Models,
+		"apis":        facets.APIs,
+		"accounts":    facets.Accounts,
+		"errorTypes":  facets.ErrorTypes,
+		"outcomes":    facets.Outcomes,
+		"captureMode": config.GetTraceCaptureMode(),
 	})
 }
 
