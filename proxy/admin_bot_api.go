@@ -1105,7 +1105,16 @@ func (h *Handler) handleAdminAddKiroAccount(w http.ResponseWriter, r *http.Reque
 		if account.Provider != "" {
 			updated.Provider = account.Provider
 		}
-		if account.ProfileArn != "" {
+		// An operator-pinned profile is NOT moved by a re-upload. The dedicated
+		// setter refuses this exact write (UpdateAccountProfileArn returns
+		// "account profile is manually pinned"), and this path must not become a
+		// back door around it: the whole point of pinning is that automatic
+		// resolution stops choosing for the operator.
+		//
+		// Note this only became reachable when the write below moved from
+		// UpdateAccount to ReplaceAccount — UpdateAccount preserved the stored
+		// ProfileArn, so this assignment was previously a silent no-op.
+		if account.ProfileArn != "" && !updated.ProfilePinned {
 			updated.ProfileArn = account.ProfileArn
 		}
 		if nickname := strings.TrimSpace(req.Nickname); nickname != "" {
@@ -1120,7 +1129,22 @@ func (h *Handler) handleAdminAddKiroAccount(w http.ResponseWriter, r *http.Reque
 		// MachineId is deliberately NOT regenerated — it is a stable per-account
 		// device identity for upstream request tracking, and churning it on every
 		// re-upload would make one account look like a fleet of new machines.
-		if err := config.UpdateAccount(existing.ID, updated); err != nil {
+		//
+		// The fingerprint must travel with the credential it identifies. Leaving
+		// the previous token's fingerprint in place would keep the slot matching
+		// the OLD credential for dedup purposes, so a later re-upload of the
+		// SAME fresh token would not be recognised as this account.
+		updated.RefreshTokenFingerprint = config.RefreshTokenFingerprint(updated.RefreshToken)
+		// ReplaceAccount, NOT UpdateAccount: this is the one write on this route
+		// that legitimately changes credentials. UpdateAccount deliberately
+		// preserves the stored credential state (so a stale status snapshot
+		// cannot roll back a refresh-token rotation that landed concurrently) and
+		// therefore silently discarded every field adopted above — the endpoint
+		// answered 200 with duplicate:true while the slot kept its dead token,
+		// which is exactly the "repair silently no-ops" failure the adoption
+		// logic exists to prevent. ReplaceAccount is the documented path for an
+		// operator-confirmed whole-row replacement like this one.
+		if err := config.ReplaceAccount(existing.ID, updated); err != nil {
 			w.WriteHeader(http.StatusInternalServerError)
 			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
 			return

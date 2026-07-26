@@ -73,6 +73,15 @@ var kiroEndpoints = []kiroEndpoint{
 	},
 }
 
+// kiroCLIEndpoint is the headless / API Key path used by Kiro CLI:
+// POST https://runtime.{region}.kiro.dev/ with AWS JSON 1.0 protocol.
+var kiroCLIEndpoint = kiroEndpoint{
+	URL:       "https://runtime.us-east-1.kiro.dev/",
+	Origin:    "KIRO_CLI",
+	AmzTarget: "AmazonCodeWhispererStreamingService.GenerateAssistantResponse",
+	Name:      "Kiro CLI",
+}
+
 // Global HTTP clients, swappable at runtime to apply proxy reconfiguration without restart.
 var kiroHttpStore atomic.Pointer[http.Client]
 var kiroRestHttpStore atomic.Pointer[http.Client]
@@ -302,12 +311,39 @@ func setPayloadProfileArnForAccount(payload *KiroPayload, account *config.Accoun
 		return
 	}
 
+	// API Key credentials must not carry IDE/profile semantics.
+	if config.IsAPIKeyAccount(account) {
+		payload.ProfileArn = ""
+		return
+	}
+
 	payload.ProfileArn = strings.TrimSpace(payload.ProfileArn)
 	if account != nil {
 		if profileArn := strings.TrimSpace(account.ProfileArn); profileArn != "" {
 			payload.ProfileArn = profileArn
 		}
 	}
+}
+
+// endpointsForAccount returns the upstream endpoint list for a credential.
+// API Key accounts always use the CLI runtime protocol; OAuth accounts keep
+// the configured preferred-endpoint fallback chain.
+func endpointsForAccount(account *config.Account) []kiroEndpoint {
+	if config.IsAPIKeyAccount(account) {
+		return []kiroEndpoint{kiroCLIEndpoint}
+	}
+	return getSortedEndpoints(config.GetPreferredEndpoint())
+}
+
+// cliRuntimeURL builds the regional Kiro CLI runtime URL.
+func cliRuntimeURL(account *config.Account) string {
+	region := "us-east-1"
+	if account != nil {
+		if r := strings.TrimSpace(account.Region); r != "" {
+			region = r
+		}
+	}
+	return fmt.Sprintf("https://runtime.%s.kiro.dev/", region)
 }
 
 // getSortedEndpoints returns endpoints ordered by user preference, with optional fallback.
@@ -428,7 +464,7 @@ func CallKiroAPIWithDiagnostics(account *config.Account, payload *KiroPayload, c
 		callback = &wrapped
 	}
 
-	if payload != nil && strings.TrimSpace(payload.ProfileArn) == "" {
+	if payload != nil && strings.TrimSpace(payload.ProfileArn) == "" && !config.IsAPIKeyAccount(account) {
 		if profileArn, err := ResolveProfileArn(account); err == nil {
 			payload.ProfileArn = profileArn
 		} else if isProfileArnResolutionSoftError(err) {
@@ -450,8 +486,14 @@ func CallKiroAPIWithDiagnostics(account *config.Account, payload *KiroPayload, c
 		return err
 	}
 
-	// Build endpoint list ordered by configuration.
-	endpoints := getSortedEndpoints(config.GetPreferredEndpoint())
+	// MERGE POLICY NOTE (fork ↔ upstream v1.1.5): union. The fork's fail-closed
+	// region-override validation above is kept, and upstream's credential-aware
+	// endpoint selection replaces the fork's unconditional getSortedEndpoints:
+	// endpointsForAccount routes api_key accounts to the Kiro CLI runtime host
+	// instead of the IDE/Q hosts, which is required for those credentials to work
+	// at all. isAPIKey is consumed by the per-endpoint rewrite inside the loop.
+	endpoints := endpointsForAccount(account)
+	isAPIKey := config.IsAPIKeyAccount(account)
 
 	var lastErr error
 	// shrunkForLength guards the one-shot payload reduction below. It is declared
@@ -464,7 +506,11 @@ func CallKiroAPIWithDiagnostics(account *config.Account, payload *KiroPayload, c
 		payload.ConversationState.CurrentMessage.UserInputMessage.Origin = ep.Origin
 
 		// Target the profile's data-plane region; endpoint URLs are declared for us-east-1.
+		// API Key accounts use the CLI runtime host instead of IDE/Q hosts.
 		epURL := regionalizeURLForProfile(ep.URL, account, payload.ProfileArn)
+		if isAPIKey {
+			epURL = cliRuntimeURL(account)
+		}
 
 		reqBody, _ := json.Marshal(payload)
 		req, err := http.NewRequest("POST", epURL, bytes.NewReader(reqBody))
@@ -479,14 +525,25 @@ func CallKiroAPIWithDiagnostics(account *config.Account, payload *KiroPayload, c
 		}
 		headerValues := buildStreamingHeaderValues(account, host)
 
-		req.Header.Set("Content-Type", "application/json")
+		if isAPIKey {
+			req.Header.Set("Content-Type", "application/x-amz-json-1.0")
+		} else {
+			req.Header.Set("Content-Type", "application/json")
+		}
 		req.Header.Set("Accept", "*/*")
 		if ep.AmzTarget != "" {
 			req.Header.Set("X-Amz-Target", ep.AmzTarget)
 		}
 		applyKiroBaseHeaders(req, account, headerValues)
-		req.Header.Set("x-amzn-kiro-agent-mode", "vibe")
-		req.Header.Set("x-amzn-codewhisperer-optout", "true")
+		if !isAPIKey {
+			req.Header.Set("x-amzn-kiro-agent-mode", "vibe")
+		}
+		// CLI captures use optout=false; IDE path keeps true.
+		if isAPIKey {
+			req.Header.Set("x-amzn-codewhisperer-optout", "false")
+		} else {
+			req.Header.Set("x-amzn-codewhisperer-optout", "true")
+		}
 		req.Header.Set("Amz-Sdk-Request", "attempt=1; max=3")
 		req.Header.Set("Amz-Sdk-Invocation-Id", uuid.New().String())
 
@@ -650,8 +707,6 @@ func parseEventStream(body io.Reader, callback *KiroStreamCallback) error {
 	var inputTokens, outputTokens int
 	var totalCredits float64
 	var currentToolUse *toolUseState
-	var lastAssistantContent string
-	var lastReasoningContent string
 
 	// Read the placeholder-reasoning toggle once (not per event). When on
 	// (default), reasoning that is still a pure redaction placeholder ("...") is
@@ -714,27 +769,78 @@ func parseEventStream(body io.Reader, callback *KiroStreamCallback) error {
 
 		// Dispatch by event type.
 		switch eventType {
+		// Both text streams are passed through verbatim: Kiro sends
+		// assistantResponseEvent and reasoningContentEvent as incremental deltas, not
+		// as cumulative snapshots. A dropped stream is retried as a whole new request
+		// rather than resumed from an offset.
+		//
+		// Scope of what the transport actually guarantees: the single TCP connection
+		// carrying the response gives byte ordering and prevents a TRANSPORT-level
+		// retransmission from surfacing as a duplicate event. It says nothing about
+		// the upstream APPLICATION emitting the same event twice -- a producer-side
+		// replay remains possible in principle. Do not read TCP as proof of
+		// at-most-once delivery at the event layer.
+		//
+		// Do NOT reintroduce content-based de-duplication here. At the string level a
+		// replayed chunk is indistinguishable from text that simply repeats itself, so
+		// such a heuristic can only guess -- and when it guesses wrong it silently eats
+		// real output. The previous implementation turned "6666666666" into "666",
+		// "abababab" into "abab" and "1833" into "183", on both streams. The events we
+		// decode carry no sequence number or message id we can use to tell the two
+		// cases apart; extractEventType only reads :event-type, so if a future protocol
+		// revision adds an ordering/version header, CHECK THE DECODED HEADERS before
+		// concluding none exists rather than relying on the base-spec argument.
+		//
+		// MERGE POLICY NOTE (fork ↔ upstream v1.1.5): upstream removed the
+		// normalizeChunk() de-duplication (their #138) and this fork removed it
+		// independently; the two removals agree. The fork's per-chunk
+		// placeholder-reasoning suppression is NOT part of that heuristic and is
+		// retained below.
+		//
+		// Caveat on the delta premise: it is an inference from the protocol shape and
+		// from upstream's own bug report. It is NOT confirmed by the captured traces,
+		// and that was checked rather than assumed: traceRecorder.noteResponseText
+		// stores already-assembled text (request_trace_recorder.go), and a scan of the
+		// full local corpus (9,312 capture files) found ZERO retaining per-frame
+		// boundaries. No capture mode helps -- off/meta/redacted/full govern how much
+		// text is kept, not whether frame boundaries survive, and the boundaries are
+		// destroyed upstream of the recorder. So the corpus cannot settle this
+		// question, no matter how large it grows.
+		//
+		// If doubled text is ever observed in the wild, the fix is NOT "compare the new
+		// chunk against the accumulated buffer": that is still content guessing, and it
+		// silently deletes valid output. Frames ["ha", "haha"] are legitimate deltas
+		// meaning "hahaha", but a prefix-of-accumulator test emits only "ha" and yields
+		// "haha", eating a real chunk -- the same class of bug as normalizeChunk.
+		//
+		// The sound way to settle it is a predicate-only observer, not a mutator: for
+		// ADJACENT non-empty payloads on the same channel, evaluate
+		// strings.HasPrefix(current, previous) in memory and persist only
+		// fixed-cardinality counters (pairs checked, prefix / non-prefix / equal
+		// counts, per event type). ONE same-block non-prefix pair conclusively refutes
+		// the cumulative hypothesis. Compare against the PREVIOUS PAYLOAD, never the
+		// concatenated accumulator. Persist no text, no prefixes, no raw frames and no
+		// content hashes -- reasoning text routinely contains source code and secrets,
+		// and "debug-only" is not an adequate control for retaining it.
 		case "assistantResponseEvent":
 			if content, ok := event["content"].(string); ok && content != "" {
-				normalized := normalizeChunk(content, &lastAssistantContent)
-				if normalized != "" && callback.OnText != nil {
-					callback.OnText(normalized, false)
+				if callback.OnText != nil {
+					callback.OnText(content, false)
 				}
 			}
 		case "reasoningContentEvent":
 			if text, ok := event["text"].(string); ok && text != "" {
-				normalized := normalizeChunk(text, &lastReasoningContent)
-				if normalized != "" && callback.OnText != nil {
+				if callback.OnText != nil {
 					// Suppress ONLY the individual redaction-placeholder deltas
 					// ("...", signature-block markers). This is a per-chunk
 					// decision, not a cumulative-buffer one: every real reasoning
 					// delta flows through, so extended-thinking text is never lost
 					// even when it is interleaved with redacted "..." markers.
 					// Disabled by config toggle.
-					if suppressPlaceholderReasoning && isPlaceholderReasoning(normalized) {
+					if suppressPlaceholderReasoning && isPlaceholderReasoning(text) {
 						// placeholder-only delta carries no information — skip
 					} else {
-						callback.OnText(normalized, true)
+						callback.OnText(text, true)
 					}
 				}
 			}
@@ -860,6 +966,12 @@ func getContextWindowSize(model string) int {
 //     dated snapshot ("claude-sonnet-4-20250514") does not parse as minor
 //     20250514. With an unbounded minor that date compared as ">= 6" and
 //     wrongly promoted a 200K model to a 1M window.
+//
+// MERGE POLICY NOTE (fork ↔ upstream v1.1.5): both sides fixed the same bug
+// (upstream's #140 — major-only ids classifying as 200K) by making the minor
+// group optional. The fork's pattern is kept because it ALSO bounds the minor to
+// two digits with a trailing boundary; upstream's unbounded `(\d+)` still
+// misparses a dated snapshot id as a huge minor and over-promotes it to 1M.
 var claudeVersionExtractor = regexp.MustCompile(`claude-(?:opus|sonnet|haiku)-(\d+)(?:[.-](\d{1,2})(?:\b|_|$))?`)
 
 // isLargeContextModel reports whether a model uses the 1M-token context window.
@@ -874,6 +986,12 @@ func isLargeContextModel(model string) bool {
 	m := strings.ToLower(model)
 	if match := claudeVersionExtractor.FindStringSubmatch(m); match != nil {
 		major, errMaj := strconv.Atoi(match[1])
+		// MERGE POLICY NOTE (fork ↔ upstream v1.1.5): the two sides express the
+		// SAME classification with inverted control flow — upstream nests the whole
+		// decision inside `if errMaj == nil`, the fork guards and falls through to
+		// the equivalent ladder below (major>4 -> 1M, major<4 -> 200K, else minor
+		// >= 6). The fork's shape is kept so the ladder stays un-nested; behaviour
+		// is identical, including treating a bare major as ".0".
 		if errMaj != nil {
 			return false
 		}
@@ -921,51 +1039,6 @@ func collectUsageMaps(v interface{}, out *[]map[string]interface{}) {
 			collectUsageMaps(child, out)
 		}
 	}
-}
-
-func normalizeChunk(chunk string, previous *string) string {
-	if chunk == "" {
-		return ""
-	}
-
-	prev := *previous
-	if prev == "" {
-		*previous = chunk
-		return chunk
-	}
-
-	if chunk == prev {
-		return ""
-	}
-
-	if strings.HasPrefix(chunk, prev) {
-		delta := chunk[len(prev):]
-		*previous = chunk
-		return delta
-	}
-
-	if strings.HasPrefix(prev, chunk) {
-		return ""
-	}
-
-	maxOverlap := 0
-	maxLen := len(prev)
-	if len(chunk) < maxLen {
-		maxLen = len(chunk)
-	}
-	for i := maxLen; i > 0; i-- {
-		if strings.HasSuffix(prev, chunk[:i]) {
-			maxOverlap = i
-			break
-		}
-	}
-
-	*previous = chunk
-	if maxOverlap > 0 {
-		return chunk[maxOverlap:]
-	}
-
-	return chunk
 }
 
 func readTokenNumber(m map[string]interface{}, keys ...string) (int, bool) {

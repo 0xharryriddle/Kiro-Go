@@ -856,8 +856,8 @@ func TestAdminAddKiroAccountRepairsDeadSlot(t *testing.T) {
 		AuthMethod: "external_idp", Region: "eu-central-1",
 		ProfileArn: "arn:aws:codewhisperer:eu-central-1:123456789012:profile/ABCDEF",
 		ClientID:   "cid-old", TokenEndpoint: "https://idp/old", Scopes: "old",
-		Nickname:   "keep-my-nickname",
-		Enabled:    false, BanStatus: "BANNED", BanReason: "Authentication failed - token invalid or expired",
+		Nickname: "keep-my-nickname",
+		Enabled:  false, BanStatus: "BANNED", BanReason: "Authentication failed - token invalid or expired",
 		BanTime: 12345,
 	}
 	if err := config.AddAccount(dead); err != nil {
@@ -908,6 +908,62 @@ func TestAdminAddKiroAccountRepairsDeadSlot(t *testing.T) {
 	}
 }
 
+// A re-upload adopts the fresh credential but must NOT move a profile the operator
+// pinned by hand. config.UpdateAccountProfileArn refuses that write outright
+// ("account profile is manually pinned"), and this route must not become a back
+// door around it: pinning exists precisely so automatic resolution stops choosing.
+//
+// This became reachable only when the adoption write moved from UpdateAccount to
+// ReplaceAccount. UpdateAccount preserved the stored ProfileArn, so the assignment
+// was a silent no-op; ReplaceAccount writes the whole row, so the guard has to be
+// explicit. Neutralizing the `!updated.ProfilePinned` condition fails this test.
+func TestAdminAddKiroAccountDoesNotMovePinnedProfile(t *testing.T) {
+	mustInitConfig(t)
+	config.SetPassword("topsecret")
+	p := accountpool.GetPool()
+	p.Reload()
+	h := &Handler{pool: p}
+
+	const pinnedARN = "arn:aws:codewhisperer:eu-central-1:123456789012:profile/PINNED"
+	const otherARN = "arn:aws:codewhisperer:eu-central-1:123456789012:profile/OTHER"
+	if err := config.AddAccount(config.Account{
+		ID: "pinned-1", Email: "m365@example.com", UserId: "kiro-user-M",
+		AccessToken: "at-old", RefreshToken: "rt-old",
+		AuthMethod: "external_idp", Region: "eu-central-1",
+		ProfileArn: pinnedARN, ProfilePinned: true, RegionOverride: "eu-central-1",
+		ClientID: "cid-old", TokenEndpoint: "https://idp/old", Scopes: "old",
+		Enabled: false,
+	}); err != nil {
+		t.Fatalf("AddAccount: %v", err)
+	}
+
+	origProbe := probeKiroAccount
+	defer func() { probeKiroAccount = origProbe }()
+	probeKiroAccount = func(account *config.Account) (*config.AccountInfo, error) {
+		return &config.AccountInfo{Email: "m365@example.com", UserId: "kiro-user-M"}, nil
+	}
+
+	rec := serve(h, adminReq(http.MethodPost, "/admin/add_kiro_account",
+		`{"account":{"accessToken":"at-fresh","refreshToken":"rt-fresh","authMethod":"external_idp",`+
+			`"region":"eu-central-1","email":"m365@example.com",`+
+			`"profileArn":"`+otherARN+`",`+
+			`"clientId":"cid-new","tokenEndpoint":"https://idp/new","scopes":"new offline_access"},`+
+			`"enabled":false}`, "topsecret"))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	got := config.GetAccounts()[0]
+	// The pin holds.
+	if got.ProfileArn != pinnedARN || !got.ProfilePinned {
+		t.Fatalf("re-upload moved a pinned profile: arn=%q pinned=%v", got.ProfileArn, got.ProfilePinned)
+	}
+	// ...and the credential was still adopted, so the repair is not silently skipped.
+	if got.AccessToken != "at-fresh" || got.RefreshToken != "rt-fresh" || got.ClientID != "cid-new" {
+		t.Fatalf("pin guard blocked the credential adoption too: %+v", got)
+	}
+}
+
 // An OAuth account carries an empty KiroApiKey. Dedup must key on identity, not on
 // that empty string — otherwise the first OAuth account in a region would match
 // every later probe and report a bogus duplicate.
@@ -928,9 +984,14 @@ func TestAdminAddKiroAccountDoesNotDedupeDistinctAccounts(t *testing.T) {
 		}, nil
 	}
 
+	// Each account gets its OWN refresh token. A refresh token is issued per
+	// credential, so two distinct accounts can never legitimately share one, and
+	// AddAccount rejects a repeat as a duplicate credential — reusing one string
+	// here would test that rejection instead of the identity-dedup logic this
+	// test is about.
 	for _, email := range []string{"a@example.com", "b@example.com"} {
 		rec := serve(h, adminReq(http.MethodPost, "/admin/add_kiro_account",
-			`{"account":{"accessToken":"at","refreshToken":"rt",`+
+			`{"account":{"accessToken":"at-`+email+`","refreshToken":"rt-`+email+`",`+
 				`"authMethod":"external_idp","region":"eu-central-1","email":"`+email+`",`+
 				`"profileArn":"arn:aws:codewhisperer:eu-central-1:123456789012:profile/ABCDEF",`+
 				`"clientId":"cid","tokenEndpoint":"https://idp/token","scopes":"s"},"enabled":false}`, "topsecret"))

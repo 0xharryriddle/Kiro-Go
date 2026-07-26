@@ -75,19 +75,13 @@ const (
 	kiroSsoLoginTimeout = 10 * time.Minute
 )
 
-// allowedExternalIdpIssuerSuffixes restricts which IdP issuer/endpoint hosts the
-// enterprise leg will discover and redirect to. The issuer arrives in an
-// attacker-influenceable portal callback query, so it is constrained to known
-// enterprise IdP hosts (Microsoft Entra / Azure AD — the supported provider).
-// This is the primary control against SSRF, open-redirect, and forced-auth abuse
-// via a forged /signin/callback. The leading dot anchors each suffix to a real
-// subdomain boundary so "evil-microsoftonline.com" cannot match. Extend this
-// list to onboard additional enterprise IdPs.
-var allowedExternalIdpIssuerSuffixes = []string{
-	".microsoftonline.com",
-	".microsoftonline.us",
-	".microsoftonline.cn",
-}
+// MERGE POLICY NOTE (fork ↔ upstream v1.1.5): allowedExternalIdpIssuerSuffixes
+// used to be declared here and matched by suffix. The allow-list now lives in
+// validateExternalIdpEndpointStrict (auth/microsoft_sso.go) as an exact-host set,
+// which is the stronger control the same threat model was reaching for: the issuer
+// still arrives in an attacker-influenceable portal callback query, and SSRF /
+// open-redirect / forced-auth abuse via a forged /signin/callback is still the
+// thing being prevented. To onboard another enterprise IdP host, add it there.
 
 // KiroSsoSession holds the transient state for one hosted-portal sign-in attempt.
 type KiroSsoSession struct {
@@ -529,28 +523,21 @@ func (s *KiroSsoSession) handleCallback(w http.ResponseWriter, req *http.Request
 // non-IP, allow-listed enterprise IdP host. It gates the issuer (before
 // discovery) and BOTH discovered endpoints (the authorize URL the browser is
 // 302'd to, and the token endpoint the code is exchanged at).
+//
+// MERGE POLICY NOTE (fork ↔ upstream v1.1.5): the fork's own suffix-matching body
+// used to live here and has been replaced by a delegation to upstream's stricter
+// validateExternalIdpEndpointStrict (auth/microsoft_sso.go). Upstream's version is
+// a superset: it keeps the https + no-IP-literal + allow-list checks and adds
+// exact-host matching, rejection of userinfo, fragments, non-443 ports, opaque and
+// relative URLs. Two consequences are deliberate:
+//
+//   - "login.microsoftonline.cn" is no longer accepted. It never was a real Entra
+//     endpoint; Azure China's login host is "login.partner.microsoftonline.cn",
+//     which upstream allow-lists explicitly. The fork's suffix rule accepted the
+//     bare form only as an accident of matching ".microsoftonline.cn".
+//   - allowedExternalIdpIssuerSuffixes is consequently unused and was removed.
 func validateExternalIdpEndpoint(rawURL string) error {
-	u, err := url.Parse(strings.TrimSpace(rawURL))
-	if err != nil {
-		return fmt.Errorf("invalid external IdP URL: %w", err)
-	}
-	if !strings.EqualFold(u.Scheme, "https") {
-		return fmt.Errorf("external IdP URL must be https")
-	}
-	host := strings.ToLower(u.Hostname())
-	if host == "" {
-		return fmt.Errorf("external IdP URL has no host")
-	}
-	// Reject IP-literal hosts outright; only named, allow-listed hosts pass.
-	if net.ParseIP(host) != nil {
-		return fmt.Errorf("external IdP host must not be an IP literal")
-	}
-	for _, suffix := range allowedExternalIdpIssuerSuffixes {
-		if strings.HasSuffix(host, suffix) {
-			return nil
-		}
-	}
-	return fmt.Errorf("external IdP host %q is not allow-listed", host)
+	return validateExternalIdpEndpointStrict(rawURL)
 }
 
 // externalIdpEndpointValidator is the function ValidateExternalIdpEndpoint delegates
@@ -622,48 +609,15 @@ func ExpFromAccessTokenJWT(accessToken string) int64 {
 	return claims.Exp
 }
 
-// DeriveExternalIdpEndpoints reconstructs the Microsoft / Azure AD token endpoint,
-// OIDC issuer, and default scopes for an external-IdP credential. The Azure tenant
-// is recovered from userId (Kiro Account Manager exports carry it at account
-// level) or, failing that, from the accessToken JWT's issuer (bare blobs with only
-// clientId + accessToken + refreshToken). This lets the credential-import path
-// accept those shapes even though they omit tokenEndpoint/issuerUrl/scopes.
-//
-// userId / iss look like: https://login.microsoftonline.com/<tenant>/v2.0.<oid>
-// Returns empty strings if neither source yields a usable tenant, so the caller
-// can fall back to its "requires clientId and tokenEndpoint" error. The derived
-// tokenEndpoint is re-validated against the IdP allow-list by the caller, so a
-// non-allow-listed host (or the test's http+127.0.0.1 fake) is still gated.
-func DeriveExternalIdpEndpoints(userId, clientID, accessToken string) (tokenEndpoint, issuerURL, scopes string) {
-	src := strings.TrimSpace(userId)
-	if src == "" {
-		// Bare credential blobs carry only clientId + accessToken: recover the
-		// tenant from the access token's JWT issuer.
-		src = strings.TrimSpace(issuerFromAccessTokenJWT(accessToken))
-	}
-	if src == "" {
-		return "", "", ""
-	}
-	u, err := url.Parse(src)
-	if err != nil || u.Host == "" {
-		return "", "", ""
-	}
-	segments := strings.Split(strings.Trim(u.Path, "/"), "/")
-	if len(segments) == 0 || segments[0] == "" {
-		return "", "", ""
-	}
-	tenant := segments[0]
-	scheme := u.Scheme
-	if scheme == "" {
-		scheme = "https"
-	}
-	tokenEndpoint = fmt.Sprintf("%s://%s/%s/oauth2/v2.0/token", scheme, u.Host, tenant)
-	issuerURL = fmt.Sprintf("%s://%s/%s/v2.0", scheme, u.Host, tenant)
-	if clientID != "" {
-		scopes = fmt.Sprintf("api://%s/codewhisperer:conversations api://%s/codewhisperer:completions offline_access", clientID, clientID)
-	}
-	return tokenEndpoint, issuerURL, scopes
-}
+// MERGE POLICY NOTE (fork ↔ upstream v1.1.5): the fork's DeriveExternalIdpEndpoints
+// used to live here. Upstream v1.1.5 shipped a same-named exported function in
+// auth/microsoft_sso.go, so one had to go. Upstream's survives because it is the
+// same derivation with tighter input validation — it requires the tenant and the
+// clientID to be real UUIDs and routes the result through parseMicrosoftIssuer —
+// while producing the identical tokenEndpoint / issuer / scope strings this
+// version produced (verified against TestDeriveExternalIdpEndpoints, which is
+// retained unchanged). Its JWT fallback for bare credential blobs is
+// parseExternalTokenMetadata, which supersedes the fork's issuerFromAccessTokenJWT.
 
 // oidcDiscover fetches the OpenID Connect discovery document for issuerURL and
 // returns its authorization and token endpoints. The issuer and BOTH discovered
@@ -748,6 +702,15 @@ func externalIdpAuthorizeURL(authEndpoint, clientID, redirectURI, scopes, challe
 // verifier) for IdP tokens at the discovered token endpoint. Standard OAuth2
 // authorization_code grant for a public client (PKCE, no client secret);
 // request is form-encoded and the response is snake_case.
+//
+// MERGE POLICY NOTE (fork ↔ upstream v1.1.5): postExternalIdpToken now comes from
+// auth/microsoft_sso.go and returns a *externalIdpTokenResponse plus an extra
+// issuerURL argument (see the note in auth/oidc.go for why upstream's pair won).
+// The scalar return shape is preserved here so this function's own callers are
+// unaffected. issuerURL is passed empty because the hosted-portal flow discovers
+// its token endpoint via OIDC discovery and has already validated it against the
+// IdP allow-list; upstream's extra issuer/tenant pinning applies to the accounts
+// that carry an issuer, and postExternalIdpToken skips it when issuerURL is blank.
 func exchangeExternalIdpCode(client *http.Client, tokenEndpoint, clientID, code, codeVerifier, redirectURI, scopes string) (accessToken, refreshToken string, expiresIn int, err error) {
 	form := url.Values{}
 	form.Set("client_id", clientID)
@@ -758,7 +721,11 @@ func exchangeExternalIdpCode(client *http.Client, tokenEndpoint, clientID, code,
 	if strings.TrimSpace(scopes) != "" {
 		form.Set("scope", scopes)
 	}
-	return postExternalIdpToken(client, tokenEndpoint, form)
+	token, err := postExternalIdpToken(client, tokenEndpoint, "", form)
+	if err != nil {
+		return "", "", 0, err
+	}
+	return token.AccessToken, token.RefreshToken, token.ExpiresIn, nil
 }
 
 // exchangeSocialCode exchanges a Cognito authorization code (with its PKCE

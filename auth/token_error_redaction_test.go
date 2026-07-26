@@ -9,8 +9,9 @@ import (
 )
 
 // postExternalIdpToken treats a 2xx response whose access_token is missing as a
-// failure (oidc.go:123) and then interpolates the ENTIRE response body into the
-// returned error (oidc.go:127).
+// failure and must NOT interpolate the response body into the returned error.
+// (Historically the fork's implementation in oidc.go did exactly that; the
+// surviving implementation lives in microsoft_sso.go.)
 //
 // An OAuth token response is exactly the wrong thing to stringify: a 2xx body
 // that lacks access_token can still legitimately carry refresh_token, and the
@@ -37,7 +38,13 @@ func TestExternalIdpTokenErrorDoesNotLeakRefreshToken(t *testing.T) {
 	restore := SetExternalIdpValidatorForTest(func(string) error { return nil })
 	defer SetExternalIdpValidatorForTest(restore)
 
-	_, _, _, err := postExternalIdpToken(server.Client(), server.URL, url.Values{})
+	// MERGE POLICY NOTE (fork ↔ upstream v1.1.5): postExternalIdpToken now lives in
+	// auth/microsoft_sso.go and takes an extra issuerURL plus returns a struct.
+	// issuerURL is passed empty so the Microsoft issuer/tenant pinning is skipped
+	// and this test still exercises the response-handling path it was written for.
+	// The redaction property being asserted is unchanged and still real: upstream's
+	// missing-access_token branch reports only a fixed message, never the body.
+	_, err := postExternalIdpToken(server.Client(), server.URL, "", url.Values{})
 	if err == nil {
 		t.Fatal("expected an error when access_token is absent")
 	}
@@ -61,7 +68,7 @@ func TestExternalIdpTokenErrorKeepsDiagnosticContext(t *testing.T) {
 	restore := SetExternalIdpValidatorForTest(func(string) error { return nil })
 	defer SetExternalIdpValidatorForTest(restore)
 
-	_, _, _, err := postExternalIdpToken(server.Client(), server.URL, url.Values{})
+	_, err := postExternalIdpToken(server.Client(), server.URL, "", url.Values{})
 	if err == nil {
 		t.Fatal("expected an error for a 400 response")
 	}

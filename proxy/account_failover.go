@@ -8,7 +8,6 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
-	"time"
 )
 
 const maxAccountRetryAttempts = 3
@@ -148,15 +147,46 @@ var upstreamStatusPatterns = []*regexp.Regexp{
 
 // upstreamStatusFromMessage returns the HTTP status carried by an upstream error
 // message and whether one was found.
+//
+// It returns the LEFTMOST match across all patterns, not the first pattern that
+// happens to hit. That distinction is load-bearing. Every formatter in this repo
+// writes the authoritative status at the FRONT of the message and appends the
+// opaque upstream body after it, so position — not pattern order — is what
+// separates "the status the upstream returned" from "a number that appears
+// inside a response body".
+//
+// Selecting by pattern order instead let a body win over the header. For
+//
+//	refresh failed: 401 {"error":"invalid_grant","trace":"HTTP 503 from edge"}
+//
+// the `http (\d{3})` pattern is tried first and matched the body's 503, so the
+// message was classified as a 5xx outage — and once isAuthErrorMessage refuses
+// to honour markers on 5xx, a genuinely revoked credential stopped being
+// recognised as an auth failure and the account was never flagged for re-auth.
+// Anchoring on the earliest occurrence keeps the header authoritative regardless
+// of what the body quotes.
 func upstreamStatusFromMessage(lower string) (int, bool) {
+	bestIdx := -1
+	bestStatus := 0
 	for _, re := range upstreamStatusPatterns {
-		if m := re.FindStringSubmatch(lower); m != nil {
-			if status, err := strconv.Atoi(m[1]); err == nil {
-				return status, true
-			}
+		loc := re.FindStringSubmatchIndex(lower)
+		if loc == nil {
+			continue
+		}
+		// loc[0] is the start of the whole match; loc[2]:loc[3] is group 1.
+		status, err := strconv.Atoi(lower[loc[2]:loc[3]])
+		if err != nil {
+			continue
+		}
+		if bestIdx < 0 || loc[0] < bestIdx {
+			bestIdx = loc[0]
+			bestStatus = status
 		}
 	}
-	return 0, false
+	if bestIdx < 0 {
+		return 0, false
+	}
+	return bestStatus, true
 }
 
 // authErrorNarrowMarkers are phrases specific enough that they identify a
@@ -193,7 +223,18 @@ func isAuthErrorMessage(msg string) bool {
 		if status == http.StatusUnauthorized || status == http.StatusForbidden {
 			return true
 		}
-		// A definite non-auth status: trust it over whatever the body says,
+		// 5xx is the upstream failing, never this account's credentials being
+		// bad, and the narrow markers are NOT safe to honour here: the message
+		// embeds an opaque upstream body (a stack trace, a gateway page, an IdP
+		// error_description that copies a request marker), so a 500 whose body
+		// merely mentions invalid_grant used to permanently BAN a healthy
+		// account. A server error cannot revoke a credential, so no phrase found
+		// inside one is evidence about the credential. Failover/retry still
+		// happens via the non-auth path; only the irreversible ban is withheld.
+		if status >= 500 {
+			return false
+		}
+		// A definite non-auth 4xx: trust the status over whatever the body says,
 		// but still honour a narrow marker (e.g. a 400 carrying invalid_grant
 		// is a genuine revoked refresh token).
 		return containsAny(lower, authErrorNarrowMarkers)
@@ -236,17 +277,11 @@ func (h *Handler) disableAccount(account *config.Account, banStatus, banReason s
 		return
 	}
 
-	updatedAccount := *account
-	if !updatedAccount.Enabled && updatedAccount.BanStatus == banStatus && updatedAccount.BanReason == banReason {
+	if !account.Enabled && account.BanStatus == banStatus && account.BanReason == banReason {
 		return
 	}
 
-	updatedAccount.Enabled = false
-	updatedAccount.BanStatus = banStatus
-	updatedAccount.BanReason = banReason
-	updatedAccount.BanTime = time.Now().Unix()
-
-	if err := config.UpdateAccount(account.ID, updatedAccount); err != nil {
+	if err := config.SetAccountBanStatus(account.ID, banStatus, banReason); err != nil {
 		logger.Warnf("[AccountFailover] Failed to disable %s: %v", account.Email, err)
 		return
 	}

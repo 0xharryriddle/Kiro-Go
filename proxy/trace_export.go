@@ -15,7 +15,7 @@ var traceCSVHeader = []string{
 	"tokens", "credits", "durationMs",
 	// Trace additions.
 	"traceId", "api", "outcome", "httpStatus", "stream", "apiKeyId",
-	"attemptCount", "inputTokens", "outputTokens", "cacheReadTokens",
+	"attemptCount", "inputTokens", "outputTokens", "cacheReadTokens", "cacheWriteTokens",
 	"stopReason", "responseModel", "toolCallCount", "ttfbMs",
 	"region", "profileArn", "upstreamHost", "cacheHit", "bodyRef", "bodyTruncated",
 }
@@ -53,6 +53,7 @@ func writeTraceCSV(w io.Writer, logs []RequestLog) {
 			strconv.Itoa(log.InputTokens),
 			strconv.Itoa(log.OutputTokens),
 			strconv.Itoa(log.CacheReadTokens),
+			strconv.Itoa(log.CacheWriteTokens),
 			log.StopReason,
 			log.ResponseModel,
 			strconv.Itoa(log.ToolCallCount),

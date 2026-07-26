@@ -1,0 +1,285 @@
+# Checkpoint — audit state, merge state, remaining work
+
+Purpose: a resumable record of where this project stands, written so a fresh
+session (or a reviewer) can pick it up without re-deriving anything. Every
+claim below is verified against the live tree by real command output; items I
+could not verify are labelled as such rather than asserted.
+
+Last verified: repo `harry` branch, working tree mid-merge (see §2).
+
+---
+
+## 1. Verified state of the tree
+
+| Fact | Value | How verified |
+|---|---|---|
+| Branch | `harry` | `git rev-parse --abbrev-ref HEAD` |
+| HEAD | `99dda52` | `git rev-parse HEAD` |
+| Merge in progress | YES — `.git/MERGE_HEAD` present | file exists |
+| Merging in | `upstream-v1.1.5` (`ec4ba56`) | `.git/MERGE_MSG` |
+| Conflicted paths (unstaged `U`) | 14 | `git diff --name-only --diff-filter=U` |
+| Conflict markers remaining | 0 in every conflicted file | grep for `^<<<<<<<`/`^>>>>>>>` |
+| Build | clean | `go build ./...` |
+| Test suite | **918 passed, 0 failed** | `go test ./config/ ./pool/ ./auth/ ./proxy/` |
+| `go vet` | clean | `go vet ./...` |
+
+**Interpretation.** The merge is *textually resolved but not staged*: git still
+reports `U` (both-modified) for 14 paths, yet no file contains conflict markers
+and the full suite is green. Someone resolved the conflicts in place without
+`git add`. This is a safe state to continue from, but the merge must be
+completed deliberately (§4, item R1) — it is NOT finished.
+
+---
+
+## 2. What upstream v1.1.5 brought in (9 commits)
+
+```
+ec4ba56  chore: bump version to 1.1.5
+40f5e25  fix: harden web search handling and add regression tests
+9409c3f  feat: Anthropic native web_search via Kiro MCP (#120)
+95c85db  fix: stop dropping repeated content from response streams (#138)
+df13a66  fix: classify major-only Claude versions (opus-5) as 1M context (#140)
+f0e2e61  fix: app.js syntax error + stabilize API key import tests
+1e67432  feat: Kiro API key credentials and import
+b0ebb56  fix: Microsoft SSO import trust boundaries + credential copy fields
+82247ca  feat: Microsoft Enterprise SSO
+```
+
+Two notes that matter:
+
+- **`df13a66` is the same Opus 5 1M-context fix I made independently.** Upstream
+  reached the same conclusion. The merged tree keeps a working version; the
+  regex at `proxy/kiro.go` still classifies bare-major `claude-opus-5` as 1M.
+- **`9409c3f` adds native `web_search` through Kiro MCP** — a new tool surface
+  that my audit never examined. See §4 item R4.
+
+---
+
+## 3. Audit checkpoint — 18 defects fixed, all verified surviving the merge
+
+Committed as `d81cb7b` ("fix(audit): 18 verified defects across auth, pool,
+config, translation, streaming"), which **is** an ancestor of HEAD.
+
+Each was proven with a RED test against real source before the fix, then
+verified GREEN. Survival re-checked against the post-merge worktree:
+
+| # | Defect | Site | Post-merge |
+|---|---|---|---|
+| 1 | Bare-major flagship models got 200K instead of 1M context | `proxy/kiro.go` | PRESENT (also fixed upstream) |
+| 2 | Dated snapshots misparsed as 1M (unbounded minor group) | `proxy/kiro.go` | PRESENT |
+| 3 | `thinking.budget_tokens` validated then discarded | `proxy/translator.go` | PRESENT |
+| 4 | `cache_control` dropped at decode on `ClaudeTool` | `proxy/translator.go` | PRESENT |
+| 5 | `cache_control` dropped at decode on `ClaudeContentBlock` | `proxy/translator.go` | PRESENT |
+| 6 | Parallel tool-use fragments merged / second call dropped | `proxy/kiro.go` | PRESENT |
+| 7 | `tool_result.is_error` discarded — failed tools reported success | `proxy/translator.go` | PRESENT |
+| 8 | Data race: routing getters returned `&p.accounts[i]` | `pool/account.go` | PRESENT (copy-return) |
+| 9 | Data race: `Init` wrote `cfgPath` unlocked vs `Save` | `config/config.go` | PRESENT |
+| 10 | Stats snapshots could move counters backwards | `config/config.go` | PRESENT (monotonic) |
+| 11 | Diagnostics reported quota-exhausted accounts as Available | `pool/account.go` | PRESENT (reordered) |
+| 12 | 4 byte-truncations split UTF-8 runes | `proxy/translator.go` | PRESENT |
+| 13 | Unbounded alloc from 4-byte frame length (192MiB from 12B) | `proxy/kiro.go` | PRESENT — renamed by merge to `maxEventStreamMessageBytes` + `errEventStreamFrameTooLarge` |
+| 14 | Claude stream: unclosed blocks, no `message_stop` mid-stream | `proxy/handler.go` | PRESENT |
+| 15 | OpenAI stream: no error, no `finish_reason`, no `[DONE]` | `proxy/handler.go` | PRESENT |
+| 16 | Responses stream: no `[DONE]`, failure not attributed to account | `proxy/responses_handler.go` | PRESENT |
+| 17 | Healthy accounts permanently BANNED by body-substring match | `proxy/account_failover.go` | PRESENT (status-anchored, 3 formats) |
+| 18 | Live `refresh_token` written into a logged error string | `auth/oidc.go` | PRESENT |
+
+**Correction to an earlier report:** I initially flagged 6 of these as MISSING
+post-merge. That was wrong — my grep patterns were fragile (brace/paren escaping
+under a shadowed `rg`). Re-verified individually: all 18 survive. #13 survives
+under a different, better name chosen by upstream.
+
+### Findings I investigated and rejected (do not re-fix)
+
+- Cache fingerprints including `cache_control` marker position —
+  `writeCanonicalJSON` already strips the key at every map level. Code was correct.
+- Auth session-timer race (`auth/kiro_sso.go`) — subagent claim; produced **zero**
+  races under `-race` across ~2000 iterations. Unsubstantiated.
+- OpenAI-route `is_error` equivalent — the OpenAI wire format has no such field
+  on a tool message. The asymmetry with the Claude route is correct.
+- Responses route has no prompt-cache/thinking-budget plumbing — correct, that
+  wire format carries neither field.
+
+---
+
+## 3b. Round-2 audit — 18 further defects in the new upstream surfaces
+
+Method: three independent reviewers (`gpt-5.6-sol-thinking`, reasoning_effort
+max) audited websearch/MCP, Microsoft SSO, and pool routing from source. Every
+claim was then re-derived by the parent against live bytes — reviewer
+self-reports were treated as leads, not facts. Each fix below was RED-proven
+first (test fails against the unfixed code) and several were additionally
+verified by neutralizing the fix and confirming the test goes red again.
+
+| # | Defect | Site | Why it mattered |
+|---|---|---|---|
+| 19 | F3 external-usage auto-disable was **unreachable dead code** — gate required `strong_external && acc.Enabled`, but that tier is only assigned when `!EnabledLocally` | `proxy/handler.go:623` | Feature marked SHIPPED had never once fired; zero test coverage hid it |
+| 20 | Auto-recovery re-enabled accounts quarantined for external usage within one 60s tick | `pool/account.go` `reprobeDisabled` | A successful token refresh is not evidence a shared credential stopped being shared; F3 undid itself |
+| 21 | HTTP status classified *after* JSON parse, so a genuine 401 answered with an HTML error page became an unclassifiable parse error | `auth/microsoft_sso.go` `postExternalIdpToken` | `isAuthErrorMessage` had no status to anchor on → real credential failures missed |
+| 22 | Submitted credentials echoed into the returned error via `error_description` | same | Error is logged verbatim by the background refresher → live token in operator logs |
+| 23 | `isAuthErrorMessage` let body markers vote on **5xx** | `proxy/account_failover.go:191` | An upstream outage whose body merely mentioned `invalid_grant` permanently BANNED a healthy account — the exact bug class the comment above it claimed was fixed |
+| 24 | `pool.IsAuthFailure` had **no status gating at all** (sibling of #23) | `pool/account.go` | Same permanent ban, reached via `classifyAndBanOnUsageError` |
+| 25 | Unbounded `io.ReadAll` on the MCP response body | `proxy/websearch.go` | Body is amplified twice downstream (result blocks + summary); sibling call sites already bound with `io.LimitReader` |
+| 26 | Quota-aware routing (F2) **bypassed the circuit breaker** | `pool/account.go` `eligibleForRoute` | The account with most remaining quota is exactly the one a fresh ban leaves untouched — enabling F2 silently disabled the breaker |
+| 27 | Quota-aware dispatch never stamped the LRU clock | `pool/account.go` | Flipping the toggle off handed that account a burst of consecutive requests |
+| 28 | `Reload` never pruned per-account state; a deleted+re-added ID **inherited the old OPEN breaker**, cooldown and error count | `pool/account.go` `Reload` | Operator re-adding a credential to fix a problem got an account that looked broken for no visible reason |
+| 29 | `maxAffinityEntries` was decorative — expiry-only pruning is not a bound | `pool/account.go` | One request per random API key grew the map without limit |
+| 30 | Half-open breaker admitted **unlimited** concurrent probes | `pool/account.go` `isOpen` | Full request rate resumed the instant the window elapsed, against an account that had just failed 5× |
+| 31 | `DisableAccount`/`MarkOverLimit` set their safety-net cooldown *before* `Reload`, which prunes it | `pool/account.go` | A value whose stated job is to survive a racing Reload was deleted by it |
+| 32 | Cooldown fallback dispatched to accounts with an **open circuit** | `pool/account.go` `fallbackEarliestCooldown` | Converted one open breaker into a stream of failed requests, each re-arming it |
+| 33 | Session-affinity TOCTOU returned an account that a completed `Reload` had removed | `pool/account.go` `GetNextForModelWithApiKey` | Dispatched on a credential already pulled from routing |
+| 34 | Redaction could not catch an IdP-**returned** rotated token, nor a submitted value under the 16-byte floor | `auth/microsoft_sso.go` | Name-based (`param=value`) redaction added; prose that only *mentions* a parameter still survives |
+| 35 | `max_uses` exhaustion rendered as a **successful empty result** | `proxy/websearch_loop.go` | Indistinguishable from "search ran, found nothing"; contract requires `web_search_tool_result_error` / `max_uses_exceeded` |
+| 36 | MCP JSON-RPC `id`/`jsonrpc` never validated against the request | `proxy/websearch.go` | A replayed/reordered reply could return one query's results as the answer to another |
+
+Also removed: an unrequested stream-delta probe a reviewer had wired into the
+streaming hot path (`proxy/kiro.go`) whose counters no route ever read.
+
+### Round-2 claims investigated and REJECTED (do not re-fix)
+
+- "Untrusted search text reaches the model summary" — inherent to any web-search
+  tool; the content *is* the payload. Not a defect.
+- "Result expansion has no aggregate bound" — real but subsumed by #25, which
+  bounds the input that feeds the expansion.
+- Reviewer #3's probes for half-open single-probe, reused-ID inheritance,
+  quota-aware bypass and affinity bound asserted via unconditional `t.Fatalf`,
+  so they "confirmed" regardless of behaviour. Re-tested with correct
+  assertions: 4 of 9 were real (#26–#29), the rest were artifacts.
+- Concurrent model-map / affinity / dispatch-seq access — clean under `-race`.
+
+---
+
+## 3c. Round-3 — self-audit of the round-2 fixes
+
+My own round-2 changes had received no independent scrutiny, so before landing
+them I audited them myself (and dispatched a fresh adversarial review of the
+diff). Four defects found in MY OWN fixes plus one pre-existing latent panic, all
+RED-proven and fixed:
+
+| # | Defect | Site | Notes |
+|---|---|---|---|
+| 37 | **Regression I introduced.** `isOpen` both decided AND mutated (promoted open→half-open, stamped `probeAt`). Adding two call sites meant ONE selection pass consumed its own probe: gate A promoted and admitted, gate B saw a probe in flight and blocked — taking a single-account pool dark exactly when its breaker was due a recovery probe | `pool/account.go` | Fixed by splitting the pure predicate `isOpen` from an explicit `claimProbe`, called once at each of the 4 dispatch commit points. RED-proven by neutralizing `claimProbe` → 4 tests fail |
+| 38 | **Pre-existing latent panic** (not mine, surfaced while auditing my affinity work): the affinity bind writes `p.apiKeyAffinity` unconditionally, but that map is only populated by `GetPool()`. A pool assembled field-by-field reaches it nil → *write to nil map panics* → whole proxy process dies instead of degrading to no-affinity | `pool/account.go` | Guarded, matching how `lastDispatchSeq` is already handled two lines below |
+| 39 | **Regression I introduced.** Removing the `acc.Enabled` guard from F3 (fix #19) let it stamp an account that was already `BANNED`. `SetAccountBanStatus` overwrites unconditionally, so a permanent operator-only ban was DOWNGRADED to `DISABLED` — which auto-recovery is allowed to revisit. External usage could un-ban a credential banned for a more serious reason | `proxy/handler.go` | Fixed with an `alreadyBanned` guard; positive control proves a merely-disabled account is still quarantined |
+| 40 | **Over-reach I introduced, now walked back.** Fix #36 REJECTED an MCP response whose JSON-RPC id/version mismatched. But nothing in this repo records a real MCP response, so "Kiro echoes our id back" was an unverified assumption — if the server picks its own id, failing closed breaks EVERY web search and burns one account per attempt. The security value is also small: one-shot HTTP already binds reply to request via the connection | `proxy/websearch.go` | Downgraded to a loud warning. Detection kept (a real mismatch is discoverable from logs), rejection deferred until a capture proves the id is mirrored |
+| 41 | Client-facing status consequence of fix #23 was unpinned: a 5xx carrying an auth marker now correctly returns 502 rather than 401 | `proxy/account_failover.go` | Pinned in both directions |
+
+Also verified rather than assumed:
+- **Lock discipline** across all new `*Locked` helpers — every caller holds the
+  write lock; `Reload` still reads config BEFORE taking `p.mu`, preserving the
+  documented `p.mu → cfgLock` leaf ordering. No lock-order inversion introduced.
+- **Redactor edge cases** — 13 cases including the overlapping-name traps
+  (`client_assertion` contains `assertion`; `device_code` contains `code`),
+  underscore-prefixed lookalikes (`error_code=` must NOT match `code`),
+  case-insensitivity, and multibyte preservation (byte-index alignment is why
+  `asciiLower` exists rather than `strings.ToLower`).
+- **Affinity eviction cost** — MEASURED, not hand-waved: ~20.6µs per eviction at
+  the 1024 cap under the write lock (`BenchmarkEvictOldestAffinityAtCap`).
+  Negligible against the Kiro round-trip, and only reachable under API-key
+  rotation abuse. Recorded in the code comment with the escape hatch (heap /
+  intrusive LRU) if that changes.
+- **Multi-skip `max_uses` bookkeeping** — every remaining `web_search` in a round
+  is marked, client tools are not.
+
+Lesson worth keeping: a query that mutates as a side effect is safe with one
+caller and unsafe with two. Fix #26/#32 added callers to `isOpen` without
+noticing it was not a pure predicate. That is exactly the class of bug an
+independent reviewer of the DIFF catches and a reviewer of the ORIGINAL code
+cannot.
+
+### Round-3b — defects found by reviewing the round-2/3 fixes AGAIN
+
+A second adversarial pass over the same diff (reviewers probing the redactor and
+the classifiers with real Azure AD / formatter strings) surfaced four more, three
+of them regressions introduced by MY earlier fixes:
+
+| # | Defect | Site | Notes |
+|---|---|---|---|
+| 42 | **Regression I introduced (functional, not cosmetic).** The name-based redactor accepted a BARE colon as an assignment, so real IdP prose was shredded: `"the code: invalid_grant was already redeemed"` → `code: [REDACTED]`. That destroys the `invalid_grant` marker `isAuthErrorMessage` classifies revoked credentials by — a genuinely revoked token became unclassifiable and the account was never flagged for re-auth. Also ate `"error code: 50173"`, `"status code: 401"`, and URLs after a colon | `auth/microsoft_sso.go` | Narrowed to machine syntax only: `=` always, `:` only when the key is JSON-quoted (`"name": "value"`). 6 prose cases + 2 machine-assignment controls pin both directions |
+| 43 | Boundary check treated `-` as a name byte, so `x-refresh_token=<secret>` was skipped as an unrelated identifier and leaked | same | `-` no longer binds a name; `_`/alphanumerics still do (so `error_code=` is still not `code`) |
+| 44 | **Regression I introduced.** `upstreamStatusFromMessage` selected by PATTERN ORDER, not string position. For `refresh failed: 401 {...\"trace\":\"HTTP 503 from edge\"}` it returned **503**, so fix #23's 5xx gate then refused to ban a genuinely revoked credential. The body outvoted the header | `proxy/account_failover.go` | Now returns the LEFTMOST match across all patterns — every formatter writes the authoritative status at the front |
+| 45 | Same positional flaw in the pool sibling, reached differently: `hasUpstream5xxStatusToken` matched any bare 5xx token ANYWHERE, so `refresh failed: 400 {...\"upstream returned 500\"}` hit the 5xx gate and a revoked credential was read as a server outage | `pool/account.go` | Replaced with `firstUpstreamStatusToken` (leftmost 400–599, same boundary rule). The two classifiers now agree on all 18 real formatter strings — pinned by a permanent cross-package agreement test so they cannot silently diverge again |
+
+Verified rather than assumed in this pass:
+- **Redactor is panic-free and terminating** under a brute-force probe over
+  `name` + up to 3 arbitrary bytes (including invalid UTF-8), and never turns
+  valid UTF-8 input into invalid output.
+- **Accepted redactor limits**, documented in code so nobody "fixes" them into
+  over-redaction: `refresh_token_value=` (different parameter), and spelling
+  variants we never submit (`refreshToken=`, `refresh-token=`, bare `token=`).
+  The value-based pass still covers those whenever the value is one we sent.
+
+Reviewer artifacts: all `zz_*` probe files were transient and are gone (count
+verified 0). Their findings were re-derived against live bytes before any fix;
+one reported DIVERGE line turned out to be stale `/tmp` output from a probe its
+author had already deleted, which is why probe claims get re-run rather than
+believed.
+
+---
+
+## 4. Remaining work
+
+### R1 — Complete the merge (BLOCKING, needs user decision)
+14 paths are resolved-but-unstaged. The tree builds and 918 tests pass, so the
+resolution looks sound, but finishing a merge is a history-affecting act on the
+user's repo. Needs explicit go-ahead on: stage the 14 resolved paths + commit
+the merge, then push `harry`.
+
+### R2 — `stop_reason: "error"` (needs user decision)
+On Claude mid-stream termination I emit `stop_reason: "error"`, which is outside
+Anthropic's documented enum. A strict client may prefer `end_turn` with the
+separate `error` event carrying the signal. Cosmetic but client-visible.
+
+### R3 — `toolResult.status` enum (needs external evidence)
+`is_error` is currently signalled via a content-text marker
+(`toolResultErrorPrefix`), following the existing `toolResultImagePlaceholder`
+precedent. The structured `Status` field would be cleaner, but the set of values
+Kiro accepts is undocumented in-repo and could not be verified (no CodeWhisperer
+SDK in the module cache; web search unavailable). Sending an unaccepted enum
+would 400 every failed tool turn. Needs a live capture of Kiro IDE traffic.
+
+### R4 — Audit the new upstream surfaces — DONE (see §3b)
+`web_search` via Kiro MCP, Microsoft Enterprise SSO, and the session-affinity /
+circuit-breaker / dispatch-seq code in `pool/account.go` were all reviewed by
+three independent `gpt-5.6-sol-thinking` reviewers at max reasoning effort, then
+every claim was re-derived against live bytes by the parent before any fix. 18
+further defects found and fixed; the false alarms are listed so they are not
+re-litigated.
+
+### R5 — Design tradeoffs raised by subagents (deliberately not actioned)
+Not defects; they need a product decision, not a unilateral rewrite:
+- Per-request `Save()` fsync serializes routing behind whole-file disk I/O.
+- Several `config` setters mutate in memory then `return Save()` with no
+  rollback, while sibling setters do roll back.
+- `/v1/models` is unauthenticated and can drive account error counters.
+- Admin gate now fails closed on empty password (fixed), but `config.SetPassword`
+  remains unguarded.
+
+---
+
+## 5. Roadmap status (`docs/feature-roadmap.md`)
+
+F1–F12 are marked SHIPPED (health score, quota-aware routing, external-usage
+auto-action, capacity forecast, response cache, per-key RPM/TPM, webhook bus,
+model matrix, Prometheus `/metrics`, per-model cost, PII redaction, anomaly
+detection). The roadmap is a design record, not open work. No open roadmap items
+were found; the remaining work in §4 is audit/merge hygiene plus the new
+upstream surfaces.
+
+---
+
+## 6. Validation gate (run all of these before claiming done)
+
+```bash
+gofmt -l ./config ./proxy ./pool ./auth   # expect only the 2 pre-existing flags
+go build ./...
+go vet ./...
+go test ./config/ ./pool/ ./auth/ ./proxy/
+go test -race ./config/ ./pool/ ./auth/ ./proxy/ -count=1
+node --check web/app.js
+# locale symmetry: en.json vs zh.json leaf-key sets must match exactly
+git diff --check
+```
+
+Pre-existing gofmt flags (NOT introduced here, leave alone unless editing):
+`proxy/usage_anomaly_test.go`, `proxy/response_cache_test.go`.

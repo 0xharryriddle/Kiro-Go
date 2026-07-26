@@ -4,7 +4,6 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"net/http"
-	"net/http/httptest"
 	"net/url"
 	"reflect"
 	"strings"
@@ -69,11 +68,27 @@ func TestExtractEmailFromJWT(t *testing.T) {
 	}
 }
 
-func TestValidateExternalIdpEndpoint(t *testing.T) {
+// TestValidateExternalIdpEndpointHostAllowList covers the unexported validator
+// used by the hosted-portal discovery leg.
+//
+// MERGE POLICY NOTE (fork ↔ upstream v1.1.5): this test was renamed (it was
+// TestValidateExternalIdpEndpoint) because upstream's auth/microsoft_sso_test.go
+// added a same-named test in this package. Both are kept: that one exercises the
+// exported entry point and upstream's stricter URL-component rules, this one the
+// unexported validator and the host allow-list.
+//
+// One expectation CHANGED rather than being preserved: bare
+// "login.microsoftonline.cn" moved from the allowed list to the rejected list.
+// The fork's old suffix rule (".microsoftonline.cn") accepted it as a side effect,
+// but it is not a real Microsoft Entra endpoint — Azure China's login host is
+// "login.partner.microsoftonline.cn", which IS accepted below. The surviving
+// validator uses an exact-host allow-list, so the bare form is now correctly
+// refused. Keeping the old assertion would have pinned an SSRF-adjacent hole open.
+func TestValidateExternalIdpEndpointHostAllowList(t *testing.T) {
 	valid := []string{
 		"https://login.microsoftonline.com/5fbc183e/v2.0",
 		"https://login.microsoftonline.us/tenant/v2.0",
-		"https://login.microsoftonline.cn/tenant/oauth2/v2.0/token",
+		"https://login.partner.microsoftonline.cn/tenant/oauth2/v2.0/token",
 	}
 	for _, u := range valid {
 		if err := validateExternalIdpEndpoint(u); err != nil {
@@ -87,6 +102,7 @@ func TestValidateExternalIdpEndpoint(t *testing.T) {
 		"https://10.0.0.5/x",                        // IP literal
 		"https://accounts.google.com/x",             // not allow-listed
 		"https:///x",                                // no host
+		"https://login.microsoftonline.cn/x",        // not a real Entra host (see note above)
 	}
 	for _, u := range invalid {
 		if err := validateExternalIdpEndpoint(u); err == nil {
@@ -140,34 +156,38 @@ func TestExternalIdpAuthorizeURLOmitsEmptyLoginHint(t *testing.T) {
 	}
 }
 
-// TestRefreshExternalIdpToken drives the refresh_token grant against a stub IdP
-// token endpoint and asserts the form encoding and response mapping.
+// MERGE POLICY NOTE (fork ↔ upstream v1.1.5): these three tests used to drive the
+// fork's own refreshExternalIdpToken (4 args + client) against an httptest server.
+// That function was removed in favour of upstream's stricter implementation in
+// auth/microsoft_sso.go, which takes an additional issuerURL and pins the token
+// endpoint to the issuer's tenant — so an httptest URL can no longer be used at
+// all. The tests are ported rather than deleted: they now drive the surviving
+// function through a RoundTripper against real allow-listed Microsoft hostnames,
+// which is the pattern upstream's own tests use. The behaviours asserted are
+// unchanged: form encoding, response mapping, refresh-token retention, and the
+// precondition errors.
+
+// TestRefreshExternalIdpToken asserts the refresh_token grant's form encoding and
+// response mapping.
 func TestRefreshExternalIdpToken(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if err := r.ParseForm(); err != nil {
+	issuer := testMicrosoftIssuer()
+	tokenEndpoint := issuerBase(issuer) + "/" + testMicrosoftTenantID + "/oauth2/v2.0/token"
+	client := &http.Client{Transport: microsoftRoundTripFunc(func(request *http.Request) (*http.Response, error) {
+		if err := request.ParseForm(); err != nil {
 			t.Fatalf("parse form: %v", err)
 		}
-		if r.Form.Get("grant_type") != "refresh_token" {
-			t.Fatalf("grant_type = %q", r.Form.Get("grant_type"))
-		}
-		if r.Form.Get("client_id") != "azure-client" {
-			t.Fatalf("client_id = %q", r.Form.Get("client_id"))
-		}
-		if r.Form.Get("refresh_token") != "old-refresh" {
-			t.Fatalf("refresh_token = %q", r.Form.Get("refresh_token"))
-		}
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"access_token":"new-access","refresh_token":"new-refresh","expires_in":3600}`))
-	}))
-	defer srv.Close()
-
-	// The POST boundary re-validates tokenEndpoint against the allow-list, which rejects
-	// the httptest URL (http + 127.0.0.1). Install a permissive validator for the test.
-	restore := SetExternalIdpValidatorForTest(func(string) error { return nil })
-	defer SetExternalIdpValidatorForTest(restore)
+		assertMicrosoftFormValue(t, request.PostForm, "grant_type", "refresh_token")
+		assertMicrosoftFormValue(t, request.PostForm, "client_id", testMicrosoftClientID)
+		assertMicrosoftFormValue(t, request.PostForm, "refresh_token", "old-refresh")
+		return microsoftJSONResponse(request, http.StatusOK, map[string]any{
+			"access_token":  "new-access",
+			"refresh_token": "new-refresh",
+			"expires_in":    3600,
+		}), nil
+	})}
 
 	access, refresh, expiresAt, profileArn, err := refreshExternalIdpToken(
-		"old-refresh", "azure-client", srv.URL, "api://x/codewhisperer:conversations offline_access", srv.Client(),
+		"old-refresh", testMicrosoftClientID, tokenEndpoint, issuer, testMicrosoftScopes(), client,
 	)
 	if err != nil {
 		t.Fatalf("refreshExternalIdpToken: %v", err)
@@ -189,17 +209,18 @@ func TestRefreshExternalIdpToken(t *testing.T) {
 // TestRefreshExternalIdpTokenKeepsRefreshTokenWhenOmitted verifies the existing
 // refresh token is retained when the IdP response omits a rotated one.
 func TestRefreshExternalIdpTokenKeepsRefreshTokenWhenOmitted(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"access_token":"a2","expires_in":1200}`))
-	}))
-	defer srv.Close()
+	issuer := testMicrosoftIssuer()
+	tokenEndpoint := issuerBase(issuer) + "/" + testMicrosoftTenantID + "/oauth2/v2.0/token"
+	client := &http.Client{Transport: microsoftRoundTripFunc(func(request *http.Request) (*http.Response, error) {
+		return microsoftJSONResponse(request, http.StatusOK, map[string]any{
+			"access_token": "a2",
+			"expires_in":   1200,
+		}), nil
+	})}
 
-	// See TestRefreshExternalIdpToken: relax the allow-list for the httptest endpoint.
-	restore := SetExternalIdpValidatorForTest(func(string) error { return nil })
-	defer SetExternalIdpValidatorForTest(restore)
-
-	_, refresh, _, _, err := refreshExternalIdpToken("keep-me", "c", srv.URL, "", srv.Client())
+	_, refresh, _, _, err := refreshExternalIdpToken(
+		"keep-me", testMicrosoftClientID, tokenEndpoint, issuer, testMicrosoftScopes(), client,
+	)
 	if err != nil {
 		t.Fatalf("refreshExternalIdpToken: %v", err)
 	}
@@ -211,11 +232,16 @@ func TestRefreshExternalIdpTokenKeepsRefreshTokenWhenOmitted(t *testing.T) {
 // TestRefreshExternalIdpTokenRequiresClientAndEndpoint guards the precondition
 // that distinguishes the external-IdP branch from the AWS OIDC branch.
 func TestRefreshExternalIdpTokenRequiresClientAndEndpoint(t *testing.T) {
-	if _, _, _, _, err := refreshExternalIdpToken("r", "", "https://login.microsoftonline.com/t/token", "", http.DefaultClient); err == nil {
+	issuer := testMicrosoftIssuer()
+	tokenEndpoint := issuerBase(issuer) + "/" + testMicrosoftTenantID + "/oauth2/v2.0/token"
+	if _, _, _, _, err := refreshExternalIdpToken("r", "", tokenEndpoint, issuer, testMicrosoftScopes(), http.DefaultClient); err == nil {
 		t.Fatalf("expected error when clientID is empty")
 	}
-	if _, _, _, _, err := refreshExternalIdpToken("r", "c", "", "", http.DefaultClient); err == nil {
+	if _, _, _, _, err := refreshExternalIdpToken("r", testMicrosoftClientID, "", issuer, testMicrosoftScopes(), http.DefaultClient); err == nil {
 		t.Fatalf("expected error when tokenEndpoint is empty")
+	}
+	if _, _, _, _, err := refreshExternalIdpToken("", testMicrosoftClientID, tokenEndpoint, issuer, testMicrosoftScopes(), http.DefaultClient); err == nil {
+		t.Fatalf("expected error when refreshToken is empty")
 	}
 }
 

@@ -25,6 +25,33 @@ func installCleanAuthClient(t *testing.T) func() {
 	return func() { auth.SetGlobalAuthClientForTest(prev) }
 }
 
+// installInertKiroRestClient makes every Kiro REST call from an import fail fast
+// through a stub transport, and leaves an equally inert stub behind afterwards.
+//
+// Any import that SUCCEEDS reaches upstream twice: the handler spawns a
+// background, un-awaited model-list refresh for the new enabled account, and an
+// import carrying a profileArn verifies it against ListAvailableProfiles. Both
+// go through kiroRestHttpStore, whose default client uses
+// http.ProxyFromEnvironment -- and Go resolves the proxy environment ONCE per
+// process and caches it. A single real call therefore freezes the proxy config
+// before TestBuildKiroTransportFallsBackToEnvironmentProxy sets its env vars,
+// making that test fail depending only on run order.
+//
+// The restore deliberately installs a fresh inert stub rather than the previous
+// client: the background refresh goroutine may still be in flight when the test
+// returns, so handing the real client back would reintroduce the same race.
+func installInertKiroRestClient(t *testing.T) {
+	t.Helper()
+	kiroRestHttpStore.Store(&http.Client{
+		Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+			return nil, fmt.Errorf("network disabled in test")
+		}),
+	})
+	t.Cleanup(func() {
+		kiroRestHttpStore.Store(&http.Client{Transport: &http.Transport{}})
+	})
+}
+
 // TestApiImportCredentialsRejectsWhenRefreshFails verifies the regression:
 // previously, when auth.RefreshToken failed and the user supplied an accessToken,
 // the handler stored that accessToken with ExpiresAt = now+300, producing an
@@ -149,6 +176,10 @@ func TestApiImportCredentialsExternalIdpHappyPath(t *testing.T) {
 		t.Fatalf("config.Init: %v", err)
 	}
 	defer installCleanAuthClient(t)()
+	// This import succeeds and carries a profileArn, so it reaches Kiro REST
+	// twice (profile verification + background model refresh). See
+	// installInertKiroRestClient.
+	installInertKiroRestClient(t)
 
 	const upstreamExpiresIn = 3600
 	// external_idp refreshes against the IdP token endpoint (snake_case OAuth2
@@ -300,10 +331,18 @@ func TestApiImportCliJsonBatch(t *testing.T) {
 		t.Fatalf("config.Init: %v", err)
 	}
 	defer installCleanAuthClient(t)()
+	installInertKiroRestClient(t)
 
+	// Rotate per-credential rather than returning one fixed refresh token for
+	// every request: import rejects a credential whose refresh token is already
+	// persisted, so a stub that hands the same rotated token to both items would
+	// make the second import a self-inflicted duplicate rather than exercising
+	// the batch path.
 	idp := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = r.ParseForm()
+		rotated := r.Form.Get("refresh_token") + "-rotated"
 		w.Header().Set("Content-Type", "application/json")
-		fmt.Fprint(w, `{"access_token":"at","refresh_token":"rt2","expires_in":3600}`)
+		fmt.Fprintf(w, `{"access_token":"at","refresh_token":%q,"expires_in":3600}`, rotated)
 	}))
 	defer idp.Close()
 	restoreValidator := auth.SetExternalIdpValidatorForTest(func(string) error { return nil })
@@ -313,7 +352,7 @@ func TestApiImportCliJsonBatch(t *testing.T) {
 
 	body := `[
 	  {"auth_method":"external_idp","client_id":"c1","refresh_token":"rt1","token_endpoint":"` + idp.URL + `","email":"a@example.com","type":"kiro"},
-	  {"auth_method":"external_idp","client_id":"c2","refresh_token":"rt1","token_endpoint":"` + idp.URL + `","email":"b@example.com","type":"kiro"}
+	  {"auth_method":"external_idp","client_id":"c2","refresh_token":"rt2","token_endpoint":"` + idp.URL + `","email":"b@example.com","type":"kiro"}
 	]`
 	req := httptest.NewRequest("POST", "/auth/import-cli-json", strings.NewReader(body))
 	rec := httptest.NewRecorder()
@@ -385,5 +424,138 @@ func TestExternalIDPDiagnosticsReportsStaticWarnings(t *testing.T) {
 	response := rec.Body.String()
 	if !strings.Contains(response, "totalExternalIdp") || !strings.Contains(response, "tokenRefreshDue") || !strings.Contains(response, "profile ARN is missing") {
 		t.Fatalf("diagnostics missing expected static checks: %s", response)
+	}
+}
+
+// MERGE POLICY NOTE (fork ↔ upstream v1.1.5): the two sides of this file's
+// conflicts were DIFFERENT tests that happened to land at the same offsets, not
+// rival versions of one test. Everything above is the fork's suite (external_idp
+// import happy path, missing-token-endpoint rejection, CLI-JSON preview/batch,
+// diagnostics); everything below is upstream's api_key import suite. Both are
+// kept verbatim -- picking one side would have silently deleted real coverage.
+
+// MERGE POLICY NOTE (fork ↔ upstream v1.1.5), api_key import contract: upstream's
+// two tests below were written against an import that persisted a key WITHOUT
+// contacting upstream. This fork requires one successful live probe before an
+// api_key account is stored, because such an account never re-probes afterwards
+// (ResolveProfileArn short-circuits for key-bound profiles), so a bad key or a
+// wrong region would 403 forever with no repair path. That invariant is locked in
+// by TestImportKiroAPIKeyCredentialLiveValidatesAndPersists and is NOT relaxed to
+// satisfy a test.
+//
+// Upstream's genuinely-unique coverage is preserved by driving these two tests
+// through the same probeKiroAPIKeyAccount seam the fork's own test uses:
+//   - "ksk_xxx|region" pipe form is split, and the embedded region is adopted,
+//   - a re-import of an already-persisted key answers 409.
+//
+// One upstream assertion is deliberately inverted: AccessToken stays EMPTY rather
+// than mirroring the key. Routing reads the key through Account.UpstreamBearerToken
+// (which special-cases IsKiroAPIKeyCredential), so mirroring would duplicate a
+// long-lived secret into a second persisted field for no functional gain.
+func TestApiImportCredentialsAPIKeySuccess(t *testing.T) {
+	cfgFile := t.TempDir() + "/config.json"
+	if err := config.Init(cfgFile); err != nil {
+		t.Fatalf("config.Init: %v", err)
+	}
+	oldProbe := probeKiroAPIKeyAccount
+	probeKiroAPIKeyAccount = func(account *config.Account) (*config.AccountInfo, error) {
+		if account.KiroApiKey != "ksk_test_import" || account.RegionOverride != "eu-central-1" {
+			t.Fatalf("unexpected probe account: %+v", account)
+		}
+		return &config.AccountInfo{Email: "cli-key@example.com", UserId: "cli-key-user"}, nil
+	}
+	t.Cleanup(func() { probeKiroAPIKeyAccount = oldProbe })
+	// The import handler spawns a background, un-awaited model-list refresh
+	// for enabled accounts. Route it through a stub transport with no Proxy
+	// configured (rather than the real http.ProxyFromEnvironment-backed
+	// client) and restore to an equally inert stub afterward — never back to
+	// the real client — since the goroutine may still be in flight after this
+	// test returns and would otherwise poison TestBuildKiroTransport*, which
+	// relies on http.ProxyFromEnvironment reading env vars for the first time.
+	kiroRestHttpStore.Store(&http.Client{
+		Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+			return nil, fmt.Errorf("network disabled in test")
+		}),
+	})
+	t.Cleanup(func() {
+		kiroRestHttpStore.Store(&http.Client{Transport: &http.Transport{}})
+	})
+
+	h := &Handler{pool: accountpool.GetPool()}
+	body := `{"kiroApiKey":"ksk_test_import|eu-central-1","authMethod":"api_key","nickname":"cli-key"}`
+	req := httptest.NewRequest("POST", "/auth/credentials", strings.NewReader(body))
+	rec := httptest.NewRecorder()
+	h.apiImportCredentials(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	accs := config.GetAccounts()
+	if len(accs) != 1 {
+		t.Fatalf("expected 1 account, got %d", len(accs))
+	}
+	got := accs[0]
+	if got.AuthMethod != "api_key" || got.KiroApiKey != "ksk_test_import" {
+		t.Fatalf("unexpected account: %+v", got)
+	}
+	// See the merge-policy note above: the key is stored once, in KiroApiKey.
+	if got.AccessToken != "" {
+		t.Fatalf("accessToken must not duplicate the api key, got %q", got.AccessToken)
+	}
+	if got.Region != "eu-central-1" {
+		t.Fatalf("region = %q", got.Region)
+	}
+	if got.RefreshToken != "" || got.ExpiresAt != 0 || got.ProfileArn != "" {
+		t.Fatalf("oauth fields should be empty: %+v", got)
+	}
+	if got.MachineId != config.MachineIdFromAPIKey("ksk_test_import") {
+		t.Fatalf("machineId = %q", got.MachineId)
+	}
+}
+
+func TestApiImportCredentialsAPIKeyDuplicateRejected(t *testing.T) {
+	cfgFile := t.TempDir() + "/config.json"
+	if err := config.Init(cfgFile); err != nil {
+		t.Fatalf("config.Init: %v", err)
+	}
+	// See the merge-policy note on TestApiImportCredentialsAPIKeySuccess: the
+	// live probe is mandatory, so it is stubbed rather than removed. This key
+	// carries NO embedded region, so it takes the discovery path — that walks the
+	// candidate regions through resolveApiKeyRegion/probeKiroApiKey, a different
+	// seam from the single-region probe used when a region is already known.
+	oldProbe := probeKiroApiKey
+	probeKiroApiKey = func(key, region string) (*config.AccountInfo, error) {
+		if key != "ksk_dup_import" {
+			t.Fatalf("unexpected probed key %q", key)
+		}
+		return &config.AccountInfo{Email: "dup@example.com", UserId: "dup-user"}, nil
+	}
+	t.Cleanup(func() { probeKiroApiKey = oldProbe })
+	// See TestApiImportCredentialsAPIKeySuccess: avoid ever restoring the real
+	// http.ProxyFromEnvironment-backed client, since the background model
+	// refresh goroutine may still be in flight after this test returns.
+	kiroRestHttpStore.Store(&http.Client{
+		Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+			return nil, fmt.Errorf("network disabled in test")
+		}),
+	})
+	t.Cleanup(func() {
+		kiroRestHttpStore.Store(&http.Client{Transport: &http.Transport{}})
+	})
+
+	h := &Handler{pool: accountpool.GetPool()}
+	body := `{"kiroApiKey":"ksk_dup_import","authMethod":"api_key"}`
+	req := httptest.NewRequest("POST", "/auth/credentials", strings.NewReader(body))
+	rec := httptest.NewRecorder()
+	h.apiImportCredentials(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("first import expected 200, got %d body=%s", rec.Code, rec.Body.String())
+	}
+
+	req2 := httptest.NewRequest("POST", "/auth/credentials", strings.NewReader(body))
+	rec2 := httptest.NewRecorder()
+	h.apiImportCredentials(rec2, req2)
+	if rec2.Code != http.StatusConflict {
+		t.Fatalf("duplicate expected 409, got %d body=%s", rec2.Code, rec2.Body.String())
 	}
 }

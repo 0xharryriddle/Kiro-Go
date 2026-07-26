@@ -15,6 +15,7 @@ import (
 	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -22,6 +23,14 @@ import (
 	"strings"
 	"sync"
 	"time"
+)
+
+var (
+	ErrAccountNotFound       = errors.New("account not found")
+	ErrDuplicateAccountID    = errors.New("account ID already exists")
+	ErrDuplicateRefreshToken = errors.New("account refresh token already exists")
+	ErrDuplicateAPIKey       = errors.New("account API key already exists")
+	ErrEmptyAPIKey           = errors.New("kiroApiKey is empty")
 )
 
 // GenerateMachineId generates a UUID v4 format machine identifier.
@@ -53,8 +62,16 @@ type Account struct {
 	Tags    []string `json:"tags,omitempty"`    // Labels; custom_api accounts carry ["Custom API"]
 
 	// Authentication credentials
-	AccessToken   string `json:"accessToken"`             // OAuth access token for API calls
-	RefreshToken  string `json:"refreshToken"`            // OAuth refresh token for token renewal
+	AccessToken  string `json:"accessToken"`  // OAuth access token for API calls
+	RefreshToken string `json:"refreshToken"` // OAuth refresh token for token renewal
+	// RefreshTokenFingerprint is a one-way identifier for the credential that
+	// originally created this account. It prevents a previously imported token
+	// from being imported again after the provider rotates it.
+	// MERGE POLICY NOTE (fork ↔ upstream v1.1.5): added by upstream; the fork's
+	// own fields below are kept alongside it (the two sides added disjoint
+	// credential features, so this struct is a union of both).
+	RefreshTokenFingerprint string `json:"refreshTokenFingerprint,omitempty"`
+
 	ClientID      string `json:"clientId,omitempty"`      // OIDC client ID (for IdC auth)
 	ClientSecret  string `json:"clientSecret,omitempty"`  // OIDC client secret (for IdC auth)
 	KiroApiKey    string `json:"kiroApiKey,omitempty"`    // Upstream Kiro-issued ksk_ credential (headless "api_key" auth). Used directly as the upstream bearer token, never refreshed, never mirrored into AccessToken.
@@ -102,6 +119,15 @@ type Account struct {
 	// not accept the Anthropic Messages wire format. Defaults false: Claude models
 	// stay on the zero-translation native invoke path.
 	BedrockUseConverse bool `json:"bedrockUseConverse,omitempty"`
+
+	// MERGE POLICY NOTE (fork ↔ upstream v1.1.5): upstream's side of this conflict
+	// re-declared AccessToken, RefreshToken, KiroApiKey, ClientID, ClientSecret,
+	// AuthMethod, Provider, Region, StartUrl, ExpiresAt, MachineId, ProfileArn and
+	// TokenEndpoint/IssuerURL/Scopes — all of which the fork already declares above
+	// with equivalent json tags. Only RefreshTokenFingerprint was genuinely new, and
+	// it has been hoisted next to RefreshToken. Re-adding upstream's copies here
+	// would be a duplicate-field compile error, so this side of the hunk is
+	// intentionally empty rather than unioned.
 
 	// Per-account outbound proxy (falls back to global ProxyURL if empty)
 	ProxyURL string `json:"proxyURL,omitempty"`
@@ -581,7 +607,7 @@ type AccountInfo struct {
 }
 
 // Version current version
-const Version = "1.1.2"
+const Version = "1.1.5"
 
 var (
 	cfg     *Config
@@ -1119,17 +1145,259 @@ func GetEnabledAccounts() []Account {
 	return accounts
 }
 
+// RefreshTokenFingerprint returns a stable, non-reversible identifier for an
+// opaque refresh token. Empty tokens do not receive a fingerprint.
+func RefreshTokenFingerprint(refreshToken string) string {
+	if refreshToken == "" {
+		return ""
+	}
+	sum := sha256.Sum256([]byte(refreshToken))
+	return fmt.Sprintf("%x", sum[:])
+}
+
+// APIKeyFingerprint returns a stable, non-reversible identifier for a Kiro API key.
+func APIKeyFingerprint(apiKey string) string {
+	if apiKey == "" {
+		return ""
+	}
+	sum := sha256.Sum256([]byte(apiKey))
+	return fmt.Sprintf("%x", sum[:])
+}
+
+// IsAPIKeyAccount reports whether the account authenticates with a Kiro API key.
+func IsAPIKeyAccount(account *Account) bool {
+	if account == nil {
+		return false
+	}
+	if strings.TrimSpace(account.KiroApiKey) != "" {
+		return true
+	}
+	method := strings.ToLower(strings.TrimSpace(account.AuthMethod))
+	return method == "api_key" || method == "apikey"
+}
+
+// SplitKiroAPIKeyAndRegion parses the convenience form "key|region".
+// The key itself is not restricted to a fixed prefix so future formats remain compatible.
+func SplitKiroAPIKeyAndRegion(raw string) (key, region string, err error) {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return "", "", ErrEmptyAPIKey
+	}
+	parts := strings.Split(trimmed, "|")
+	if len(parts) > 2 {
+		return "", "", errors.New("multiple pipe separators are not allowed")
+	}
+	key = strings.TrimSpace(parts[0])
+	if key == "" {
+		return "", "", errors.New("key before pipe is empty")
+	}
+	if len(parts) == 2 {
+		region = strings.TrimSpace(parts[1])
+		if region == "" {
+			return "", "", errors.New("region after pipe is empty")
+		}
+		if err := validateKiroRegionHostLabel(region); err != nil {
+			return "", "", err
+		}
+	}
+	return key, region, nil
+}
+
+func validateKiroRegionHostLabel(region string) error {
+	region = strings.TrimSpace(region)
+	if region == "" {
+		return errors.New("region is empty")
+	}
+	for _, r := range region {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '-' {
+			continue
+		}
+		return errors.New("region contains host-unsafe characters")
+	}
+	if strings.Contains(region, " ") || strings.ContainsAny(region, "\n\r\t./") {
+		return errors.New("region contains host-unsafe characters")
+	}
+	return nil
+}
+
+// MachineIdFromAPIKey derives the machine id used by Kiro CLI/API-key clients:
+// sha256 hex of "KiroAPIKey/<api_key>".
+func MachineIdFromAPIKey(apiKey string) string {
+	sum := sha256.Sum256([]byte("KiroAPIKey/" + apiKey))
+	return fmt.Sprintf("%x", sum[:])
+}
+
+// NormalizeAPIKeyAccount fills API-key credential defaults in place.
+// It accepts "ksk_xxx|region", sets AuthMethod=api_key, copies the key into
+// AccessToken for the shared Bearer path, clears OAuth-only fields, and
+// derives MachineId when missing.
+func NormalizeAPIKeyAccount(account *Account) error {
+	if account == nil {
+		return errors.New("account is nil")
+	}
+	raw := strings.TrimSpace(account.KiroApiKey)
+	if raw == "" {
+		raw = strings.TrimSpace(account.AccessToken)
+	}
+	key, region, err := SplitKiroAPIKeyAndRegion(raw)
+	if err != nil {
+		return err
+	}
+	account.KiroApiKey = key
+	account.AccessToken = key
+	account.AuthMethod = "api_key"
+	account.RefreshToken = ""
+	account.RefreshTokenFingerprint = ""
+	account.ClientID = ""
+	account.ClientSecret = ""
+	account.TokenEndpoint = ""
+	account.IssuerURL = ""
+	account.Scopes = ""
+	account.ProfileArn = ""
+	account.ExpiresAt = 0
+	if region != "" {
+		if strings.TrimSpace(account.Region) == "" {
+			account.Region = region
+		}
+	}
+	if strings.TrimSpace(account.Region) == "" {
+		account.Region = "us-east-1"
+	}
+	if err := validateKiroRegionHostLabel(account.Region); err != nil {
+		return err
+	}
+	if strings.TrimSpace(account.MachineId) == "" {
+		account.MachineId = MachineIdFromAPIKey(key)
+	}
+	if strings.TrimSpace(account.Provider) == "" {
+		account.Provider = "APIKey"
+	}
+	if strings.TrimSpace(account.Email) == "" {
+		// Stable display label without leaking the full secret.
+		fp := APIKeyFingerprint(key)
+		if len(fp) > 12 {
+			fp = fp[:12]
+		}
+		account.Email = "api-key-" + fp
+	}
+	return nil
+}
+
+// AccountCredentialExists checks both the current refresh token and the
+// original credential fingerprint while holding the configuration read lock.
+func AccountCredentialExists(refreshToken string) bool {
+	if refreshToken == "" {
+		return false
+	}
+	fingerprint := RefreshTokenFingerprint(refreshToken)
+	cfgLock.RLock()
+	defer cfgLock.RUnlock()
+	for _, account := range cfg.Accounts {
+		if account.RefreshToken == refreshToken ||
+			(fingerprint != "" && account.RefreshTokenFingerprint == fingerprint) {
+			return true
+		}
+	}
+	return false
+}
+
+// AccountAPIKeyExists reports whether a Kiro API key is already persisted.
+func AccountAPIKeyExists(apiKey string) bool {
+	apiKey = strings.TrimSpace(apiKey)
+	if apiKey == "" {
+		return false
+	}
+	fingerprint := APIKeyFingerprint(apiKey)
+	cfgLock.RLock()
+	defer cfgLock.RUnlock()
+	for _, account := range cfg.Accounts {
+		existing := strings.TrimSpace(account.KiroApiKey)
+		if existing == "" {
+			continue
+		}
+		if existing == apiKey || APIKeyFingerprint(existing) == fingerprint {
+			return true
+		}
+	}
+	return false
+}
+
+// MERGE POLICY NOTE (fork ↔ upstream v1.1.5): upstream's copy of AccountIDExists
+// sat here. Both sides added the same function in different places, so git merged
+// each cleanly and produced a duplicate declaration with NO conflict marker. The
+// two bodies were logically identical (differing only in the loop variable name),
+// so upstream's copy was deleted and the fork's — which carries the doc comment
+// explaining the import-path contract — is the survivor above.
+
 func AddAccount(account Account) error {
 	cfgLock.Lock()
 	defer cfgLock.Unlock()
-	// Reject a duplicate id under the write lock. The import path pre-checks with
-	// AccountIDExists (RLock) and mints a fresh id on collision, but that check and this
-	// append are not atomic; two concurrent imports of the same pasted id could both
-	// pass the pre-check. This makes "add if id absent" the atomic invariant.
-	if account.ID != "" {
-		for _, a := range cfg.Accounts {
-			if a.ID == account.ID {
-				return fmt.Errorf("account with id %s already exists", account.ID)
+
+	// MERGE POLICY NOTE (fork ↔ upstream v1.1.5): both sides added duplicate
+	// rejection here, guarding DIFFERENT things, so this is a union rather than a
+	// choice. Upstream contributed api-key normalization plus refresh-token
+	// fingerprint / API-key dedup (defeats re-importing a credential the provider
+	// has since rotated). The fork contributed the atomic id check: the import path
+	// pre-checks with AccountIDExists under RLock and mints a fresh id on collision,
+	// but that check and this append are not atomic, so two concurrent imports of
+	// the same pasted id could both pass the pre-check. Doing the id comparison
+	// inside this write lock is what makes "add if id absent" a real invariant.
+	//
+	// The id check returns upstream's ErrDuplicateAccountID (a sentinel callers can
+	// match with errors.Is) instead of the fork's fmt.Errorf string.
+	// The normalization gate is IsKiroAPIKeyCredential (an explicit
+	// authMethod=="api_key" check), NOT upstream's IsAPIKeyAccount.
+	//
+	// MERGE POLICY NOTE (fork ↔ upstream v1.1.5): IsAPIKeyAccount also returns
+	// true whenever KiroApiKey is non-empty, and in this fork that field is
+	// overloaded — a custom_api account stores its upstream pool bearer there.
+	// Gating on it sent every custom_api account through NormalizeAPIKeyAccount,
+	// which rewrites AuthMethod to "api_key" and wipes BaseURL-adjacent state,
+	// so linked-pool accounts silently became broken key accounts. It also
+	// rejected any authMethod=="api_key" record whose key is empty (test
+	// fixtures) with "kiroApiKey is empty". Both are avoided by keying off the
+	// declared credential kind instead of a field that means two things.
+	if account.IsKiroAPIKeyCredential() && strings.TrimSpace(account.KiroApiKey) != "" {
+		if err := NormalizeAPIKeyAccount(&account); err != nil {
+			return err
+		}
+	} else if account.RefreshTokenFingerprint == "" {
+		account.RefreshTokenFingerprint = RefreshTokenFingerprint(account.RefreshToken)
+	}
+	for _, existing := range cfg.Accounts {
+		if account.ID != "" && existing.ID == account.ID {
+			return ErrDuplicateAccountID
+		}
+		if account.RefreshToken != "" && existing.RefreshToken == account.RefreshToken {
+			return ErrDuplicateRefreshToken
+		}
+		existingFingerprint := existing.RefreshTokenFingerprint
+		if existingFingerprint == "" {
+			existingFingerprint = RefreshTokenFingerprint(existing.RefreshToken)
+		}
+		if account.RefreshTokenFingerprint != "" &&
+			existingFingerprint == account.RefreshTokenFingerprint {
+			return ErrDuplicateRefreshToken
+		}
+		// Upstream's key dedup is scoped to the data-plane REGION here, which
+		// upstream's own version was not. In this fork a Kiro API key is
+		// legitimately added once per region: model access is per-region, so the
+		// same ksk_ key served in us-east-1 and in ap-southeast-1 is two distinct
+		// pool slots (see AddKiroAPIKeyAccountIfAbsent, whose stable identity is
+		// userId+region, and TestAdminAddKiroApiKey's multi-region case). An
+		// unscoped key comparison rejected the second region with
+		// ErrDuplicateAPIKey and collapsed multi-region support.
+		//
+		// Only api_key credentials are compared: custom_api accounts store their
+		// upstream pool bearer in this same field, and two linked pools may share
+		// a bearer without being the same account.
+		if account.KiroApiKey != "" && account.IsKiroAPIKeyCredential() &&
+			existing.IsKiroAPIKeyCredential() &&
+			accountDataPlaneRegion(existing) == accountDataPlaneRegion(account) {
+			existingKey := strings.TrimSpace(existing.KiroApiKey)
+			if existingKey != "" && (existingKey == account.KiroApiKey ||
+				APIKeyFingerprint(existingKey) == APIKeyFingerprint(account.KiroApiKey)) {
+				return ErrDuplicateAPIKey
 			}
 		}
 	}
@@ -1198,15 +1466,44 @@ func accountDataPlaneRegion(account Account) string {
 func UpdateAccount(id string, account Account) error {
 	cfgLock.Lock()
 	defer cfgLock.Unlock()
-	for i := range cfg.Accounts {
-		if cfg.Accounts[i].ID == id {
-			// ProfileArn/ProfilePinned/RegionOverride form one atomic routing tuple.
-			// Most callers update unrelated fields from detached snapshots (ban state,
-			// usage, admin metadata). Preserve the current tuple so a stale whole-row
-			// write cannot undo a concurrent manual profile selection.
-			account.ProfileArn = cfg.Accounts[i].ProfileArn
-			account.ProfilePinned = cfg.Accounts[i].ProfilePinned
-			account.RegionOverride = cfg.Accounts[i].RegionOverride
+	// MERGE POLICY NOTE (fork ↔ upstream v1.1.5): both sides hardened UpdateAccount
+	// against stale whole-row writes, protecting DIFFERENT field groups, so both
+	// preservation sets are kept.
+	//
+	//   - fork: the ProfileArn/ProfilePinned/RegionOverride routing tuple, so a
+	//     detached snapshot (ban state, usage, admin metadata) cannot undo a
+	//     concurrent manual profile selection.
+	//   - upstream: the credential state, so a snapshot taken before a refresh
+	//     cannot roll back a refresh-token rotation that landed while an upstream
+	//     status request was in flight.
+	//
+	// Callers that legitimately need to replace credentials or routing must use
+	// ReplaceAccount (below) or the field-specific setters (UpdateAccountToken,
+	// UpdateAccountProfileArn, ...), which is already how the refresh path writes.
+	for i, a := range cfg.Accounts {
+		if a.ID == id {
+			// Routing tuple (fork).
+			account.ProfileArn = a.ProfileArn
+			account.ProfilePinned = a.ProfilePinned
+			account.RegionOverride = a.RegionOverride
+			// Credential state (upstream).
+			account.AccessToken = a.AccessToken
+			account.RefreshToken = a.RefreshToken
+			account.RefreshTokenFingerprint = a.RefreshTokenFingerprint
+			account.KiroApiKey = a.KiroApiKey
+			account.ClientID = a.ClientID
+			account.ClientSecret = a.ClientSecret
+			account.AuthMethod = a.AuthMethod
+			account.Provider = a.Provider
+			account.Region = a.Region
+			account.StartUrl = a.StartUrl
+			account.ExpiresAt = a.ExpiresAt
+			account.TokenEndpoint = a.TokenEndpoint
+			account.IssuerURL = a.IssuerURL
+			account.Scopes = a.Scopes
+			if account.RefreshTokenFingerprint == "" {
+				account.RefreshTokenFingerprint = RefreshTokenFingerprint(a.RefreshToken)
+			}
 			previous := cfg.Accounts[i]
 			cfg.Accounts[i] = account
 			if err := Save(); err != nil {
@@ -1339,12 +1636,17 @@ func SetAccountEnabled(id string, enabled bool) error {
 	defer cfgLock.Unlock()
 	for i, a := range cfg.Accounts {
 		if a.ID == id {
+			previous := cfg.Accounts[i]
 			cfg.Accounts[i].Enabled = enabled
 			if !enabled {
 				cfg.Accounts[i].BanStatus = "DISABLED"
 				cfg.Accounts[i].BanTime = time.Now().Unix()
 			}
-			return Save()
+			if err := Save(); err != nil {
+				cfg.Accounts[i] = previous
+				return err
+			}
+			return nil
 		}
 	}
 	return nil
@@ -1357,13 +1659,39 @@ func SetAccountBanStatus(id, status, reason string) error {
 	defer cfgLock.Unlock()
 	for i, a := range cfg.Accounts {
 		if a.ID == id {
+			previous := cfg.Accounts[i]
 			cfg.Accounts[i].BanStatus = status
 			cfg.Accounts[i].BanReason = reason
 			cfg.Accounts[i].BanTime = time.Now().Unix()
 			if status == "BANNED" || status == "DISABLED" {
 				cfg.Accounts[i].Enabled = false
 			}
-			return Save()
+			if err := Save(); err != nil {
+				cfg.Accounts[i] = previous
+				return err
+			}
+			return nil
+		}
+	}
+	return nil
+}
+
+// ClearAccountBanStatus marks an account active without replacing any
+// credential fields from a potentially stale caller snapshot.
+func ClearAccountBanStatus(id string) error {
+	cfgLock.Lock()
+	defer cfgLock.Unlock()
+	for i, account := range cfg.Accounts {
+		if account.ID == id {
+			previous := cfg.Accounts[i]
+			cfg.Accounts[i].BanStatus = "ACTIVE"
+			cfg.Accounts[i].BanReason = ""
+			cfg.Accounts[i].BanTime = 0
+			if err := Save(); err != nil {
+				cfg.Accounts[i] = previous
+				return err
+			}
+			return nil
 		}
 	}
 	return nil
@@ -1377,12 +1705,22 @@ func UpdateAccountProfileArn(id, profileArn string) error {
 	defer cfgLock.Unlock()
 	for i, a := range cfg.Accounts {
 		if a.ID == id {
+			// MERGE POLICY NOTE (fork ↔ upstream v1.1.5): union. The fork's guard
+			// refuses to move an operator-pinned ARN, and upstream's `previous`
+			// capture is what the Save() rollback below restores. Neither replaces
+			// the other: the guard runs first so a pinned account is rejected before
+			// any mutation, then the snapshot makes the write reversible.
 			profileArn = strings.TrimSpace(profileArn)
 			if cfg.Accounts[i].ProfilePinned && profileArn != strings.TrimSpace(cfg.Accounts[i].ProfileArn) {
 				return fmt.Errorf("account profile is manually pinned")
 			}
+			previous := cfg.Accounts[i].ProfileArn
 			cfg.Accounts[i].ProfileArn = profileArn
-			return Save()
+			if err := Save(); err != nil {
+				cfg.Accounts[i].ProfileArn = previous
+				return err
+			}
+			return nil
 		}
 	}
 	return fmt.Errorf("account not found: %s", id)
@@ -1446,19 +1784,44 @@ func DeleteAccount(id string) error {
 }
 
 func UpdateAccountToken(id, accessToken, refreshToken string, expiresAt int64) error {
+	return UpdateAccountCredentialState(id, accessToken, refreshToken, expiresAt, "")
+}
+
+// UpdateAccountCredentialState atomically updates all fields produced by one
+// refresh-token exchange. If persistence fails, the in-memory configuration is
+// restored so a rotated token is never published from a state that cannot
+// survive restart.
+func UpdateAccountCredentialState(
+	id string,
+	accessToken string,
+	refreshToken string,
+	expiresAt int64,
+	profileArn string,
+) error {
 	cfgLock.Lock()
 	defer cfgLock.Unlock()
 	for i, a := range cfg.Accounts {
 		if a.ID == id {
+			previous := cfg.Accounts[i]
+			if cfg.Accounts[i].RefreshTokenFingerprint == "" {
+				cfg.Accounts[i].RefreshTokenFingerprint = RefreshTokenFingerprint(a.RefreshToken)
+			}
 			cfg.Accounts[i].AccessToken = accessToken
 			if refreshToken != "" {
 				cfg.Accounts[i].RefreshToken = refreshToken
 			}
 			cfg.Accounts[i].ExpiresAt = expiresAt
-			return Save()
+			if profileArn != "" {
+				cfg.Accounts[i].ProfileArn = profileArn
+			}
+			if err := Save(); err != nil {
+				cfg.Accounts[i] = previous
+				return err
+			}
+			return nil
 		}
 	}
-	return nil
+	return ErrAccountNotFound
 }
 
 func GetApiKey() string {

@@ -8,7 +8,6 @@ import (
 	"kiro-go/config"
 	"kiro-go/logger"
 	"net/http"
-	"net/url"
 	"strings"
 	"sync"
 	"time"
@@ -60,6 +59,13 @@ func refreshLockFor(id string) *sync.Mutex {
 // for id-less accounts (login validation, which has no shared state to
 // coordinate against) and as the inner step of the locked RefreshToken.
 func refreshTokenDirect(account *config.Account) (string, string, int64, string, error) {
+	// MERGE POLICY NOTE (fork ↔ upstream v1.1.5): upstream added this API-key guard
+	// directly in RefreshToken. It is placed here instead so BOTH entry points (the
+	// locked RefreshToken and the id-less direct path) reject key credentials — an
+	// api_key account has no refresh token, so a refresh attempt is always a bug.
+	if config.IsAPIKeyAccount(account) {
+		return "", "", 0, "", fmt.Errorf("API Key credentials do not support token refresh")
+	}
 	// Resolve per-account proxy: account.ProxyURL > global config. A direct opt-out
 	// must not fall back to the global proxy; imported IDE accounts may need to
 	// mirror the IDE's no-proxy path while other accounts still use global proxy.
@@ -68,14 +74,76 @@ func refreshTokenDirect(account *config.Account) (string, string, int64, string,
 		proxyURL = config.GetProxyURL()
 	}
 	client := GetAuthClientForProxy(proxyURL)
+
+	// MERGE POLICY NOTE (fork ↔ upstream v1.1.5): two rival external-IdP refresh
+	// implementations collided here. Resolution keeps upstream's refresh (the
+	// strict superset: it validates the issuer, pins the token endpoint to the
+	// issuer's tenant, and normalizes scopes) and upstream's tolerant auth-method
+	// comparison, while keeping the fork's switch shape for the other providers.
+	// MicrosoftSSOAuthMethod is the same "external_idp" string the fork already
+	// stored, so this one branch serves accounts from BOTH onboarding paths.
+	if strings.EqualFold(strings.TrimSpace(account.AuthMethod), MicrosoftSSOAuthMethod) {
+		// Accounts imported by the fork's older paths can lack issuerUrl/scopes
+		// (they were optional before upstream's validation existed). Backfill them
+		// from the material we do have rather than failing the refresh: without
+		// this, every pre-merge external_idp account would start erroring with
+		// "Microsoft issuer must end with /<tenant>/v2.0".
+		tokenEndpoint, issuerURL, scopes := externalIdpRefreshInputs(account)
+		return refreshExternalIdpToken(
+			account.RefreshToken,
+			account.ClientID,
+			tokenEndpoint,
+			issuerURL,
+			scopes,
+			client,
+		)
+	}
 	switch account.AuthMethod {
-	case "external_idp":
-		return refreshExternalIdpToken(account.RefreshToken, account.ClientID, account.TokenEndpoint, account.Scopes, client)
 	case "social":
 		return refreshSocialToken(account.RefreshToken, client)
 	default:
 		return refreshOIDCToken(account.RefreshToken, account.ClientID, account.ClientSecret, account.Region, client)
 	}
+}
+
+// externalIdpRefreshInputs returns the token endpoint, issuer, and scopes to use
+// for an external-IdP refresh, reconstructing whichever ones the stored account
+// omits. Pre-merge accounts were persisted before issuer/scope validation
+// existed, so they routinely carry an empty IssuerURL or Scopes; upstream's
+// refresh rejects both. Derivation reuses upstream's helpers, which re-validate
+// the host allow-list, so a recovered endpoint is no less gated than a stored
+// one. Anything that cannot be recovered is passed through unchanged and the
+// refresh itself reports the specific validation failure.
+func externalIdpRefreshInputs(account *config.Account) (tokenEndpoint, issuerURL, scopes string) {
+	tokenEndpoint = strings.TrimSpace(account.TokenEndpoint)
+	issuerURL = strings.TrimSpace(account.IssuerURL)
+	scopes = strings.TrimSpace(account.Scopes)
+
+	// Issuer missing: recover it from the tenant-specific token endpoint.
+	if issuerURL == "" && tokenEndpoint != "" {
+		if normalizedEndpoint, derivedIssuer, derivedScopes := ExternalIdpConfigurationFromTokenEndpoint(tokenEndpoint, account.ClientID); derivedIssuer != "" {
+			issuerURL = derivedIssuer
+			if normalizedEndpoint != "" {
+				tokenEndpoint = normalizedEndpoint
+			}
+			if scopes == "" {
+				scopes = derivedScopes
+			}
+		}
+	}
+
+	// Endpoint or scopes missing: derive both from the issuer.
+	if issuerURL != "" && (tokenEndpoint == "" || scopes == "") {
+		if derivedEndpoint, _, derivedScopes := ExternalIdpConfigurationFromIssuer(issuerURL, account.ClientID); derivedEndpoint != "" {
+			if tokenEndpoint == "" {
+				tokenEndpoint = derivedEndpoint
+			}
+			if scopes == "" {
+				scopes = derivedScopes
+			}
+		}
+	}
+	return tokenEndpoint, issuerURL, scopes
 }
 
 // RefreshToken refreshes the account's access token. For id-bearing accounts it
@@ -88,6 +156,26 @@ func refreshTokenDirect(account *config.Account) (string, string, int64, string,
 //
 // Returns: accessToken, refreshToken, expiresAt, profileArn, error.
 func RefreshToken(account *config.Account) (string, string, int64, string, error) {
+	return refreshTokenWithPolicy(account, false)
+}
+
+// RefreshTokenForce refreshes unconditionally: it keeps the per-account lock (so
+// concurrent forced refreshes still serialize and a rotated refresh token is
+// never lost) but does NOT skip the IdP POST just because the stored token still
+// looks valid.
+//
+// MERGE POLICY NOTE (fork ↔ upstream v1.1.5): upstream's refreshAccountToken
+// takes a `force` flag and its callers (the admin "refresh" action, the batch
+// refresh, and apiTestAccount) rely on a forced refresh actually reaching the
+// IdP. The fork's double-checked locking made every such call a silent no-op
+// whenever the current token was unexpired, which is exactly what
+// TestRefreshAccountTokenSerializesExternalIDPRotation caught: the second forced
+// refresh never POSTed, so the rotated refresh token was never exercised.
+func RefreshTokenForce(account *config.Account) (string, string, int64, string, error) {
+	return refreshTokenWithPolicy(account, true)
+}
+
+func refreshTokenWithPolicy(account *config.Account, force bool) (string, string, int64, string, error) {
 	if account == nil {
 		return "", "", 0, "", fmt.Errorf("RefreshToken: nil account")
 	}
@@ -106,11 +194,15 @@ func RefreshToken(account *config.Account) (string, string, int64, string, error
 	// Double-checked locking: a concurrent refresh may have renewed the token
 	// while we waited. Re-read the canonical expiry from config; if it is still
 	// valid, propagate it and skip the IdP POST. Either way adopt the canonical
-	// fields (a concurrent refresh may have rotated the refresh token).
+	// fields (a concurrent refresh may have rotated the refresh token) — that
+	// adoption happens even under force, because the whole point of holding the
+	// lock is to POST with the newest refresh token rather than a stale copy.
 	if live, ok := config.GetAccountByID(account.ID); ok {
 		*account = live
-		if now := time.Now().Unix(); live.ExpiresAt > 0 && now < live.ExpiresAt-refreshSkewSeconds {
-			return live.AccessToken, live.RefreshToken, live.ExpiresAt, live.ProfileArn, nil
+		if !force {
+			if now := time.Now().Unix(); live.ExpiresAt > 0 && now < live.ExpiresAt-refreshSkewSeconds {
+				return live.AccessToken, live.RefreshToken, live.ExpiresAt, live.ProfileArn, nil
+			}
 		}
 	}
 
@@ -142,93 +234,25 @@ func RefreshToken(account *config.Account) (string, string, int64, string, error
 	return accessToken, refreshToken, expiresAt, profileArn, nil
 }
 
-// refreshExternalIdpToken refreshes an external-IdP (enterprise SSO) access token
-// through the IdP token endpoint using the OAuth2 refresh_token grant for a public
-// client (no client secret). offline_access in the original scopes is what makes a
-// refresh token available. The IdP issues no profileArn (it is resolved separately
-// via ListAvailableProfiles using the EXTERNAL_IDP token type), so "" is returned
-// for the profileArn.
-func refreshExternalIdpToken(refreshToken, clientID, tokenEndpoint, scopes string, client *http.Client) (string, string, int64, string, error) {
-	if clientID == "" || tokenEndpoint == "" {
-		return "", "", 0, "", fmt.Errorf("external IdP refresh requires clientId and tokenEndpoint")
-	}
-	form := url.Values{}
-	form.Set("client_id", clientID)
-	form.Set("grant_type", "refresh_token")
-	form.Set("refresh_token", refreshToken)
-	if scopes != "" {
-		form.Set("scope", scopes)
-	}
-	accessToken, newRefreshToken, expiresIn, err := postExternalIdpToken(client, tokenEndpoint, form)
-	if err != nil {
-		return "", "", 0, "", err
-	}
-	// Some IdPs (Azure AD) rotate refresh tokens; others omit it on refresh. Keep the
-	// existing refresh token when the response does not carry a new one.
-	if newRefreshToken == "" {
-		newRefreshToken = refreshToken
-	}
-	expiresAt := time.Now().Unix() + int64(expiresIn)
-	return accessToken, newRefreshToken, expiresAt, "", nil
-}
-
-// postExternalIdpToken performs a form-encoded POST to an external-IdP token
-// endpoint and maps the snake_case OAuth2 token response onto the standard return
-// shape. Shared by the authorization-code exchange (login) and the refresh_token
-// grant (renewal).
-func postExternalIdpToken(client *http.Client, tokenEndpoint string, form url.Values) (accessToken, refreshToken string, expiresIn int, err error) {
-	if strings.TrimSpace(tokenEndpoint) == "" {
-		return "", "", 0, fmt.Errorf("external IdP token endpoint is empty")
-	}
-	// Defense-in-depth: re-validate the endpoint at the outbound-POST boundary so the
-	// refresh token is never sent to a non-allow-listed host — even if a persisted
-	// account's TokenEndpoint was set out-of-band (backup restore, an external file
-	// write, or a future caller that stores an endpoint without validating). This makes
-	// allow-list validation an invariant of the exfiltration-sensitive operation itself
-	// rather than of every caller. Uses the exported ValidateExternalIdpEndpoint so the
-	// test seam (SetExternalIdpValidatorForTest) still relaxes it for httptest servers.
-	if err := ValidateExternalIdpEndpoint(tokenEndpoint); err != nil {
-		return "", "", 0, fmt.Errorf("external IdP token endpoint rejected: %w", err)
-	}
-	req, err := http.NewRequest("POST", tokenEndpoint, strings.NewReader(form.Encode()))
-	if err != nil {
-		return "", "", 0, fmt.Errorf("failed to build external IdP token request: %w", err)
-	}
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	req.Header.Set("Accept", "application/json")
-
-	resp, err := client.Do(req)
-	if err != nil {
-		return "", "", 0, fmt.Errorf("external IdP token request failed: %w", err)
-	}
-	defer resp.Body.Close()
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return "", "", 0, fmt.Errorf("failed to read external IdP token response: %w", err)
-	}
-	var out struct {
-		AccessToken  string `json:"access_token"`
-		RefreshToken string `json:"refresh_token"`
-		ExpiresIn    int    `json:"expires_in"`
-		Error        string `json:"error"`
-		ErrorDesc    string `json:"error_description"`
-	}
-	_ = json.Unmarshal(body, &out)
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 || out.AccessToken == "" {
-		if out.Error != "" {
-			return "", "", 0, fmt.Errorf("external IdP token exchange failed (status %d): %s: %s", resp.StatusCode, out.Error, out.ErrorDesc)
-		}
-		// Never echo the raw body. This branch is also reached on a 2xx that simply
-		// lacks access_token, and such a body legitimately carries refresh_token —
-		// so stringifying it wrote a live credential into an error that
-		// proxy/handler.go logs verbatim on every background refresh failure.
-		// Report only the status and the response size, which is enough to
-		// diagnose a malformed token response without persisting a secret.
-		return "", "", 0, fmt.Errorf("external IdP token exchange failed (status %d): unexpected token response (%d bytes, no access_token)", resp.StatusCode, len(body))
-	}
-	return out.AccessToken, out.RefreshToken, out.ExpiresIn, nil
-}
+// MERGE POLICY NOTE (fork ↔ upstream v1.1.5): the fork's refreshExternalIdpToken
+// and postExternalIdpToken used to live here. Upstream v1.1.5 shipped rival
+// implementations of both in auth/microsoft_sso.go — same package, same names,
+// different signatures (theirs take an extra issuerURL, and their POST returns a
+// *externalIdpTokenResponse instead of three scalars), so keeping both was not
+// possible. Upstream's versions are kept because they are a strict superset of
+// the behavior this pair had:
+//
+//   - endpoint allow-list re-validation at the outbound-POST boundary (the
+//     fork's exfiltration guard) is preserved via ValidateExternalIdpEndpoint;
+//   - plus issuer parsing, tenant-pinning of the token endpoint, scope
+//     normalization, a redirect-refusing client, a bounded body read, and an
+//     expires_in sanity check, none of which the fork's version had;
+//   - the fork's "never echo the response body in an error" redaction property
+//     is also honored there: errors carry status + OAuth error code only.
+//
+// The fork's callers were rewired to the surviving signatures rather than the
+// other way around. See externalIdpRefreshInputs above for how accounts stored
+// before upstream's validation existed are backfilled instead of being failed.
 
 // refreshOIDCToken IdC/Builder ID token 刷新
 func refreshOIDCToken(refreshToken, clientID, clientSecret, region string, client *http.Client) (string, string, int64, string, error) {

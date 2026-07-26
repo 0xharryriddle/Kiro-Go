@@ -11,8 +11,15 @@ import (
 // credential. Current reports the account's cached selection; Pinned reports
 // whether that current selection was explicitly chosen by an operator.
 type KiroProfile struct {
-	Arn     string `json:"arn"`
-	Region  string `json:"region"`
+	Arn    string `json:"arn"`
+	Region string `json:"region"`
+	// Name is the upstream-reported profileName. MERGE POLICY NOTE (fork ↔
+	// upstream v1.1.5): upstream declared a second, conflicting KiroProfile in
+	// proxy/kiro_api.go with fields ARN/Name/Region. The two were unified into
+	// this one type: the fork's field spelling (Arn) and its operator-facing
+	// flags are kept, and upstream's Name is added here so the paginated
+	// ListAvailableProfiles response is not silently dropped.
+	Name    string `json:"name,omitempty"`
 	Usable  bool   `json:"usable"`
 	Current bool   `json:"current"`
 	Pinned  bool   `json:"pinned"`

@@ -237,7 +237,7 @@ func (h *Handler) handleResponsesNonStream(
 		if len(toolUses) > 0 {
 			finishReason = "tool_calls"
 		}
-		tr.noteUsage(inputTokens, outputTokens, 0, credits)
+		tr.noteUsage(inputTokens, outputTokens, 0, 0, credits)
 		tr.noteResponseShape(finishReason, model, len(toolUses))
 		tr.noteResponseText(finalContent)
 		h.emitTrace(tr, outcomeSuccess, http.StatusOK)
@@ -642,7 +642,7 @@ func (h *Handler) handleResponsesStream(
 		if len(toolUses) > 0 {
 			finishReason = "tool_calls"
 		}
-		tr.noteUsage(inputTokens, outputTokens, 0, credits)
+		tr.noteUsage(inputTokens, outputTokens, 0, 0, credits)
 		tr.noteResponseShape(finishReason, model, len(toolUses))
 		tr.noteResponseText(finalContent)
 		h.emitTrace(tr, outcomeSuccess, http.StatusOK)

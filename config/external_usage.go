@@ -26,6 +26,13 @@ const (
 	ExternalConfidenceUnknown        = "unknown"         // no upstream data, fresh period baseline, or just reset
 )
 
+// ExternalUsageDisableReason is the BanReason stamped on an account that the
+// external-usage auto-action quarantined. It is a named constant rather than a
+// literal because two packages must agree on it: proxy writes it when F3 fires,
+// and pool reads it to decide that token-refresh success is NOT evidence the
+// quarantine can be lifted (the credential is shared, not expired).
+const ExternalUsageDisableReason = "auto-disabled: external usage detected"
+
 // externalCreditsFloor is the minimum absolute tolerance (in credits) below which a
 // positive gap is treated as metering noise rather than real external usage. Prevents
 // flapping to "external" on sub-credit rounding when period growth is tiny.

@@ -7,6 +7,7 @@ import (
 	"kiro-go/config"
 	"math/rand"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -67,25 +68,72 @@ type circuitBreaker struct {
 	state          int
 	consecutiveErr int
 	openedAt       time.Time
+	// probeAt is when the currently outstanding half-open probe was admitted.
+	// It exists so half-open means "one probe in flight" rather than "fully
+	// open again": without it every caller after the open window was let
+	// through, and the full request rate resumed instantly against an account
+	// that had just failed circuitErrorThreshold times in a row.
+	probeAt time.Time
 }
 
-// isOpen reports whether the breaker is currently blocking requests. After the
-// open window elapses it persists the open->half-open transition and returns
-// false to let a single probe through.
+// isOpen reports whether the breaker is currently blocking requests.
+//
+// This is a PURE PREDICATE: it must never mutate breaker state. Selection
+// evaluates the same account through several independent gates in a single pass
+// (the quota-aware eligibility check, the LRU candidate loop, and the cooldown
+// fallback), so a query that consumed the half-open probe as a side effect made
+// those gates disagree with each other: the first call promoted open->half-open
+// and returned "admissible", and the next call in the SAME pass saw a fresh
+// probe already in flight and returned "blocked" — taking a single-account pool
+// completely dark exactly when its breaker was due a recovery probe.
+//
+// Claiming the probe is therefore a separate, explicit step (claimProbe), done
+// once at the dispatch commit point for the account actually selected.
 func (cb *circuitBreaker) isOpen(now time.Time) bool {
 	cb.mu.Lock()
 	defer cb.mu.Unlock()
 	switch cb.state {
 	case circuitOpen:
-		if now.Sub(cb.openedAt) >= circuitOpenDuration {
-			cb.state = circuitHalfOpen // persist transition; allow one probe
-			return false
-		}
-		return true
+		// The open window having elapsed means "a probe is due", so the account
+		// is admissible; whoever dispatches to it claims the probe.
+		return now.Sub(cb.openedAt) < circuitOpenDuration
 	case circuitHalfOpen:
-		return false
+		// A probe is already in flight: block everyone else so half-open sends
+		// exactly one request at the suspect account and decides from its
+		// outcome (recordError re-opens, reset closes).
+		//
+		// A probe that never reports back (dropped request, restart mid-flight)
+		// must not wedge the breaker shut forever, so once another open window
+		// has elapsed a fresh probe may replace the abandoned one. That bounds
+		// the worst case at one request per circuitOpenDuration rather than none.
+		return now.Sub(cb.probeAt) < circuitOpenDuration
 	default:
 		return false
+	}
+}
+
+// claimProbe records that the caller is about to dispatch to this account, so a
+// half-open breaker admits exactly ONE in-flight probe. It is the mutating half
+// of the pair whose read half is isOpen, and it must be called only at a real
+// dispatch commit point — never from an eligibility gate, or the probe is spent
+// on an account that is then not selected.
+//
+// Callers hold the pool write lock, so the claim is serialized across
+// concurrent selections; the breaker's own mutex guards the fields themselves.
+// A no-op for a closed breaker: nothing is being probed.
+func (cb *circuitBreaker) claimProbe(now time.Time) {
+	cb.mu.Lock()
+	defer cb.mu.Unlock()
+	switch cb.state {
+	case circuitOpen:
+		if now.Sub(cb.openedAt) >= circuitOpenDuration {
+			cb.state = circuitHalfOpen
+			cb.probeAt = now
+		}
+	case circuitHalfOpen:
+		if now.Sub(cb.probeAt) >= circuitOpenDuration {
+			cb.probeAt = now
+		}
 	}
 }
 
@@ -97,6 +145,7 @@ func (cb *circuitBreaker) recordError(now time.Time) {
 	if cb.state == circuitHalfOpen {
 		cb.state = circuitOpen // probe failed → re-open
 		cb.openedAt = now
+		cb.probeAt = time.Time{} // the probe reported back; clear it
 	} else if cb.consecutiveErr >= circuitErrorThreshold && cb.state == circuitClosed {
 		cb.state = circuitOpen
 		cb.openedAt = now
@@ -109,6 +158,7 @@ func (cb *circuitBreaker) reset() {
 	defer cb.mu.Unlock()
 	cb.state = circuitClosed
 	cb.consecutiveErr = 0
+	cb.probeAt = time.Time{} // the probe succeeded; clear it
 }
 
 // accountHealth tracks per-account health signals used by score-weighted
@@ -208,6 +258,12 @@ func (p *AccountPool) Reload() {
 	// Read config (takes cfgLock) BEFORE acquiring p.mu so the pool lock never
 	// nests cfgLock — see GetNextForModelExcluding for the ordering rationale.
 	enabled := config.GetEnabledAccounts()
+	// The prune below must know every CONFIGURED account, not just the routable
+	// ones. Keying it off `enabled` deleted the cooldown and breaker of any
+	// account that is merely disabled — including the 24h safety-net cooldown
+	// DisableAccount sets immediately before calling Reload, which erased itself
+	// on the very next line (TestDisableAccountSetsCooldown).
+	configured := config.GetAccounts()
 	allowOverUsage := config.GetAllowOverUsage()
 
 	p.mu.Lock()
@@ -238,6 +294,66 @@ func (p *AccountPool) Reload() {
 	p.accounts = accounts
 	p.allowLists = allowLists
 	p.totalAccounts = len(enabled)
+
+	// Drop per-account routing state for accounts that no longer exist in
+	// config. Two reasons this matters, both observed as real behaviour:
+	//
+	//   1. Unbounded growth. Every add/remove cycle leaves a permanent entry in
+	//      circuitState, lastDispatchSeq, cooldowns, errorCounts, healthStats
+	//      and modelLists, keyed by an ID nothing will ever look up again.
+	//   2. Worse, IDs are reusable. Deleting an account and re-adding it with
+	//      the same ID silently inherits the old breaker (possibly OPEN, so the
+	//      fresh account is unroutable), the old cooldown, the old error count
+	//      and a stale LRU sequence. An operator re-adding a credential to fix
+	//      a problem would get an account that looks broken for no visible
+	//      reason.
+	//
+	// Keyed off every CONFIGURED account (not `enabled`, and not the
+	// post-quota-filter `accounts`) so an account that is merely disabled or
+	// temporarily over quota keeps its cooldown, breaker and health history.
+	// Only an account genuinely gone from config loses its state.
+	live := make(map[string]bool, len(configured))
+	for _, a := range configured {
+		live[a.ID] = true
+	}
+	for id := range p.circuitState {
+		if !live[id] {
+			delete(p.circuitState, id)
+		}
+	}
+	for id := range p.lastDispatchSeq {
+		if !live[id] {
+			delete(p.lastDispatchSeq, id)
+		}
+	}
+	for id := range p.cooldowns {
+		if !live[id] {
+			delete(p.cooldowns, id)
+		}
+	}
+	for id := range p.errorCounts {
+		if !live[id] {
+			delete(p.errorCounts, id)
+		}
+	}
+	for id := range p.healthStats {
+		if !live[id] {
+			delete(p.healthStats, id)
+		}
+	}
+	for id := range p.modelLists {
+		if !live[id] {
+			delete(p.modelLists, id)
+		}
+	}
+	// Affinity bindings that point at a removed account would otherwise pin a
+	// session to an ID that can never be selected again; the binding is dead
+	// weight and the affinity path would fall through on every request.
+	for key, binding := range p.apiKeyAffinity {
+		if !live[binding.accountID] {
+			delete(p.apiKeyAffinity, key)
+		}
+	}
 }
 
 // GetNext 获取下一个可用账号（加权轮询）
@@ -360,6 +476,23 @@ func (p *AccountPool) GetNextForModelExcluding(model string, excluded map[string
 	// data. pickQuotaAware already returns a copy.
 	if config.GetQuotaAwareRouting() {
 		if acc := p.pickQuotaAware(model, excluded, now, allowOverUsage); acc != nil {
+			// Stamp the LRU clock even though this pick did not use it. Every
+			// other dispatch path stamps (the LRU pick below and the
+			// cooldown fallback both do), and skipping it here leaves a stale
+			// sequence behind: the moment quota data goes absent or the toggle
+			// is turned off, LRU selection sees this account as
+			// least-recently-used and hands it a burst of consecutive requests.
+			// Keeping the clock authoritative across both modes makes the
+			// toggle safe to flip at runtime.
+			p.dispatchSeq++
+			if p.lastDispatchSeq == nil {
+				p.lastDispatchSeq = make(map[string]uint64)
+			}
+			p.lastDispatchSeq[acc.ID] = p.dispatchSeq
+			// Dispatch commit point: claim the half-open probe (see claimProbe).
+			if cb := p.circuitState[acc.ID]; cb != nil {
+				cb.claimProbe(now)
+			}
 			return acc
 		}
 	}
@@ -415,13 +548,17 @@ func (p *AccountPool) GetNextForModelExcluding(model string, excluded map[string
 		// pool completely dark. Serving the account whose cooldown expires
 		// soonest keeps the pool alive and lets the upstream be authoritative
 		// about whether the quota has actually reset.
-		acc := p.fallbackEarliestCooldown(model, excluded, allowOverUsage)
+		acc := p.fallbackEarliestCooldown(model, excluded, allowOverUsage, now)
 		if acc != nil {
 			p.dispatchSeq++
 			if p.lastDispatchSeq == nil {
 				p.lastDispatchSeq = make(map[string]uint64)
 			}
 			p.lastDispatchSeq[acc.ID] = p.dispatchSeq
+			// Dispatch commit point: claim the half-open probe (see claimProbe).
+			if cb := p.circuitState[acc.ID]; cb != nil {
+				cb.claimProbe(now)
+			}
 		}
 		return acc
 	}
@@ -462,6 +599,15 @@ func (p *AccountPool) GetNextForModelExcluding(model string, excluded map[string
 	}
 	p.lastDispatchSeq[chosen.ID] = p.dispatchSeq
 
+	// Claim the half-open probe for the account we are actually dispatching to.
+	// Done here, at the commit point, rather than in the eligibility gates
+	// above: those evaluate several accounts (and evaluate the same account
+	// more than once), so claiming there would spend the probe on a candidate
+	// that loses the LRU tie-break and never receives a request.
+	if cb := p.circuitState[chosen.ID]; cb != nil {
+		cb.claimProbe(now)
+	}
+
 	// Return a COPY, never &p.accounts[i]. Callers mutate the returned account
 	// without holding the pool lock (proxy's ensureValidToken assigns
 	// AccessToken/RefreshToken/ExpiresAt), which raced with UpdateToken writing
@@ -484,6 +630,19 @@ func (p *AccountPool) GetByID(id string) *config.Account {
 		}
 	}
 	return nil
+}
+
+// hasAccountLocked reports whether id is still a routable member of the pool.
+// Caller must hold p.mu (read or write). Exists so a caller that already holds
+// the write lock can confirm membership without the lock upgrade GetByID's own
+// RLock would require (which would deadlock).
+func (p *AccountPool) hasAccountLocked(id string) bool {
+	for i := range p.accounts {
+		if p.accounts[i].ID == id {
+			return true
+		}
+	}
+	return false
 }
 
 // GetNextForModelWithApiKey selects an account for a request, preferring the one
@@ -523,15 +682,40 @@ func (p *AccountPool) GetNextForModelWithApiKey(model string, excluded map[strin
 				if !isExcluded && !cooldownActive && !p.isCircuitOpen(acc.ID, time.Now()) && hasModel && !quotaBlocked {
 					now := time.Now()
 					p.mu.Lock()
-					binding.lastUsed = now
-					p.dispatchSeq++
-					if p.lastDispatchSeq == nil {
-						p.lastDispatchSeq = make(map[string]uint64)
+					// Re-verify membership under the SAME write lock that commits
+					// the dispatch. Every gate above ran in its own short critical
+					// section (binding read, GetByID copy, cooldown/model/quota
+					// read, breaker check), so a Reload can complete in any of the
+					// gaps between them — deleting or disabling this account — and
+					// the pre-fix code still returned the stale copy it captured
+					// before that Reload. The proxy would then dispatch one more
+					// request on a credential the completed reload had already
+					// removed from routing.
+					//
+					// Committing and validating under one lock closes every window
+					// at once: if the account is gone we drop the binding and fall
+					// through to normal selection, which costs one re-pick and
+					// never a failed request.
+					if !p.hasAccountLocked(acc.ID) {
+						delete(p.apiKeyAffinity, apiKey)
+						p.mu.Unlock()
+						acc = nil
+					} else {
+						binding.lastUsed = now
+						p.dispatchSeq++
+						if p.lastDispatchSeq == nil {
+							p.lastDispatchSeq = make(map[string]uint64)
+						}
+						p.lastDispatchSeq[acc.ID] = p.dispatchSeq
+						p.apiKeyAffinity[apiKey] = binding
+						// Dispatch commit point: claim the half-open probe
+						// (see claimProbe).
+						if cb := p.circuitState[acc.ID]; cb != nil {
+							cb.claimProbe(now)
+						}
+						p.mu.Unlock()
+						return acc
 					}
-					p.lastDispatchSeq[acc.ID] = p.dispatchSeq
-					p.apiKeyAffinity[apiKey] = binding
-					p.mu.Unlock()
-					return acc
 				}
 			}
 		}
@@ -540,14 +724,71 @@ func (p *AccountPool) GetNextForModelWithApiKey(model string, excluded map[strin
 	// Fall back to normal selection.
 	acc := p.GetNextForModelExcluding(model, excluded)
 	if acc != nil && apiKey != "" && config.GetSessionAffinityEnabled() {
+		now := time.Now()
 		p.mu.Lock()
-		if len(p.apiKeyAffinity) >= maxAffinityEntries {
-			p.pruneExpiredAffinityLocked(time.Now())
+		// A write to a nil Go map panics, and this map is only populated by
+		// GetPool(); a pool assembled field-by-field (Reload and selection are
+		// both driven that way) reaches here with it nil. Without this the
+		// first affinity bind would take the whole proxy process down instead
+		// of degrading to "no affinity" — every other optional map on the hot
+		// path is already guarded the same way (see lastDispatchSeq below).
+		if p.apiKeyAffinity == nil {
+			p.apiKeyAffinity = make(map[string]apiKeyBinding)
 		}
-		p.apiKeyAffinity[apiKey] = apiKeyBinding{accountID: acc.ID, lastUsed: time.Now()}
+		if len(p.apiKeyAffinity) >= maxAffinityEntries {
+			p.pruneExpiredAffinityLocked(now)
+			// Expiry-only pruning is not a bound. Every distinct API key seen
+			// inside one TTL window keeps its binding alive, so a caller that
+			// rotates keys (or an attacker sending one request per random key)
+			// grows this map without limit while maxAffinityEntries silently
+			// does nothing — the pre-existing check could only ever free
+			// already-stale entries. When pruning cannot get us back under the
+			// cap, evict the least-recently-used bindings, which is exactly the
+			// data affinity is allowed to lose: dropping a binding costs one
+			// re-pick through normal selection, never a failed request.
+			if len(p.apiKeyAffinity) >= maxAffinityEntries {
+				p.evictOldestAffinityLocked(maxAffinityEntries - 1)
+			}
+		}
+		p.apiKeyAffinity[apiKey] = apiKeyBinding{accountID: acc.ID, lastUsed: now}
 		p.mu.Unlock()
 	}
 	return acc
+}
+
+// evictOldestAffinityLocked shrinks the affinity map to at most target entries by
+// repeatedly dropping the least-recently-used binding. Caller must hold p.mu.
+//
+// The scan is O(n) per eviction and runs with the pool write lock held, so the
+// cost was measured rather than assumed: ~20.6µs per eviction at the 1024-entry
+// cap (BenchmarkEvictOldestAffinityAtCap). That is negligible against the Kiro
+// round-trip the selected account is about to make, and it is only reached at
+// all when a client rotates API keys fast enough to keep 1024 bindings fresh
+// inside the 10-minute TTL — i.e. the abuse case whose alternative was letting
+// the map grow without limit. Steady-state traffic never enters this path.
+//
+// If that ever stops being true, the fix is a heap or an intrusive LRU list, not
+// a larger cap.
+func (p *AccountPool) evictOldestAffinityLocked(target int) {
+	if target < 0 {
+		target = 0
+	}
+	for len(p.apiKeyAffinity) > target {
+		var oldestKey string
+		var oldestAt time.Time
+		first := true
+		for key, binding := range p.apiKeyAffinity {
+			if first || binding.lastUsed.Before(oldestAt) {
+				oldestKey = key
+				oldestAt = binding.lastUsed
+				first = false
+			}
+		}
+		if first {
+			return // map is empty; nothing left to evict
+		}
+		delete(p.apiKeyAffinity, oldestKey)
+	}
 }
 
 // pruneExpiredAffinityLocked removes session-affinity bindings whose TTL has
@@ -683,10 +924,39 @@ func IsAuthFailure(err error) bool {
 	msg := err.Error()
 	lower := strings.ToLower(msg)
 
-	// Match HTTP status codes only when they appear as standalone tokens to avoid
-	// false positives from arbitrary digits in the error body (e.g. request IDs).
-	if HasStatusToken(msg, "401") || HasStatusToken(msg, "403") {
-		return true
+	// Decide from the FIRST status token in the message, not from whichever code
+	// happens to appear anywhere in it. Every formatter in this repo writes the
+	// authoritative status at the front and appends the opaque upstream body
+	// after it, so position is what separates "the status upstream returned"
+	// from "a number quoted inside a response body".
+	//
+	// Scanning for any 5xx anywhere (the previous shape) misclassified a genuine
+	// revoked credential whose body merely quoted a server error:
+	//
+	//	refresh failed: 400 {"error":"invalid_grant","upstream returned 500"}
+	//
+	// hit the 5xx gate and returned false, so classifyAndBanOnUsageError never
+	// saw an auth failure and the account was never flagged for re-auth — the
+	// mirror image of the false-ban this gate exists to prevent, and it left
+	// this classifier disagreeing with proxy's isAuthErrorMessage on the same
+	// string.
+	if status, ok := firstUpstreamStatusToken(lower); ok {
+		if status == 401 || status == 403 {
+			return true
+		}
+		// A 5xx is the upstream failing, never proof that THIS account's
+		// credentials were revoked. Without this gate a 500 whose body merely
+		// mentioned "invalid_grant"/"unauthorized"/"token expired" drove
+		// classifyAndBanOnUsageError (proxy/kiro_api.go) to
+		// banAccountInline(BANNED) — a permanent, operator-only-reversible ban
+		// on a healthy account during an upstream outage, i.e. the fleet drains
+		// exactly when it is least able to recover.
+		if status >= 500 {
+			return false
+		}
+		// Any other 4xx: the status is authoritative but not itself an auth
+		// verdict, so the narrow markers below get their say (a 400 carrying
+		// invalid_grant is a genuinely revoked refresh token).
 	}
 	if strings.Contains(lower, "bad credentials") ||
 		strings.Contains(lower, "invalid_grant") ||
@@ -722,6 +992,61 @@ func HasStatusToken(s, status string) bool {
 	}
 }
 
+// firstUpstreamStatusToken returns the EARLIEST HTTP status code (4xx/5xx)
+// appearing in s as a standalone token, and whether one was found.
+//
+// Position matters: the authoritative status is written at the front of the
+// message by whichever formatter produced it, and everything after it is an
+// opaque upstream body that may quote unrelated status codes. Returning the
+// leftmost token keeps the header authoritative.
+//
+// The boundary rule is HasStatusToken's, so a request ID like "req_5031" cannot
+// masquerade as a 503. Codes are enumerated rather than pattern-matched so the
+// pool package keeps its current import set (no regexp), and the enumeration
+// covers 400-599 because a 4xx must be distinguishable from a 5xx here rather
+// than merely "not 5xx".
+func firstUpstreamStatusToken(s string) (int, bool) {
+	bestIdx := -1
+	bestStatus := 0
+	for code := 400; code <= 599; code++ {
+		token := strconv.Itoa(code)
+		idx := statusTokenIndex(s, token)
+		if idx < 0 {
+			continue
+		}
+		if bestIdx < 0 || idx < bestIdx {
+			bestIdx = idx
+			bestStatus = code
+		}
+	}
+	if bestIdx < 0 {
+		return 0, false
+	}
+	return bestStatus, true
+}
+
+// statusTokenIndex returns the index of the first occurrence of status in s that
+// has non-alphanumeric boundaries on both sides, or -1. Same rule as
+// HasStatusToken, but reports WHERE the token is so callers can compare
+// positions.
+func statusTokenIndex(s, status string) int {
+	offset := 0
+	for {
+		rel := strings.Index(s[offset:], status)
+		if rel < 0 {
+			return -1
+		}
+		idx := offset + rel
+		leftOK := idx == 0 || !isAlphaNum(s[idx-1])
+		rightIdx := idx + len(status)
+		rightOK := rightIdx >= len(s) || !isAlphaNum(s[rightIdx])
+		if leftOK && rightOK {
+			return idx
+		}
+		offset = idx + len(status)
+	}
+}
+
 func isDigit(b byte) bool {
 	return b >= '0' && b <= '9'
 }
@@ -752,11 +1077,16 @@ func (p *AccountPool) DisableAccount(id, reason string) {
 		// best effort — even if persistence fails, drop it from memory
 		_ = err
 	}
+	// Reload FIRST, then stamp the safety-net cooldown. Reload prunes routing
+	// state for IDs that are no longer in config, so a cooldown written before
+	// it can be deleted by it — which is precisely backwards for a value whose
+	// stated job is to survive a racing Reload. Setting it afterwards makes the
+	// safety net hold for any id, including one already gone from config.
+	p.Reload()
 	p.mu.Lock()
 	// Long cooldown as a safety net in case Reload races
 	p.cooldowns[id] = time.Now().Add(24 * time.Hour)
 	p.mu.Unlock()
-	p.Reload()
 }
 
 // MarkOverLimit marks an account as over usage limit (after a 402 / OVERAGE response).
@@ -764,14 +1094,31 @@ func (p *AccountPool) DisableAccount(id, reason string) {
 // FetchOverageStatus from the request handler; here we just cooldown briefly so
 // the next attempt picks a different account, then reload.
 func (p *AccountPool) MarkOverLimit(id string) {
+	// Reload before stamping, for the same reason as DisableAccount: Reload
+	// prunes state for IDs absent from config, so a cooldown set beforehand can
+	// be pruned away by the very call meant to follow it.
+	p.Reload()
 	p.mu.Lock()
 	p.cooldowns[id] = time.Now().Add(time.Hour)
 	p.mu.Unlock()
-	p.Reload()
 }
 
 // UpdateToken 更新账号 Token
 func (p *AccountPool) UpdateToken(id, accessToken, refreshToken string, expiresAt int64) {
+	p.UpdateCredentialState(nil, id, accessToken, refreshToken, expiresAt, "")
+}
+
+// UpdateCredentialState publishes one persisted refresh result to both the
+// pool and an optional caller-owned account while holding the pool lock. The
+// target may itself point into the pool.
+func (p *AccountPool) UpdateCredentialState(
+	target *config.Account,
+	id string,
+	accessToken string,
+	refreshToken string,
+	expiresAt int64,
+	profileArn string,
+) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	for i := range p.accounts {
@@ -781,6 +1128,19 @@ func (p *AccountPool) UpdateToken(id, accessToken, refreshToken string, expiresA
 				p.accounts[i].RefreshToken = refreshToken
 			}
 			p.accounts[i].ExpiresAt = expiresAt
+			if profileArn != "" {
+				p.accounts[i].ProfileArn = profileArn
+			}
+		}
+	}
+	if target != nil {
+		target.AccessToken = accessToken
+		if refreshToken != "" {
+			target.RefreshToken = refreshToken
+		}
+		target.ExpiresAt = expiresAt
+		if profileArn != "" {
+			target.ProfileArn = profileArn
 		}
 	}
 }
@@ -1065,6 +1425,20 @@ func (p *AccountPool) eligibleForRoute(acc *config.Account, excluded map[string]
 	if isQuotaBlocked(*acc, allowOverUsage) {
 		return false
 	}
+	// The circuit breaker must gate this path too. The LRU path checks it
+	// inline (see GetNextForModelExcluding), but quota-aware selection runs
+	// BEFORE that loop and returns immediately on a hit — so without this an
+	// operator who enables quota-aware routing silently loses the breaker, and
+	// the account with the most remaining quota is exactly the one a breaker is
+	// most likely to be open on (a freshly-banned account has burned nothing).
+	//
+	// Read p.circuitState directly rather than via p.isCircuitOpen: callers of
+	// eligibleForRoute already hold p.mu for writing, and isCircuitOpen takes
+	// RLock, which would self-deadlock. The breaker's own mutex still guards the
+	// open->half-open transition inside isOpen.
+	if cb := p.circuitState[acc.ID]; cb != nil && cb.isOpen(now) {
+		return false
+	}
 	return true
 }
 
@@ -1171,7 +1545,12 @@ func (p *AccountPool) healthScore(id string, weight int) float64 {
 // fallbackEarliestCooldown returns the account with the earliest cooldown
 // (or one with no cooldown at all) when no fully-healthy candidate exists.
 // model="" means "any model". Caller must hold p.mu (at least RLock).
-func (p *AccountPool) fallbackEarliestCooldown(model string, excluded map[string]bool, allowOverUsage bool) *config.Account {
+//
+// now is passed in rather than read here so this fallback and the candidate
+// loop that precedes it evaluate every account's breaker against the SAME
+// instant; a second time.Now() could straddle circuitOpenDuration and let an
+// account the candidate loop just rejected slip through the fallback.
+func (p *AccountPool) fallbackEarliestCooldown(model string, excluded map[string]bool, allowOverUsage bool, now time.Time) *config.Account {
 	var best *config.Account
 	var earliest time.Time
 	for i := range p.accounts {
@@ -1183,6 +1562,21 @@ func (p *AccountPool) fallbackEarliestCooldown(model string, excluded map[string
 			continue
 		}
 		if isQuotaBlocked(*acc, allowOverUsage) {
+			continue
+		}
+		// The breaker must gate this path too. This fallback exists so a pool
+		// whose every account is in cooldown still serves traffic (a quota
+		// backoff parks an account for a full hour), and a cooldown is a
+		// timing hint — serving through it is a deliberate trade. An OPEN
+		// circuit is a different statement: circuitErrorThreshold consecutive
+		// failures just proved this upstream is not answering, so dispatching
+		// to it converts one open breaker into a stream of failed requests
+		// that each re-arm the breaker. Skipping it here does not take the
+		// pool permanently dark: isOpen promotes open->half-open after
+		// circuitOpenDuration and admits a probe, so service resumes on the
+		// first request after the window (pinned by
+		// TestOpenCircuitRecoversViaProbeAfterWindow).
+		if cb := p.circuitState[acc.ID]; cb != nil && cb.isOpen(now) {
 			continue
 		}
 		if cooldown, ok := p.cooldowns[acc.ID]; ok {
@@ -1226,6 +1620,17 @@ func (p *AccountPool) reprobeDisabled() {
 	all := config.GetAccounts()
 	for _, acc := range all {
 		if acc.Enabled || acc.BanStatus != "DISABLED" {
+			continue
+		}
+		// Auto-recovery's premise is that DISABLED means "credentials went bad",
+		// so a successful token refresh is proof the account is healthy again.
+		// That premise does not hold for an external-usage quarantine: the
+		// credential there is perfectly valid — it is being used by a THIRD
+		// PARTY as well. Refreshing it always succeeds, so without this guard
+		// auto-recovery re-enables the account within one 60s tick and silently
+		// undoes F3, putting a shared credential straight back into rotation.
+		// Lifting this quarantine is an operator decision, not a token check.
+		if acc.BanReason == config.ExternalUsageDisableReason {
 			continue
 		}
 		// Check backoff schedule.

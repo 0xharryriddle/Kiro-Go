@@ -44,11 +44,12 @@ type traceRecorder struct {
 	responseModel string
 	toolCalls     int
 
-	inputTokens     int
-	outputTokens    int
-	cacheReadTokens int
-	credits         float64
-	cacheHit        bool
+	inputTokens      int
+	outputTokens     int
+	cacheReadTokens  int
+	cacheWriteTokens int
+	credits          float64
+	cacheHit         bool
 
 	// Captured payloads, held in memory only until emitTrace decides whether
 	// the configured capture mode allows persisting them.
@@ -198,7 +199,14 @@ func (tr *traceRecorder) noteResponseShape(stopReason, responseModel string, too
 // noteUsage records token/credit detail. Tokens are kept split so the trace can
 // answer "was this an input-heavy or output-heavy request", while RequestLog.Tokens
 // keeps carrying the sum for existing consumers.
-func (tr *traceRecorder) noteUsage(inputTokens, outputTokens, cacheReadTokens int, credits float64) {
+//
+// Cache reads and cache WRITES are recorded separately because they answer
+// different operational questions. Reads mean savings are already being
+// realised; writes are the up-front cost of populating the cache. A request with
+// reads=0 and writes>0 is a cache being BUILT, which is a completely different
+// state from caching not working at all -- and the two are indistinguishable if
+// only the read count is logged.
+func (tr *traceRecorder) noteUsage(inputTokens, outputTokens, cacheReadTokens, cacheWriteTokens int, credits float64) {
 	if tr == nil {
 		return
 	}
@@ -207,6 +215,7 @@ func (tr *traceRecorder) noteUsage(inputTokens, outputTokens, cacheReadTokens in
 	tr.inputTokens = inputTokens
 	tr.outputTokens = outputTokens
 	tr.cacheReadTokens = cacheReadTokens
+	tr.cacheWriteTokens = cacheWriteTokens
 	tr.credits = credits
 }
 
@@ -281,27 +290,28 @@ func (tr *traceRecorder) finish(outcome string, httpStatus int) RequestLog {
 	defer tr.mu.Unlock()
 
 	entry := RequestLog{
-		Time:            time.Now().Unix(),
-		Endpoint:        tr.api,
-		API:             tr.api,
-		Model:           tr.model,
-		Stream:          tr.stream,
-		RequestID:       tr.traceID,
-		ApiKeyID:        tr.apiKeyID,
-		Duration:        time.Since(tr.startedAt).Milliseconds(),
-		TTFBMs:          tr.ttfbMs,
-		StopReason:      tr.stopReason,
-		ResponseModel:   tr.responseModel,
-		ToolCallCount:   tr.toolCalls,
-		AttemptCount:    len(tr.attempts),
-		Outcome:         outcome,
-		HTTPStatus:      httpStatus,
-		InputTokens:     tr.inputTokens,
-		OutputTokens:    tr.outputTokens,
-		CacheReadTokens: tr.cacheReadTokens,
-		Tokens:          tr.inputTokens + tr.outputTokens,
-		Credits:         tr.credits,
-		CacheHit:        tr.cacheHit,
+		Time:             time.Now().Unix(),
+		Endpoint:         tr.api,
+		API:              tr.api,
+		Model:            tr.model,
+		Stream:           tr.stream,
+		RequestID:        tr.traceID,
+		ApiKeyID:         tr.apiKeyID,
+		Duration:         time.Since(tr.startedAt).Milliseconds(),
+		TTFBMs:           tr.ttfbMs,
+		StopReason:       tr.stopReason,
+		ResponseModel:    tr.responseModel,
+		ToolCallCount:    tr.toolCalls,
+		AttemptCount:     len(tr.attempts),
+		Outcome:          outcome,
+		HTTPStatus:       httpStatus,
+		InputTokens:      tr.inputTokens,
+		OutputTokens:     tr.outputTokens,
+		CacheReadTokens:  tr.cacheReadTokens,
+		CacheWriteTokens: tr.cacheWriteTokens,
+		Tokens:           tr.inputTokens + tr.outputTokens,
+		Credits:          tr.credits,
+		CacheHit:         tr.cacheHit,
 	}
 
 	// Status stays success/error only, because account health and usage-anomaly

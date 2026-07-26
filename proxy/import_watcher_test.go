@@ -50,7 +50,11 @@ func writeHelperFile(t *testing.T, dir, name, tokenEndpoint, refreshToken, email
 
 // TestImportWatcherProcessesValidFile verifies a valid drop is imported and the
 // file is moved into processed/.
+// A watcher import that succeeds spawns the same background model-list refresh
+// as the HTTP import path, so it needs the inert REST client for the reason
+// documented on installInertKiroRestClient.
 func TestImportWatcherProcessesValidFile(t *testing.T) {
+	installInertKiroRestClient(t)
 	cfgFile := t.TempDir() + "/config.json"
 	if err := config.Init(cfgFile); err != nil {
 		t.Fatalf("config.Init: %v", err)

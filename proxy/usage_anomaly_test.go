@@ -63,11 +63,11 @@ func TestDetectUsageAnomaly_NoSpikeOnStrayRequestsOverIdleBaseline(t *testing.T)
 func TestAggregateAnomaly_CountsRecentAndBaselineWindows(t *testing.T) {
 	now := int64(1_000_000)
 	logs := []RequestLog{
-		{AccountID: "a", Time: now - 100},         // recent
-		{AccountID: "a", Time: now - 200},         // recent
-		{AccountID: "a", Time: now - 2*3600},      // baseline, not recent
-		{AccountID: "a", Time: now - 25*3600},     // outside baseline
-		{AccountID: "b", Time: now - 100},         // other account
+		{AccountID: "a", Time: now - 100},     // recent
+		{AccountID: "a", Time: now - 200},     // recent
+		{AccountID: "a", Time: now - 2*3600},  // baseline, not recent
+		{AccountID: "a", Time: now - 25*3600}, // outside baseline
+		{AccountID: "b", Time: now - 100},     // other account
 	}
 	in := aggregateAnomaly(logs, "a", now)
 	if in.RecentRequests != 2 {

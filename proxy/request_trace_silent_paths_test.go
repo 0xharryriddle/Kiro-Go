@@ -14,7 +14,7 @@ import (
 func TestCacheHitIsLogged(t *testing.T) {
 	h := &Handler{}
 	tr := newTraceRecorder("claude", "sonnet", false, "key-1")
-	tr.noteUsage(11, 7, 0, 0)
+	tr.noteUsage(11, 7, 0, 0, 0)
 	tr.markCacheHit()
 	h.emitTrace(tr, outcomeCacheHit, http.StatusOK)
 

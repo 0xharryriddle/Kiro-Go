@@ -12,37 +12,69 @@ import (
 	"time"
 )
 
-func TestNormalizeChunkBasicProgression(t *testing.T) {
-	prev := ""
+// Regression: an assistant stream whose chunks legitimately repeat must be reassembled
+// verbatim. The previous content-based de-duplication turned these exact inputs into
+// "666" and "abab" respectively, silently corrupting model output.
+func TestParseEventStreamAssistantRepeatedContentIsNotDropped(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		chunks []string
+		want   string
+	}{
+		{"repeated equal chunks", []string{"666", "666", "666", "6"}, "6666666666"},
+		{"repeated period", []string{"abab", "abab"}, "abababab"},
+		{"chunk equal to previous", []string{"ha", "ha", "ha"}, "hahaha"},
+		{"prefix shaped chunks", []string{"6", "66"}, "666"},
+		{"non repeating control", []string{"123", "4567890"}, "1234567890"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var stream bytes.Buffer
+			for _, c := range tc.chunks {
+				stream.Write(awsEventStreamFrame(t, "assistantResponseEvent",
+					map[string]interface{}{"content": c}))
+			}
 
-	if got := normalizeChunk("abc", &prev); got != "abc" {
-		t.Fatalf("expected first chunk to pass through, got %q", got)
-	}
-	if got := normalizeChunk("abcde", &prev); got != "de" {
-		t.Fatalf("expected appended delta, got %q", got)
+			var got string
+			err := parseEventStream(bytes.NewReader(stream.Bytes()), &KiroStreamCallback{
+				OnText: func(text string, reasoning bool) {
+					if !reasoning {
+						got += text
+					}
+				},
+			})
+			if err != nil {
+				t.Fatalf("unexpected parse error: %v", err)
+			}
+			if got != tc.want {
+				t.Fatalf("assistant text corrupted: got %q, want %q", got, tc.want)
+			}
+		})
 	}
 }
 
-func TestNormalizeChunkPrefixRewindDoesNotReplay(t *testing.T) {
-	prev := ""
-
-	_ = normalizeChunk("abcde", &prev)
-	if got := normalizeChunk("abc", &prev); got != "" {
-		t.Fatalf("expected rewind chunk to be ignored, got %q", got)
+// The reasoning stream is passed through verbatim too: it carries the same pure
+// incremental deltas as the assistant stream, and de-duplicating it dropped
+// legitimate repeated text in exactly the same way.
+func TestParseEventStreamReasoningRepeatedContentIsNotDropped(t *testing.T) {
+	var stream bytes.Buffer
+	for _, c := range []string{"666", "666", "666", "6"} {
+		stream.Write(awsEventStreamFrame(t, "reasoningContentEvent",
+			map[string]interface{}{"text": c}))
 	}
-	if prev != "abcde" {
-		t.Fatalf("expected previous snapshot to remain longest version, got %q", prev)
-	}
-	if got := normalizeChunk("abcdef", &prev); got != "f" {
-		t.Fatalf("expected only unseen suffix after rewind, got %q", got)
-	}
-}
 
-func TestNormalizeChunkOverlapDelta(t *testing.T) {
-	prev := "hello world"
-
-	if got := normalizeChunk("world!!!", &prev); got != "!!!" {
-		t.Fatalf("expected overlap suffix delta, got %q", got)
+	var got string
+	err := parseEventStream(bytes.NewReader(stream.Bytes()), &KiroStreamCallback{
+		OnText: func(text string, reasoning bool) {
+			if reasoning {
+				got += text
+			}
+		},
+	})
+	if err != nil {
+		t.Fatalf("unexpected parse error: %v", err)
+	}
+	if got != "6666666666" {
+		t.Fatalf("reasoning text corrupted: got %q, want %q", got, "6666666666")
 	}
 }
 
@@ -253,6 +285,31 @@ func TestSetPayloadProfileArnForAccountPreservesExplicitPayloadArn(t *testing.T)
 	}
 }
 
+func TestSetPayloadProfileArnForAccountClearsAPIKeyProfile(t *testing.T) {
+	payload := &KiroPayload{ProfileArn: "arn:aws:codewhisperer:us-east-1:123:profile/STALE"}
+	setPayloadProfileArnForAccount(payload, &config.Account{
+		AuthMethod: "api_key",
+		KiroApiKey: "ksk_test",
+		ProfileArn: "arn:aws:codewhisperer:us-east-1:123:profile/STALE",
+	})
+	if payload.ProfileArn != "" {
+		t.Fatalf("expected empty profileArn for API key account, got %q", payload.ProfileArn)
+	}
+}
+
+func TestEndpointsForAccountUsesCLIForAPIKey(t *testing.T) {
+	eps := endpointsForAccount(&config.Account{AuthMethod: "api_key", KiroApiKey: "ksk_x"})
+	if len(eps) != 1 || eps[0].Name != "Kiro CLI" {
+		t.Fatalf("expected single CLI endpoint, got %+v", eps)
+	}
+	if eps[0].Origin != "KIRO_CLI" {
+		t.Fatalf("origin = %q", eps[0].Origin)
+	}
+	if got := cliRuntimeURL(&config.Account{Region: "eu-central-1"}); got != "https://runtime.eu-central-1.kiro.dev/" {
+		t.Fatalf("cli url = %q", got)
+	}
+}
+
 func mustParseURL(t *testing.T, raw string) *url.URL {
 	t.Helper()
 	parsed, err := url.Parse(raw)
@@ -330,9 +387,18 @@ func TestParseEventStreamSuppressesPlaceholderReasoning(t *testing.T) {
 // a dots-only chunk — the moment a real character arrives, the cumulative buffer
 // is no longer placeholder-only and everything flows.
 func TestParseEventStreamPassesRealReasoning(t *testing.T) {
+	// MERGE POLICY NOTE (fork ↔ upstream v1.1.5): this test used to feed CUMULATIVE
+	// snapshots ("Let me think", then "Let me think step by step") and assert that
+	// the duplicated prefix was stripped, i.e. it encoded the premise that Kiro
+	// re-sends the whole reasoning block each time. That premise contradicts the
+	// dispatch contract both sides converged on (proxy/kiro.go: pure incremental
+	// deltas, passed through verbatim), and it is the premise that justified
+	// normalizeChunk -- the heuristic that silently ate repeated model output.
+	// The frames are now genuine deltas; the assertion below is unchanged, so the
+	// coverage (real reasoning reaches the client intact) is preserved.
 	stream := bytes.NewReader(bytes.Join([][]byte{
 		awsEventStreamFrame(t, "reasoningContentEvent", map[string]interface{}{"text": "Let me think"}),
-		awsEventStreamFrame(t, "reasoningContentEvent", map[string]interface{}{"text": "Let me think step by step"}),
+		awsEventStreamFrame(t, "reasoningContentEvent", map[string]interface{}{"text": " step by step"}),
 		awsEventStreamFrame(t, "assistantResponseEvent", map[string]interface{}{"content": "42"}),
 	}, nil))
 
@@ -366,9 +432,13 @@ func TestParseEventStreamSuppressesPlaceholderButKeepsInterleavedRealReasoning(t
 	stream := bytes.NewReader(bytes.Join([][]byte{
 		// Redacted block arrives first (this is the common ordering upstream).
 		awsEventStreamFrame(t, "reasoningContentEvent", map[string]interface{}{"text": "..."}),
-		// Real reasoning text follows, streamed as cumulative snapshots.
+		// Real reasoning text follows as incremental deltas (see the note on
+		// TestParseEventStreamPassesRealReasoning for why this is no longer fed
+		// as cumulative snapshots). The placeholder-suppression coverage this
+		// test exists for is unchanged: the "..." delta is dropped and every
+		// real delta survives.
 		awsEventStreamFrame(t, "reasoningContentEvent", map[string]interface{}{"text": "Checking"}),
-		awsEventStreamFrame(t, "reasoningContentEvent", map[string]interface{}{"text": "Checking the edge case"}),
+		awsEventStreamFrame(t, "reasoningContentEvent", map[string]interface{}{"text": " the edge case"}),
 		awsEventStreamFrame(t, "assistantResponseEvent", map[string]interface{}{"content": "done"}),
 	}, nil))
 
