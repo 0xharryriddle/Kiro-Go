@@ -17,6 +17,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -1072,21 +1073,73 @@ var sensitiveCredentialParams = []string{
 // functional regression, which is why the colon form requires the quotes that
 // only a machine emits.
 func redactCredentialAssignments(description string) string {
-	for _, name := range sensitiveCredentialParams {
+	for _, name := range sensitiveCredentialNameSpellings() {
 		description = redactAssignmentsOfParam(description, name)
 	}
 	return description
 }
 
+// sensitiveCredentialNameSpellings expands each sensitive parameter into the
+// spellings that actually appear in the wild, because matching only exact
+// snake_case left the most likely shape uncovered.
+//
+// This codebase's own upstream speaks camelCase: auth/oidc.go:291-292 and
+// config/config.go:65-66 declare these fields as `json:"refreshToken"` /
+// `json:"accessToken"`. An IdP or gateway echoing a rotated credential is
+// therefore more likely to write `refreshToken=` than `refresh_token=` — and a
+// rotated value is one we never submitted, so the value-based pass in
+// redactSubmittedSecrets cannot catch it either. Name matching is the only
+// control on that case, so it has to know the names.
+//
+// Longest-first ordering matters: `client_secret` must be attempted before
+// `secret` would be (were it listed), and `clientsecret` before `secret`, so a
+// longer parameter is never half-matched by a shorter one.
+func sensitiveCredentialNameSpellings() []string {
+	seen := make(map[string]bool, len(sensitiveCredentialParams)*3)
+	out := make([]string, 0, len(sensitiveCredentialParams)*3)
+	add := func(s string) {
+		if s == "" || seen[s] {
+			return
+		}
+		seen[s] = true
+		out = append(out, s)
+	}
+	for _, snake := range sensitiveCredentialParams {
+		add(snake)                               // refresh_token
+		add(strings.ReplaceAll(snake, "_", "-")) // refresh-token
+		add(snakeToLowerCamelJoined(snake))      // refreshtoken (matches refreshToken: search is case-insensitive)
+	}
+	sort.SliceStable(out, func(i, j int) bool { return len(out[i]) > len(out[j]) })
+	return out
+}
+
+// snakeToLowerCamelJoined strips the separators from a snake_case name, giving
+// the form that a case-insensitive search matches against camelCase input:
+// "refresh_token" -> "refreshtoken", which matches "refreshToken" because
+// redactAssignmentsOfParam lower-cases the haystack.
+func snakeToLowerCamelJoined(snake string) string {
+	return strings.ReplaceAll(snake, "_", "")
+}
+
 // redactAssignmentsOfParam replaces the value of every `name=value` /
 // `"name":"value"` occurrence in s with [REDACTED].
 //
-// Known and accepted limits (each would cost more in destroyed diagnostics than
-// it buys): a name glued to a longer identifier on the right
-// (`refresh_token_value=`) is treated as a different parameter and left alone,
-// and spelling variants we never submit (`refreshToken=`, `refresh-token=`,
-// bare `token=`) are not matched. The value-based pass in redactSubmittedSecrets
-// still covers those whenever the value is one we actually sent.
+// Known and accepted limits, each because closing it would cost more in
+// destroyed diagnostics than it buys:
+//
+//   - A name glued to a longer identifier on the right (`refresh_token_value=`)
+//     is a different parameter and is left alone.
+//   - Bare `token=` / `secret=` are not matched: those words appear in prose and
+//     in non-sensitive fields far too often.
+//   - Shapes with NO delimiter at all (`refresh_token is now <value>`,
+//     `refresh_token -> <value>`) and non-ASCII spacing before `=` (NBSP, thin
+//     space) are not matched. Treating those as assignments means treating prose
+//     as assignment, which is exactly the over-redaction that destroyed the
+//     `invalid_grant` marker and broke auth classification once already.
+//
+// The value-based pass in redactSubmittedSecrets still covers every one of these
+// whenever the value is one we actually submitted; the gap is only for a
+// credential the IdP invents and then describes in prose.
 func redactAssignmentsOfParam(s, name string) string {
 	// Lower-cased copy for case-insensitive search. Built with ASCII-only
 	// folding so byte indices stay aligned with s — strings.ToLower can change
@@ -1187,9 +1240,18 @@ func isParamNameByte(b byte) bool {
 }
 
 // isValueTerminatorByte reports whether b ends a credential value in free text.
+//
+// '[' is a terminator as well as ']', which is not symmetry for its own sake:
+// the two redaction passes run back to back (redactSubmittedSecrets substitutes
+// the placeholder, then calls the assignment pass over its own output). With ']'
+// a terminator but '[' not, the value scan stopped just before the closing
+// bracket of a "[REDACTED]" the first pass had written, and the orphan ']' was
+// re-emitted — turning it into "[REDACTED]]" and growing on every re-application.
+// A redaction routine that corrupts its own output invites doubt about what else
+// it rewrote, so both brackets end a value.
 func isValueTerminatorByte(b byte) bool {
 	switch b {
-	case ' ', '	', '\n', '\r', '"', '\'', '&', ',', ';', '}', ']', ')':
+	case ' ', '	', '\n', '\r', '"', '\'', '&', ',', ';', '}', ']', '[', ')':
 		return true
 	}
 	return false

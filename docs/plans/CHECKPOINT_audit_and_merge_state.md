@@ -237,6 +237,44 @@ Cumulative: **48 defects** fixed across three rounds. Nine were regressions
 introduced by earlier fixes in this same series, every one caught by re-reviewing
 the diff rather than the original code.
 
+### Round-3d — findings from the second reviewer batch (opus-5)
+
+A second batch of reviewers (this one pinned to the parent model rather than
+gpt-5.6-sol) re-reviewed the same diff. Its two HIGH findings — status chosen by
+pattern order, and bare numbers read as 5xx statuses — were **already fixed** as
+#44/#45/#48 before the batch reported; they were independently re-derived, which
+corroborates those fixes rather than adding work. Two genuinely new defects:
+
+| # | Defect | Site | Notes |
+|---|---|---|---|
+| 49 | Name-based redaction matched only exact snake_case, so the one spelling this codebase's own upstream actually emits was uncovered: `auth/oidc.go:291-292` and `config/config.go:65-66` declare these fields as `json:"refreshToken"` / `json:"accessToken"`. A gateway echoing a ROTATED credential in that shape leaked it — and a rotated value is one we never submitted, so the value-based pass cannot catch it either. Name matching was the only control on that case and it did not know the name | `auth/microsoft_sso.go` | Each sensitive parameter now expands to snake_case, hyphenated, and separator-stripped (camelCase-matching) spellings, longest-first so a longer parameter is never half-matched by a shorter one |
+| 50 | The two redaction passes corrupted each other's output: `]` was a value terminator but `[` was not, so the assignment pass stopped just before the closing bracket of a `[REDACTED]` the value pass had written and re-emitted the orphan — yielding `[REDACTED]]`, growing on every re-application | `auth/microsoft_sso.go` | `[` is now a terminator too. No secret ever escaped, but a redactor that corrupts its own output invites doubt about what else it rewrote; idempotence is now pinned by test |
+
+Cumulative: **50 defects**.
+
+Also noted by that batch and NOT actioned, with reasons:
+- `fallbackEarliestCooldown` skipping open breakers (#32) trades "always serve
+  something" for "serve nothing for up to `circuitOpenDuration`" on a
+  single-account pool. That is the intended trade — dispatching into an open
+  breaker converts one open breaker into a stream of failures — and recovery is
+  bounded and proven by `TestOpenCircuitRecoversViaProbeAfterWindow`. Flagged as
+  a product decision, not a defect.
+- Assorted redactor gaps that require no delimiter at all (`refresh_token is now
+  <value>`, NBSP/thin-space before `=`, `refresh_token -> <value>`). Closing
+  these means treating prose as assignment, which is exactly the over-redaction
+  that broke auth classification in #42. Documented as accepted limits in code.
+
+One process note worth keeping: reviewer #1 reported that the file changed under
+it mid-review (line count moved five times, and it observed `claimProbe`
+temporarily stubbed to `_ = now` — my own RED-proof neutralization). Its
+conclusions were still sound because it pinned snapshots, but reviewing a live
+working tree is unreliable by construction. Future adversarial passes should
+review a committed revision.
+
+The third reviewer in that batch (websearch/handler/kiro) **failed with no
+output**, so those surfaces were left unreviewed and a replacement was dispatched
+against the committed state.
+
 ---
 
 ## 4. Remaining work
