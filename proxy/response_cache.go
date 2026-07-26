@@ -19,6 +19,7 @@ package proxy
 //   - TTL-bounded and in-memory only (single-instance); nothing is persisted.
 
 import (
+	"container/list"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -29,17 +30,40 @@ import (
 // cachedResponse holds one stored response body with its expiry.
 type cachedResponse struct {
 	body      []byte
-	expiresAt int64 // Unix seconds
+	expiresAt int64         // Unix seconds
+	lruElem   *list.Element // back-ref into responseCache.order; Value = cache key
 }
+
+// responseCacheMaxEntries bounds how many response bodies the cache retains.
+// Whole HTTP bodies are stored here, so this is a memory ceiling rather than a
+// count that can be set generously: 2048 completions at a few KiB each is on
+// the order of low tens of MiB, which is affordable, while an unbounded map is
+// not.
+const responseCacheMaxEntries = 2048
 
 // responseCache is the in-process TTL store. Safe for concurrent use.
 type responseCache struct {
 	mu      sync.Mutex
 	entries map[string]cachedResponse
+	// order is the LRU list: front = most recently used. Element.Value is the
+	// cache key. Mirrors the design already proven in cache_tracker.go rather
+	// than inventing a second eviction scheme.
+	order *list.List
 }
 
 func newResponseCache() *responseCache {
-	return &responseCache{entries: make(map[string]cachedResponse)}
+	return &responseCache{
+		entries: make(map[string]cachedResponse),
+		order:   list.New(),
+	}
+}
+
+// Len reports the number of retained entries. Used by tests and by the stats
+// endpoint to make cache growth observable rather than a guess.
+func (c *responseCache) Len() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return len(c.entries)
 }
 
 // responseCacheKey derives the cache key from the authenticated API-key identity,
@@ -59,7 +83,7 @@ func responseCacheKey(apiKeyID, endpoint string, body []byte) string {
 }
 
 // Get returns a fresh cached body for the key, or (nil, false) on miss/expiry.
-// Expired entries are dropped lazily. `now` is injectable for tests.
+// A hit marks the entry most-recently-used. `now` is injectable for tests.
 func (c *responseCache) Get(key string, now int64) ([]byte, bool) {
 	if key == "" {
 		return nil, false
@@ -71,15 +95,33 @@ func (c *responseCache) Get(key string, now int64) ([]byte, bool) {
 		return nil, false
 	}
 	if now >= e.expiresAt {
-		delete(c.entries, key)
+		c.removeLocked(key, e)
 		return nil, false
 	}
+	c.order.MoveToFront(e.lruElem)
 	return e.body, true
 }
 
 // Set stores a response body under the key with the given TTL. A copy of the body
 // is retained so later mutation of the caller's buffer cannot corrupt the cache.
 // `now` is injectable for tests. No-op for empty key/body or non-positive TTL.
+//
+// Two reclamation steps run on every insert, because insertion is the ONLY point
+// at which this cache grows:
+//
+//   - Expired entries are swept. Reclaiming them lazily in Get was not enough:
+//     Get only ever inspects the one key being looked up, so an entry whose key
+//     is never requested again is never examined again and its body is retained
+//     for the process's lifetime. A stream of distinct requests — exactly the
+//     traffic shape a proxy sees — therefore accumulated dead bodies forever.
+//   - Overflow beyond responseCacheMaxEntries is evicted least-recently-used.
+//     Whole HTTP response bodies live in this map, so an unbounded map is an
+//     unbounded memory leak that ends in the OOM killer taking down the proxy.
+//     The TTL alone does not bound it (see above).
+//
+// The sweep is O(n) but runs only on insert and only over the map, which the
+// eviction below keeps at responseCacheMaxEntries — so the work is bounded by a
+// constant, not by traffic volume.
 func (c *responseCache) Set(key string, body []byte, ttlSeconds int, now int64) {
 	if key == "" || len(body) == 0 || ttlSeconds <= 0 {
 		return
@@ -88,7 +130,62 @@ func (c *responseCache) Set(key string, body []byte, ttlSeconds int, now int64) 
 	copy(cp, body)
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	c.entries[key] = cachedResponse{body: cp, expiresAt: now + int64(ttlSeconds)}
+
+	c.sweepExpiredLocked(now)
+
+	if e, ok := c.entries[key]; ok {
+		// Refresh in place: keep the existing LRU element, move it to front.
+		e.body = cp
+		e.expiresAt = now + int64(ttlSeconds)
+		c.entries[key] = e
+		c.order.MoveToFront(e.lruElem)
+		return
+	}
+
+	elem := c.order.PushFront(key)
+	c.entries[key] = cachedResponse{
+		body:      cp,
+		expiresAt: now + int64(ttlSeconds),
+		lruElem:   elem,
+	}
+	c.evictOverflowLocked()
+}
+
+// sweepExpiredLocked drops every entry whose TTL has elapsed. Caller holds c.mu.
+func (c *responseCache) sweepExpiredLocked(now int64) {
+	for key, e := range c.entries {
+		if now >= e.expiresAt {
+			c.removeLocked(key, e)
+		}
+	}
+}
+
+// evictOverflowLocked evicts least-recently-used entries until the map is within
+// responseCacheMaxEntries. O(1) per eviction. Caller holds c.mu.
+func (c *responseCache) evictOverflowLocked() {
+	for len(c.entries) > responseCacheMaxEntries {
+		back := c.order.Back()
+		if back == nil {
+			return
+		}
+		key := back.Value.(string)
+		if e, ok := c.entries[key]; ok {
+			c.removeLocked(key, e)
+			continue
+		}
+		// Defensive: list element with no map entry — drop the orphan so the
+		// loop cannot spin.
+		c.order.Remove(back)
+	}
+}
+
+// removeLocked deletes an entry and its LRU element together, so the two
+// structures cannot drift out of sync. Caller holds c.mu.
+func (c *responseCache) removeLocked(key string, e cachedResponse) {
+	if e.lruElem != nil {
+		c.order.Remove(e.lruElem)
+	}
+	delete(c.entries, key)
 }
 
 // usageFromCachedOpenAIBody parses the prompt/completion token counts out of a

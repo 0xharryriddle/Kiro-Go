@@ -385,7 +385,21 @@ func decodeMcpResponse(resp *http.Response) (*McpResponse, error) {
 		return nil, err
 	}
 	if len(body) > maxMcpResponseBytes {
-		return nil, fmt.Errorf("MCP response exceeds %d bytes", maxMcpResponseBytes)
+		// Report the STATUS as well as the size violation. Reporting only
+		// "exceeds N bytes" discarded the one field every downstream
+		// classifier keys off: an oversized 429 stopped being recognised by
+		// isQuotaErrorMessage, so the account was filed as a generic transient
+		// failure rather than quota-exhausted (no quota cooldown) and the
+		// client was told 502 instead of 429 — inviting an immediate retry into
+		// the same exhausted account. An oversized 401/403 likewise never
+		// reached auth classification. A quota or auth reply is exactly the
+		// shape that can arrive as a large gateway HTML page, so this is not a
+		// hypothetical.
+		//
+		// The body itself is still NOT echoed: that is what the bound exists to
+		// prevent, and the status alone is what makes the error classifiable.
+		return nil, fmt.Errorf("MCP request failed: HTTP %d: response exceeds %d bytes",
+			resp.StatusCode, maxMcpResponseBytes)
 	}
 	logger.Debugf("[MCP] Response (%d): %s", resp.StatusCode, string(body))
 
