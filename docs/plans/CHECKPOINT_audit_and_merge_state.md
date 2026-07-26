@@ -14,20 +14,23 @@ Last verified: repo `harry` branch, working tree mid-merge (see §2).
 | Fact | Value | How verified |
 |---|---|---|
 | Branch | `harry` | `git rev-parse --abbrev-ref HEAD` |
-| HEAD | `99dda52` | `git rev-parse HEAD` |
-| Merge in progress | YES — `.git/MERGE_HEAD` present | file exists |
-| Merging in | `upstream-v1.1.5` (`ec4ba56`) | `.git/MERGE_MSG` |
-| Conflicted paths (unstaged `U`) | 14 | `git diff --name-only --diff-filter=U` |
-| Conflict markers remaining | 0 in every conflicted file | grep for `^<<<<<<<`/`^>>>>>>>` |
+| HEAD | `6158c24` (merge commit) | `git rev-parse HEAD` |
+| Merge parents | `99dda52` + `ec4ba56` (2 parents) | `git rev-list --parents -n1 HEAD` |
+| Merge in progress | NO — `.git/MERGE_HEAD` cleared | file absent |
+| Conflict markers remaining | 0 across all tracked files | grep for `^<<<<<<<`/`^>>>>>>>` |
+| Pushed to `origin/harry` | **NO** — local only | `git rev-list --count origin/harry..HEAD` |
 | Build | clean | `go build ./...` |
-| Test suite | **918 passed, 0 failed** | `go test ./config/ ./pool/ ./auth/ ./proxy/` |
-| `go vet` | clean | `go vet ./...` |
+| Test suite | **826 passed, 0 failed** | `go test ./config/ ./pool/ ./auth/ ./proxy/ -count=1` |
+| `-race` | clean, 0 data races | `go test -race ./... -count=1` |
+| `go vet` / `gofmt` | clean | `go vet ./...`, `gofmt -l` |
 
-**Interpretation.** The merge is *textually resolved but not staged*: git still
-reports `U` (both-modified) for 14 paths, yet no file contains conflict markers
-and the full suite is green. Someone resolved the conflicts in place without
-`git add`. This is a safe state to continue from, but the merge must be
-completed deliberately (§4, item R1) — it is NOT finished.
+**Interpretation.** The merge is complete and committed locally. It arrived as
+*resolved but unstaged* (git reported `U` for 14 paths with no conflict markers
+in any of them — an earlier session resolved them in place without `git add`);
+every path was re-verified marker-free, the full gate was re-run from the exact
+staged state, and the merge was then committed as a real two-parent merge.
+
+Nothing has been pushed. `harry` is ahead of `origin/harry`.
 
 ---
 
@@ -215,15 +218,36 @@ one reported DIVERGE line turned out to be stale `/tmp` output from a probe its
 author had already deleted, which is why probe claims get re-run rather than
 believed.
 
+### Round-3c — a third pass over the same diff
+
+Reviewers kept probing the fixes from rounds 2/3. Three more defects, all in MY
+own changes:
+
+| # | Defect | Site | Notes |
+|---|---|---|---|
+| 46 | **Regression I introduced, and the fix bought nothing.** Fix #31 reordered `DisableAccount`/`MarkOverLimit` to Reload BEFORE stamping the cooldown. Proven by probe: that opens a window where the account is back in `p.accounts` with no cooldown — fully routable, which is precisely what these calls exist to prevent. Worse, the justification was wrong: the old order's cooldown already survived the prune, because the prune keys off `config.GetAccounts()` (all configured accounts), not the enabled subset | `pool/account.go` | Now stamps on BOTH sides of Reload via `setCooldownIfLater` (idempotent): before, so no window exists; after, so a config-absent id survives the prune. Neither order works alone |
+| 47 | `MarkOverLimit` used a raw map assignment, so a 402 arriving while a longer backoff was in force (1h quota, or the 24h disable safety net) SHORTENED it and pulled the account back into rotation early | `pool/account.go` | Switched to `setCooldownIfLater`, matching `RecordError`'s existing discipline |
+| 48 | **Regression I introduced.** Fix #45's `firstUpstreamStatusToken` matched BARE numbers in 400–599, so `unauthorized (usage 512/1000 credits)`, `token expired 540 seconds ago`, `[seq 501]` and `remaining balance 550` all read as server statuses and suppressed a genuine credential failure. Inverted the classifier: a revoked credential filed as an outage, never flagged for re-auth, kept being routed while every request failed | `pool/account.go` | A number now only counts as a status when INTRODUCED as one (`http`/`status`/`returned`/`failed` before it), mirroring proxy's patterns. Critically, the context requirement applies ONLY to the 5xx suppression — a bare 401/403 stays positive evidence, because that branch can only ever CLEAR a failure |
+
+Note on #48: the first attempt at it broke `"received 403 Forbidden"` (two
+pre-existing tests caught it). That is why the context rule is asymmetric —
+requiring context to DETECT auth is unsafe, requiring it to DISMISS auth is safe.
+
+Cumulative: **48 defects** fixed across three rounds. Nine were regressions
+introduced by earlier fixes in this same series, every one caught by re-reviewing
+the diff rather than the original code.
+
 ---
 
 ## 4. Remaining work
 
-### R1 — Complete the merge (BLOCKING, needs user decision)
-14 paths are resolved-but-unstaged. The tree builds and 918 tests pass, so the
-resolution looks sound, but finishing a merge is a history-affecting act on the
-user's repo. Needs explicit go-ahead on: stage the 14 resolved paths + commit
-the merge, then push `harry`.
+### R1 — Complete the merge — DONE
+Committed as `6158c24`, a real two-parent merge (`99dda52` + upstream `ec4ba56`);
+`MERGE_HEAD` cleared. 70 files, +13651/-850.
+
+All 14 previously-conflicted paths were verified marker-free before staging, and
+the full gate was re-run from the exact staged state. NOT YET PUSHED — `harry` is
+ahead of `origin/harry` and pushing is the user's call.
 
 ### R2 — `stop_reason: "error"` (needs user decision)
 On Claude mid-stream termination I emit `stop_reason: "error"`, which is outside

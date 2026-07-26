@@ -940,23 +940,35 @@ func IsAuthFailure(err error) bool {
 	// mirror image of the false-ban this gate exists to prevent, and it left
 	// this classifier disagreeing with proxy's isAuthErrorMessage on the same
 	// string.
-	if status, ok := firstUpstreamStatusToken(lower); ok {
-		if status == 401 || status == 403 {
-			return true
-		}
-		// A 5xx is the upstream failing, never proof that THIS account's
-		// credentials were revoked. Without this gate a 500 whose body merely
-		// mentioned "invalid_grant"/"unauthorized"/"token expired" drove
-		// classifyAndBanOnUsageError (proxy/kiro_api.go) to
-		// banAccountInline(BANNED) — a permanent, operator-only-reversible ban
-		// on a healthy account during an upstream outage, i.e. the fleet drains
-		// exactly when it is least able to recover.
-		if status >= 500 {
-			return false
-		}
-		// Any other 4xx: the status is authoritative but not itself an auth
-		// verdict, so the narrow markers below get their say (a 400 carrying
-		// invalid_grant is a genuinely revoked refresh token).
+	// A 401/403 anywhere is positive evidence on its own: only the credential
+	// can produce it, and callers upstream of this classifier format such
+	// errors in several shapes ("received 403 Forbidden" has no HTTP-status
+	// word in front of it). Requiring status CONTEXT here would silently stop
+	// detecting those, so this check keeps the original boundary-token rule.
+	if HasStatusToken(msg, "401") || HasStatusToken(msg, "403") {
+		return true
+	}
+
+	// The 5xx SUPPRESSION is the branch that needs to be conservative, because
+	// it can only ever *clear* a credential failure. Two independent conditions
+	// must hold before a 5xx is allowed to veto the markers below:
+	//
+	//  1. The number is presented AS an HTTP status (hasStatusContextBefore).
+	//     Error strings routinely carry unrelated integers in 400-599 — credit
+	//     counters ("usage 512/1000 credits"), elapsed seconds, balances,
+	//     sequence numbers. Reading one as a server status inverts the
+	//     classifier: a genuinely revoked credential is filed as an outage, so
+	//     the account is never flagged for re-auth and keeps being routed while
+	//     every request fails. That is the mirror of the false ban this gate
+	//     prevents, and harder to spot — a false ban shows in the admin UI, a
+	//     missed revocation just looks like an account that keeps erroring.
+	//
+	//  2. It is the EARLIEST status in the message. Every formatter writes the
+	//     authoritative status at the front and appends the opaque upstream body
+	//     after it, so a 400 whose body quotes "upstream returned 500" is a
+	//     revoked credential, not an outage.
+	if status, ok := firstUpstreamStatusToken(lower); ok && status >= 500 {
+		return false
 	}
 	if strings.Contains(lower, "bad credentials") ||
 		strings.Contains(lower, "invalid_grant") ||
@@ -1010,13 +1022,31 @@ func firstUpstreamStatusToken(s string) (int, bool) {
 	bestStatus := 0
 	for code := 400; code <= 599; code++ {
 		token := strconv.Itoa(code)
-		idx := statusTokenIndex(s, token)
-		if idx < 0 {
-			continue
-		}
-		if bestIdx < 0 || idx < bestIdx {
-			bestIdx = idx
-			bestStatus = code
+		offset := 0
+		for {
+			idx := statusTokenIndexFrom(s, token, offset)
+			if idx < 0 {
+				break
+			}
+			// Only count a number that is INTRODUCED as an HTTP status. Error
+			// strings routinely carry unrelated integers in 400-599 — credit
+			// counters ("usage 512/1000 credits"), elapsed seconds ("expired
+			// 540 seconds ago"), balances, sequence numbers — and reading one
+			// of those as a server status inverts this classifier: a genuinely
+			// revoked credential is filed as an upstream outage, so the
+			// account is never flagged for re-auth and keeps being routed
+			// while every request fails. That is the mirror of the false ban
+			// the 5xx gate prevents, and harder to notice: a false ban is
+			// visible in the admin UI, a missed revocation just looks like an
+			// account that keeps erroring.
+			if hasStatusContextBefore(s, idx) {
+				if bestIdx < 0 || idx < bestIdx {
+					bestIdx = idx
+					bestStatus = code
+				}
+				break
+			}
+			offset = idx + len(token)
 		}
 	}
 	if bestIdx < 0 {
@@ -1025,12 +1055,62 @@ func firstUpstreamStatusToken(s string) (int, bool) {
 	return bestStatus, true
 }
 
-// statusTokenIndex returns the index of the first occurrence of status in s that
-// has non-alphanumeric boundaries on both sides, or -1. Same rule as
-// HasStatusToken, but reports WHERE the token is so callers can compare
-// positions.
-func statusTokenIndex(s, status string) int {
-	offset := 0
+// statusContextWords are the words that precede a real HTTP status in the error
+// strings this repo produces. They mirror proxy's upstreamStatusPatterns:
+//
+//	"HTTP 500 from kiro: <body>"                    -> http
+//	"refresh failed: 500 <body>"                    -> failed
+//	"social token exchange failed (status 503): ..." -> status
+//	"upstream status 502: <body>"                   -> status
+//	"upstream returned 502: <body>"                 -> returned
+var statusContextWords = []string{"http", "status", "returned", "failed"}
+
+// hasStatusContextBefore reports whether the token starting at idx is preceded
+// by a word that introduces an HTTP status. It skips intervening spaces and
+// punctuation (':' and '(' appear in the real formats) and then compares the
+// preceding word.
+func hasStatusContextBefore(s string, idx int) bool {
+	end := idx
+	for end > 0 {
+		c := s[end-1]
+		if c == ' ' || c == '	' || c == ':' || c == '(' || c == '=' {
+			end--
+			continue
+		}
+		break
+	}
+	if end == 0 {
+		return false
+	}
+	start := end
+	for start > 0 && isAlphaNum(s[start-1]) {
+		start--
+	}
+	if start == end {
+		return false
+	}
+	word := strings.ToLower(s[start:end])
+	for _, w := range statusContextWords {
+		if word == w {
+			return true
+		}
+	}
+	return false
+}
+
+// statusTokenIndexFrom returns the index of the first occurrence of status at or
+// after start that has non-alphanumeric boundaries on both sides, or -1. Same
+// rule as HasStatusToken, but it reports WHERE the token is (so callers can
+// compare positions) and accepts a start offset (so a caller can keep scanning
+// past a match it rejected for lacking HTTP-status context).
+func statusTokenIndexFrom(s, status string, start int) int {
+	if start < 0 {
+		start = 0
+	}
+	if start > len(s) {
+		return -1
+	}
+	offset := start
 	for {
 		rel := strings.Index(s[offset:], status)
 		if rel < 0 {
@@ -1077,15 +1157,27 @@ func (p *AccountPool) DisableAccount(id, reason string) {
 		// best effort — even if persistence fails, drop it from memory
 		_ = err
 	}
-	// Reload FIRST, then stamp the safety-net cooldown. Reload prunes routing
-	// state for IDs that are no longer in config, so a cooldown written before
-	// it can be deleted by it — which is precisely backwards for a value whose
-	// stated job is to survive a racing Reload. Setting it afterwards makes the
-	// safety net hold for any id, including one already gone from config.
+	// Stamp the safety-net cooldown BOTH before and after Reload, using
+	// setCooldownIfLater so the second stamp is idempotent.
+	//
+	// Neither order works alone, which is why both stamps are here:
+	//   - Stamping only BEFORE leaves the cooldown exposed to Reload's prune
+	//     when the id is already gone from config (the prune keys off
+	//     config.GetAccounts()).
+	//   - Stamping only AFTER opens a window between Reload returning and the
+	//     stamp landing, during which a concurrent selection sees an account
+	//     that is in p.accounts with no cooldown — i.e. fully routable, which
+	//     is exactly what this call exists to prevent.
+	//
+	// Stamping on both sides closes the window and survives the prune for
+	// either id shape.
+	now := time.Now()
+	p.mu.Lock()
+	setCooldownIfLater(p.cooldowns, id, now.Add(24*time.Hour))
+	p.mu.Unlock()
 	p.Reload()
 	p.mu.Lock()
-	// Long cooldown as a safety net in case Reload races
-	p.cooldowns[id] = time.Now().Add(24 * time.Hour)
+	setCooldownIfLater(p.cooldowns, id, now.Add(24*time.Hour))
 	p.mu.Unlock()
 }
 
@@ -1094,12 +1186,22 @@ func (p *AccountPool) DisableAccount(id, reason string) {
 // FetchOverageStatus from the request handler; here we just cooldown briefly so
 // the next attempt picks a different account, then reload.
 func (p *AccountPool) MarkOverLimit(id string) {
-	// Reload before stamping, for the same reason as DisableAccount: Reload
-	// prunes state for IDs absent from config, so a cooldown set beforehand can
-	// be pruned away by the very call meant to follow it.
+	// Stamped on both sides of Reload for the same reason as DisableAccount:
+	// before, so no window exists where the account is reloaded but not yet
+	// cooled; after, so the prune cannot drop it for a config-absent id.
+	//
+	// setCooldownIfLater rather than a raw assignment: a raw write here
+	// SHORTENED an existing longer backoff, so a 402 arriving while a 1h quota
+	// cooldown (or the 24h disable safety net) was already in force pulled the
+	// account back into rotation early — the opposite of what marking it
+	// over-limit is for.
+	now := time.Now()
+	p.mu.Lock()
+	setCooldownIfLater(p.cooldowns, id, now.Add(time.Hour))
+	p.mu.Unlock()
 	p.Reload()
 	p.mu.Lock()
-	p.cooldowns[id] = time.Now().Add(time.Hour)
+	setCooldownIfLater(p.cooldowns, id, now.Add(time.Hour))
 	p.mu.Unlock()
 }
 
