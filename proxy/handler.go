@@ -879,6 +879,13 @@ func (h *Handler) handleStats(w http.ResponseWriter, r *http.Request) {
 		"totalTokens":     atomic.LoadInt64(&h.totalTokens),
 		"totalCredits":    h.getCredits(),
 		"cache":           h.promptCache.Stats(),
+		// Both caches are reported, because they are different mechanisms with
+		// different failure modes and an operator needs to tell them apart:
+		// "cache" is the Anthropic prompt-cache prefix tracker (token
+		// accounting), "responseCache" is the exact-match whole-response store
+		// (credit avoidance). Reporting only the former made an enabled-but-idle
+		// response cache indistinguishable from a working one.
+		"responseCache": h.responseCacheStats(),
 		// Customer-safe latency distribution (no account identities): with session
 		// affinity on, warm accounts pull the mean/min down over time.
 		"dispatchLatency": h.pool.LatencyAggregate(),
