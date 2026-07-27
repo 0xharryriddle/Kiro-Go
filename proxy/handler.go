@@ -3618,7 +3618,35 @@ func (h *Handler) ensureValidToken(account *config.Account) error {
 		}
 		return nil
 	}
-	if account.ExpiresAt == 0 || time.Now().Unix() < account.ExpiresAt-tokenRefreshSkewSeconds {
+	// Bedrock and custom_api accounts carry static credentials and no Kiro OAuth
+	// material, so there is nothing to refresh. They are checked explicitly rather
+	// than relying on ExpiresAt == 0, which is what used to cover them by accident
+	// and is exactly why the zero case below could not be treated as "refresh due".
+	if account.IsBedrock() || account.IsCustomApi() {
+		return nil
+	}
+
+	// ExpiresAt == 0 on an OAuth account means the expiry is UNKNOWN, not that the
+	// token never expires. It used to short-circuit as valid, so such an account
+	// was never refreshed at request time and the background refresher skipped it
+	// too (it only runs when ExpiresAt > 0). The supplied access token then expired
+	// on its own ~1h schedule while a perfectly good refresh token sat unused, every
+	// subsequent request failed upstream, and the account was cooled down and
+	// eventually banned — with the credential that would have fixed it already in
+	// hand.
+	//
+	// Refresh is attempted only when the material to do it exists; without a refresh
+	// token there is nothing to try and failing here would take an account offline
+	// that might still be serving.
+	if account.ExpiresAt == 0 {
+		if strings.TrimSpace(account.RefreshToken) == "" {
+			return nil
+		}
+		_, err := h.refreshAccountToken(account, false)
+		return err
+	}
+
+	if time.Now().Unix() < account.ExpiresAt-tokenRefreshSkewSeconds {
 		return nil
 	}
 
