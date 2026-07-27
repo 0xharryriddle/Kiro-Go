@@ -127,17 +127,47 @@ be building on an assumption and calling it a fix. It also has the same root
 cause as W3 — if Kiro never caches for us, these fields are always zero and the
 plumbing is dead code.
 
-**To unblock:** one captured Kiro response whose usage object contains a nonzero
-`cacheReadInputTokens`. That single artifact settles W2 and W3 together.
+**Status: SETTLED by captured traffic — see W3 below.** The "one capture would
+unblock this" framing was wrong twice over: the captures already existed, and
+what they show is that there is nothing to plumb.
 
-### OUT OF SCOPE — W3: make prompt caching actually work on the Kiro path
+### W3 — prompt caching on the Kiro path: PROVEN IMPOSSIBLE (not merely unverified)
 
-This requires adding a cache-breakpoint field to the Kiro wire payload. I have
-**no capture of a real Kiro IDE request** showing how (or whether) Kiro accepts
-cache markers. Guessing a field name and shape risks 400-ing every request.
+Previously recorded as "UNVERIFIED, needs one captured Kiro IDE request body".
+That blocker was self-imposed. The trace facility was already enabled
+(`traceCaptureMode = redacted`, `traceMaxBodyBytes = 262144`) with **13,636
+captured request/response bodies on disk** the entire time.
 
-UNVERIFIED and left alone deliberately. Unblocking it needs one captured Kiro
-IDE request body. Same evidence gap as R3 in the audit checkpoint.
+What the real outbound Kiro payloads contain, from 38 fully-parsed bodies (the
+rest hit the 256 KiB cap and are truncated strings, so they parse only as text):
+
+```
+KiroPayload        keys → conversationState, inferenceConfig
+conversationState  keys → chatTriggerType, conversationId, currentMessage, history
+userInputMessage   keys → content, images, modelId, origin, userInputMessageContext
+cache-related keys       → NONE at any level
+```
+
+A structural scan for `cache_control` / `cachePoint` / `cacheControl` /
+`cacheReadInputTokens` / `cacheWriteInputTokens` / `uncachedInputTokens` as JSON
+KEYS across 1,200 bodies found **zero**. Combined with
+`KiroUserInputMessage.Content` being a plain `string` (no per-block structure to
+attach a marker to), prompt caching cannot be expressed in this wire format.
+
+This is now an empirical finding, not a deduction from the struct definition.
+
+**FALSE-POSITIVE WARNING for anyone re-running this scan.** A naive text search
+reported "262 of 600 bodies contain cache markers", including plausible-looking
+hits for `cachePoint` and `cacheReadInputTokens`. Every one was contamination:
+the captured conversations contain the *agent session that was investigating the
+cache*, so the search matched its own shell commands quoted inside prompt text.
+Exclude lines containing `grep`/`python3`/`re.compile`/`pat=` and require the
+match to be a JSON key (`"name":`), or the corpus will confirm whatever you
+search for.
+
+**To reopen:** upstream documentation or a Kiro-IDE-originated capture from a
+DIFFERENT client. Captures of our own traffic cannot answer it — they only ever
+show what this proxy sends.
 
 ---
 

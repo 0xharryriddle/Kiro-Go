@@ -339,13 +339,39 @@ On Claude mid-stream termination I emit `stop_reason: "error"`, which is outside
 Anthropic's documented enum. A strict client may prefer `end_turn` with the
 separate `error` event carrying the signal. Cosmetic but client-visible.
 
-### R3 — `toolResult.status` enum (needs external evidence)
-`is_error` is currently signalled via a content-text marker
-(`toolResultErrorPrefix`), following the existing `toolResultImagePlaceholder`
-precedent. The structured `Status` field would be cleaner, but the set of values
-Kiro accepts is undocumented in-repo and could not be verified (no CodeWhisperer
-SDK in the module cache; web search unavailable). Sending an unaccepted enum
-would 400 every failed tool turn. Needs a live capture of Kiro IDE traffic.
+### R3 — `toolResult.status` enum — RESOLVED, no change needed
+
+Settled from REAL captured traffic, not inference. The trace facility was already
+enabled (`traceCaptureMode = redacted`) with 13,636 captured bodies on disk, so
+the "needs a live capture" blocker was self-imposed — the captures existed the
+whole time.
+
+What 4,000 scanned request bodies show:
+
+```
+bodies containing toolResults : 3788
+keys inside toolResults       : content 5911, toolUseId 4233, text 4219, status 2189
+distinct `status` VALUES sent : "success"  (2182 occurrences) — and nothing else
+```
+
+The corpus therefore CANNOT reveal the accepted enum, because we hardcode
+`Status: "success"` at both construction sites (`proxy/translator.go:1022` and
+`:1652`) and never send an error value. The traces show what WE send, not what
+Kiro accepts.
+
+So the existing design stands, and the comment at `translator.go:1010-1015`
+already reasons it out correctly: the failure marker goes in `Content` (free
+text, the same channel `toolResultImagePlaceholder` uses) precisely because an
+unaccepted enum would 400 every failed tool turn. The signal is lossless and
+recoverable — `markToolResultFailed` is idempotent, and three tests pin it
+(`proxy/tool_result_error_test.go`: marked on error, not marked on success, not
+marked when `is_error:false`).
+
+The OpenAI route deliberately does not mark failures: the OpenAI wire format has
+no `is_error` field on a tool message, so there is nothing to translate.
+
+Reopening this needs upstream DOCUMENTATION of the accepted enum, not another
+capture. Captures of our own traffic can never answer it.
 
 ### R4 — Audit the new upstream surfaces — DONE (see §3b)
 `web_search` via Kiro MCP, Microsoft Enterprise SSO, and the session-affinity /
