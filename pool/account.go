@@ -461,6 +461,12 @@ func (p *AccountPool) GetNextForModelExcluding(model string, excluded map[string
 	// (synchronous os.WriteFile). Keeping cfgLock a strict leaf preserves the
 	// global order tokenRefreshMu → p.mu → refreshLockFor → cfgLock.
 	allowOverUsage := config.GetAllowOverUsage()
+	// Hoisted for the same reason as allowOverUsage. This read used to sit at the
+	// quota-aware branch below, INSIDE p.mu: the hoist above only narrows the
+	// window, it does not close it, because a config writer can acquire cfgLock
+	// in the gap between these two reads and then this one blocks with the pool
+	// lock already held.
+	quotaAware := config.GetQuotaAwareRouting()
 
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -474,7 +480,7 @@ func (p *AccountPool) GetNextForModelExcluding(model string, excluded map[string
 	// Quota-aware routing: prefer the model-capable account with the most
 	// remaining quota. Falls back to LRU selection below when none has usable
 	// data. pickQuotaAware already returns a copy.
-	if config.GetQuotaAwareRouting() {
+	if quotaAware {
 		if acc := p.pickQuotaAware(model, excluded, now, allowOverUsage); acc != nil {
 			// Stamp the LRU clock even though this pick did not use it. Every
 			// other dispatch path stamps (the LRU pick below and the
@@ -1344,9 +1350,17 @@ func (p *AccountPool) Diagnostics() []AccountDiagnostics {
 
 // DiagnosticsFor returns per-account routing state for the supplied account set.
 func (p *AccountPool) DiagnosticsFor(accounts []config.Account) []AccountDiagnostics {
+	// Hoist the config read ABOVE p.mu — see GetNextForModelExcluding for the
+	// ordering rationale. diagnosticsForLocked used to call
+	// config.GetAllowOverUsage() itself, which nested cfgLock under the pool
+	// lock: a config writer mid-Save (synchronous ~145KB file I/O) parked this
+	// RLock behind disk it does not control, and every other pool operation —
+	// dispatch, cooldown stamping, model-list updates — queued behind it.
+	allowOverUsage := config.GetAllowOverUsage()
+
 	p.mu.RLock()
 	defer p.mu.RUnlock()
-	return p.diagnosticsForLocked(accounts, "")
+	return p.diagnosticsForLocked(accounts, "", allowOverUsage)
 }
 
 // ModelRouting returns diagnostics scoped to one requested model.
@@ -1356,6 +1370,10 @@ func (p *AccountPool) ModelRouting(model string) ModelRoutingDiagnostics {
 
 // ModelRoutingFor returns model routing diagnostics for the supplied account set.
 func (p *AccountPool) ModelRoutingFor(accounts []config.Account, model string) ModelRoutingDiagnostics {
+	// Hoist the config read ABOVE p.mu — same rationale as DiagnosticsFor: the
+	// shared callee must never take cfgLock while the pool lock is held.
+	allowOverUsage := config.GetAllowOverUsage()
+
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 	model = strings.ToLower(strings.TrimSpace(model))
@@ -1366,7 +1384,7 @@ func (p *AccountPool) ModelRoutingFor(accounts []config.Account, model string) M
 			break
 		}
 	}
-	items := p.diagnosticsForLocked(accounts, model)
+	items := p.diagnosticsForLocked(accounts, model, allowOverUsage)
 	routeable := 0
 	for _, item := range items {
 		if item.Available {
@@ -1422,9 +1440,12 @@ func (p *AccountPool) ModelMatrix() (entries []ModelMatrixEntry, accountsWithCac
 	return entries, accountsWithCache
 }
 
-func (p *AccountPool) diagnosticsForLocked(accounts []config.Account, model string) []AccountDiagnostics {
+// diagnosticsForLocked must be called with p.mu held. allowOverUsage is passed in
+// rather than read here: this function runs under the pool lock, and reading it
+// from config would nest cfgLock beneath p.mu, freezing the whole pool for the
+// duration of any concurrent config write (see DiagnosticsFor).
+func (p *AccountPool) diagnosticsForLocked(accounts []config.Account, model string, allowOverUsage bool) []AccountDiagnostics {
 	now := time.Now()
-	allowOverUsage := config.GetAllowOverUsage()
 	inPool := make(map[string]bool)
 	for _, acc := range p.accounts {
 		inPool[acc.ID] = true

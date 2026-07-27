@@ -701,6 +701,62 @@ control stays green.
 
 Cumulative: **76 defects**.
 
+### Round-15 — the pool lock nests cfgLock in three places (its own contract forbids it)
+
+Found by following up a lock-order claim from a research subagent instead of taking
+it on trust. The claim was partly right and partly wrong: the site it named is
+real, but its stated consequence (deadlock) is not, and it missed two other sites.
+
+The pool documents the rule itself at `pool/account.go:458-462`: read config
+BEFORE acquiring `p.mu`, "so the pool lock never nests cfgLock". Commit `58727ec`
+("hoist config reads above pool lock to avoid freeze under Save stall") hoisted the
+reads that violated it — and left three behind.
+
+| # | Defect | Site | Notes |
+|---|---|---|---|
+| 77 | **Three pool code paths call `config.*` while holding `p.mu`, parking the pool lock behind synchronous config-file I/O.** `cfgLock` is held for the WHOLE duration of a config write (`Save` → `atomicWriteConfig`: `os.ReadFile` + backup rotate + `CreateTemp` + write + fsync + `Rename` on the live 145,728-byte config). Any pool method that reads config under `p.mu` therefore blocks every other pool operation — dispatch, cooldown stamping, model-list updates — for the duration of a disk write it does not control | `pool/account.go:477` (`GetQuotaAwareRouting` under `p.mu.Lock`); `:1427` in `diagnosticsForLocked`, reached under `p.mu.RLock` from BOTH `DiagnosticsFor` (`:1346-1349`) and `ModelRoutingFor` (`:1358-1369`) | Fix hoists the read above the lock in all three: `quotaAware` is now read beside `allowOverUsage`, and `diagnosticsForLocked` takes `allowOverUsage` as a parameter instead of reading it |
+
+**Correcting the subagent's claim rather than repeating it.** It reported this as a
+lock-order/deadlock hazard. Verified it is a STALL, not a deadlock: package
+`config` imports nothing from `kiro-go` (checked — zero `kiro-go/*` imports), and
+`cfgLock` is unexported and referenced only inside `config`, so no reverse edge
+`cfgLock → p.mu` exists and a cycle is impossible. The blast radius is
+availability, not a hang. It also named only line 477 and missed
+`diagnosticsForLocked` — the more reachable of the two, since it is hit by two
+callers and by admin diagnostics traffic.
+
+**Line 477 was the *less* severe site, for a non-obvious reason.** The hoisted
+`allowOverUsage` read at `:463` sits above `p.mu` and blocks there first, so under
+a stalled writer execution never reaches 477 with the lock held. The hoist narrows
+the window; it does not close it — a writer that acquires `cfgLock` in the gap
+between the two reads still catches 477 under the lock. Fixed for that residual
+window, not for a reproducible freeze.
+
+**RED-proof.** `pool/lock_order_stall_test.go` reproduces the mechanism instead of
+asserting on source text. `config.Init` is pointed at a writer-less FIFO, so
+`Load()`'s `os.ReadFile` parks holding `cfgLock` — the exact shape of a slow `Save`,
+with no timing luck required. `SetModelList` is the canary: it takes `p.mu.Lock()`
+and calls no config function at all (`:371-382`), so if it cannot proceed, another
+pool operation is holding `p.mu`. Pre-fix both tests fail at 1.92s (frozen);
+post-fix both pass at ~0.41s.
+
+**A neutralization that proved nothing, and why.** The first attempt reverted only
+`diagnosticsForLocked` and both tests still PASSED. That looked like a false green
+but was not: the partial revert is *shielded* by the hoisted read in the caller,
+which blocks before `p.mu` is ever taken, so the re-introduced in-lock read is
+unreachable. Full neutralization — reverting all three sites to their exact
+pre-fix shape — makes both tests fail at 1.92s again. Recorded because the
+shielding is the same effect that makes line 477 hard to reproduce, and a partial
+revert would have silently understated the test's power.
+
+**Test-premise bug found and fixed in the harness itself.** The first RED run had
+one test fail on its own premise assertion, not on the defect. Cause: `config.Init`
+takes `cfgLock`, publishes `cfgPath`, RELEASES it, and only then calls `Load()`
+which re-acquires — a real window in which a config read legitimately completes.
+The premise check now polls until a probe actually blocks rather than probing once.
+
+Cumulative: **77 defects**.
+
 ---
 
 ## 4. Remaining work

@@ -1,7 +1,8 @@
 # Kiro-Go — fresh-session handoff prompt
 
 Paste this whole file as the opening message of the new session. Every fact below
-was verified by command output at handoff time (2026-07-27, HEAD `29e799c`).
+was verified by command output at handoff time (2026-07-28, HEAD `d731d86` + rounds 14/15
+uncommitted-then-committed as noted below).
 Where something is unverified or unknown, it says so — do not upgrade those to
 facts without checking.
 
@@ -11,12 +12,40 @@ facts without checking.
 
 Continue the Kiro-Go audit-and-harden effort. It is not "finish a feature"; it is
 **find real defects, prove them, fix them, verify, deploy**. The previous session
-closed 75 defects across thirteen rounds (13 + a 13b follow-up driven by an
-adversarial review of round 13's own fix). There is no deadline and no fixed list —
+closed 77 defects across fifteen rounds (13 + a 13b follow-up driven by an
+adversarial review of round 13's own fix, then 14 and 15). There is no deadline and
+no fixed list —
 work the highest-risk unreviewed surface, then the next.
 
 Repo: `/home/harry-riddle/dev/github.com/0xharryriddle/Kiro-Go`
 Branch: `harry` (tracks `origin/harry`)
+
+**Rounds 14 and 15 (most recent, read these first).**
+
+Round 14 (`d731d86`) — defect #76: `/v1/responses` had no `IsBedrock()` guard in
+either dispatch loop, so a Bedrock account could be sent to the Kiro endpoint,
+403, and be penalised by `handleAccountFailure`. Both sibling surfaces already had
+the guard; CLAUDE.md states the invariant. Latent today (0 Bedrock accounts in the
+live config), live the moment one is added.
+
+Round 15 — defect #77: three pool paths called `config.*` while holding `p.mu`
+(`pool/account.go:477`, and `diagnosticsForLocked:1427` reached from both
+`DiagnosticsFor` and `ModelRoutingFor`), which parks the pool lock behind a
+synchronous 145KB config write. The pool documents the opposite rule at
+`account.go:458-462`, and commit `58727ec` had hoisted the other reads but left
+these. Verified to be a STALL, not a deadlock — `config` imports nothing from
+`kiro-go`, so no cycle is possible.
+
+**Two lessons from those rounds worth carrying forward.**
+
+1. *Never assert on source text.* Round 14's first test grepped for the string
+   `IsBedrock()`. It went red-then-green and looked valid, but neutralizing the
+   guard with `if false && account.IsBedrock()` left it passing — the substring
+   still matched. Behavioural tests only.
+2. *A neutralization that passes may be shielded, not false-green.* Round 15's
+   partial revert kept passing because a hoisted read blocks before the lock is
+   taken, making the reverted line unreachable. Revert ALL sites to the exact
+   pre-fix shape before concluding a test is weak.
 
 ---
 
@@ -24,18 +53,20 @@ Branch: `harry` (tracks `origin/harry`)
 
 | Fact | Value |
 |---|---|
-| HEAD | `29e799c` |
+| HEAD | `d731d86` (round 14) + round 15 committed on top — check `git log -1` |
 | Remote | `origin/harry` identical (0 ahead / 0 behind) |
 | Working tree | clean |
-| Tests | 947 top-level test funcs pass across `config` `pool` `auth` `proxy` (measured, not remembered: 936 at round 12 + 6 in round 13 + 5 in round 13b) |
+| Tests | 951 top-level test funcs pass across `config` `pool` `auth` `proxy` (measured, not remembered: 936 at round 12 + 6 round 13 + 5 round 13b + 2 round 14 + 2 round 15). `-race` clean |
 | `-race` | clean, 0 data races |
 | `go vet` / `gofmt` | clean tree-wide |
 | Live container | healthy, version **1.1.5** |
-| Deployed image built from | `91f981c` (round 12, digest `b2be7951`) — **round 13 (`c013d52`) is committed but NOT yet deployed**; rebuild and redeploy before treating the container as current |
+| Deployed image built from | `29e799c` (round 13b, digest `71f4e867`) — **rounds 14 (`d731d86`) and 15 are committed but NOT yet deployed**; rebuild and redeploy before treating the container as current |
 
 Recent commits (newest first):
 
 ```
+d731d86 fix(responses): guard Bedrock accounts out of the Kiro dispatch loops
+ec6784d docs: sync the handoff to 29e799c (round 13b)
 29e799c fix(bedrock): do not bill a stream the client never received
 f27d002 docs: record round 13 and sync the handoff to c013d52
 c013d52 fix(bedrock): stop charging client disconnects to the serving account
@@ -57,7 +88,7 @@ a1cf36f fix(admin): validate an explicit region before probing or persisting it
 ```
 
 **Read `docs/plans/CHECKPOINT_audit_and_merge_state.md` first.** It is the
-authoritative record: all 75 defects, the rejected claims (so they are not
+authoritative record: all 77 defects, the rejected claims (so they are not
 re-litigated), and every deliberate non-decision with its reasoning.
 
 Two entries there are worth reading before starting: the **correction to the
