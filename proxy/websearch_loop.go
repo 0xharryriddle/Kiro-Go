@@ -23,6 +23,15 @@ import (
 
 const maxWebSearchRounds = 5
 
+// webSearchAccountUsage is what one account actually consumed across the rounds
+// it served, so each can be billed for its own work instead of the whole
+// request landing on whichever account happened to serve last.
+type webSearchAccountUsage struct {
+	inputTokens int
+	credits     float64
+	rounds      int
+}
+
 // webSearchRoundOutcome is one buffered generateAssistantResponse round.
 type webSearchRoundOutcome struct {
 	text               string
@@ -41,6 +50,39 @@ func (h *Handler) runWebSearchLoop(w http.ResponseWriter, req *ClaudeRequest, th
 	presentation := make([]map[string]interface{}, 0)
 	var lastAccountID string
 	var totalCredits float64
+	// Per-round accounting. The loop can span several upstream calls, and the
+	// pool's LRU deliberately hands consecutive rounds to DIFFERENT accounts
+	// (GetNextForModelExcluding advances lastDispatchSeq on every dispatch), so
+	// a single lastAccountID cannot describe who served the request:
+	//
+	//   - roundInputTokens sums what every round actually consumed. Only the
+	//     terminal round's count used to survive, while credits were already
+	//     accumulated with +=, so token and credit accounting disagreed about
+	//     the very same rounds.
+	//   - perAccount attributes each round's usage to the account that served
+	//     it. Charging the whole request to the last account both overstates
+	//     that account's usage (skewing quota-aware routing away from it) and
+	//     leaves every earlier account's real consumption unbilled.
+	//
+	// Ordered accountOrder keeps the settle loop deterministic for tests and
+	// logs; a map alone would iterate randomly.
+	roundInputTokens := 0
+	perAccount := make(map[string]*webSearchAccountUsage)
+	accountOrder := make([]string, 0, 2)
+	noteRound := func(accountID string, inTok int, credits float64) {
+		if accountID == "" {
+			return
+		}
+		usage, ok := perAccount[accountID]
+		if !ok {
+			usage = &webSearchAccountUsage{}
+			perAccount[accountID] = usage
+			accountOrder = append(accountOrder, accountID)
+		}
+		usage.inputTokens += inTok
+		usage.credits += credits
+		usage.rounds++
+	}
 	reqStart := time.Now()
 	fallbackInput := estimatedInputTokens
 	// Respect native max_uses (capped by maxWebSearchRounds).
@@ -69,6 +111,17 @@ func (h *Handler) runWebSearchLoop(w http.ResponseWriter, req *ClaudeRequest, th
 			lastAccountID = account.ID
 		}
 		totalCredits += round.credits
+		// Attribute THIS round before the loop moves on: account and
+		// round.inputTokens both describe the call that just completed, and both
+		// are overwritten by the next iteration.
+		roundTokens := round.inputTokens
+		if roundTokens <= 0 {
+			roundTokens = fallbackInput
+		}
+		roundInputTokens += roundTokens
+		if account != nil {
+			noteRound(account.ID, roundTokens, round.credits)
+		}
 
 		// Continue only when every tool_use is web_search, budget remains, and
 		// this round's searches fit under max_uses.
@@ -134,14 +187,32 @@ func (h *Handler) runWebSearchLoop(w http.ResponseWriter, req *ClaudeRequest, th
 		content := buildFlushContent(presentation, round.text, round.toolUses, searched, skipped)
 		stopReason := resolveFlushStopReason(round.stopReasonOverride, round.toolUses, content)
 		outputTokens := estimateContentBlocksTokens(content)
-		inputTokens := round.inputTokens
+		// Every round's input counts, not just the terminal one. Each round is a
+		// full upstream generateAssistantResponse call whose prompt grows with the
+		// search results fed back into it, so the request really did consume the
+		// sum. Reading round.inputTokens alone under-reported a 2-round search by
+		// the whole of round 1 -- and under-charged the customer key's token
+		// budget by the same amount, because recordSuccessForApiKey drives
+		// TokenLimit enforcement.
+		inputTokens := roundInputTokens
 		if inputTokens <= 0 {
 			inputTokens = fallbackInput
 		}
 
-		if lastAccountID != "" {
-			h.pool.RecordSuccess(lastAccountID)
-			h.pool.UpdateStats(lastAccountID, inputTokens+outputTokens, totalCredits)
+		// Settle each account for the rounds it actually served. Attributing the
+		// whole request to lastAccountID charged one account for other accounts'
+		// work and recorded zero for theirs, which corrupts both operator-visible
+		// per-account totals and the quota-aware routing that reads them.
+		// outputTokens belongs to the terminal round's rendered content, so it is
+		// charged to the account that produced it rather than smeared across all.
+		for _, accountID := range accountOrder {
+			usage := perAccount[accountID]
+			tokens := usage.inputTokens
+			if accountID == lastAccountID {
+				tokens += outputTokens
+			}
+			h.pool.RecordSuccess(accountID)
+			h.pool.UpdateStats(accountID, tokens, usage.credits)
 		}
 		h.recordSuccessForApiKey(apiKeyID, inputTokens, outputTokens, totalCredits, req.Model)
 		h.recordSuccessLog("claude", req.Model, lastAccountID, apiKeyID, inputTokens+outputTokens, totalCredits, time.Since(reqStart).Milliseconds())

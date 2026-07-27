@@ -282,6 +282,13 @@ func validateMcpEnvelope(mcpReq *McpRequest, mcpResp *McpResponse) error {
 	return nil
 }
 
+// mcpEndpointOverride redirects the MCP endpoint for tests. Empty in production,
+// where the region-derived AWS URL below is used. Declared as a package var for
+// the same reason kiroEndpoints/kiroHttpStore are: the multi-round web-search
+// loop cannot be exercised end-to-end without a seam, and the accounting bugs
+// that only appear across rounds are otherwise unprovable.
+var mcpEndpointOverride string
+
 // callMcpAPI posts the JSON-RPC request to Kiro MCP and returns the parsed response.
 func callMcpAPI(account *config.Account, mcpReq *McpRequest) (*McpResponse, error) {
 	if mcpReq == nil {
@@ -290,6 +297,9 @@ func callMcpAPI(account *config.Account, mcpReq *McpRequest) (*McpResponse, erro
 
 	region := kiroRegion(account)
 	endpoint := fmt.Sprintf("https://q.%s.amazonaws.com/mcp", region)
+	if mcpEndpointOverride != "" {
+		endpoint = mcpEndpointOverride
+	}
 
 	// Ensure profile ARN is available for non-API-key accounts (header required by MCP).
 	profileArn := ""
