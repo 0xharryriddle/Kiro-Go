@@ -320,6 +320,79 @@ minutes. Re-dispatched successfully against the current HEAD.
 Rule: a created delegation directory is NOT evidence of a live worker. Log GROWTH
 is. Check `stat -c %s` twice, a minute apart.
 
+### Round-5 — the client-visible error contract
+
+Everything above concerned whether the proxy *works*. This round concerned what
+the proxy *tells the client when it fails*, which decides whether the client's
+retry policy can be correct. Landed as `3242fff`, `5172d4b`, `5b6fa90`.
+
+Not counted as a defect: `7bfbbb0` introduced `claudeErrorTypeForStatus` because
+the mid-stream Claude `error` SSE event hardcoded `api_error` for every failure
+while the OpenAI stream already classified the same error. That is a `feat` — a
+missing capability, not a broken one — which is why the cumulative count below is
+62 and not 63.
+
+| # | Defect | Site | Notes |
+|---|---|---|---|
+| 55 | **402 reported as `invalid_request_error`, must be `billing_error`.** Verified against docs.anthropic.com/en/api/errors, fetched live (HTTP 200). On this proxy 402 IS the overage case, so this was the likeliest of the three to fire — and it routed a payment condition into the client's malformed-request branch, so "check your billing" was never surfaced | `proxy/account_failover.go` | Mapping written from recollection of the enum; 3 of 10 entries were wrong |
+| 56 | **503 reported as `overloaded_error`, must be `api_error`.** The doc pairs `overloaded_error` with 529 only and never lists 503. Telling a client "retry, the API is busy" when the real condition is an unexpected server-side failure invites a retry storm against a fault that will not clear | `proxy/account_failover.go` | 529 now mapped too, though `statusForUpstreamError` cannot yet emit it — an omitted documented pairing is latent the moment a caller passes one through |
+| 57 | **504 unmapped, fell through to `api_error`; now `timeout_error`.** The type carries an actionable signal (retry, or stream long requests) that `api_error` does not | `proxy/account_failover.go` | Allow-list test now sweeps statuses 0–599 and asserts the result is always a real Anthropic type, so no client `switch` on `error.type` can hit an unknown branch |
+| 58 | **`:message-type: error` frames were silently discarded.** The sibling Bedrock reader treats BOTH `exception` and `error` as failures, on either `:message-type` or `:event-type`, plus any non-empty `:exception-type`. The Kiro branch matched only `exception`, so the identical upstream condition was observable on Bedrock and invisible on Kiro — defeating the purpose of adding observation at all | `proxy/kiro.go` | Factored into `isUpstreamFailureFrame` / `upstreamFailureLabel`, shared predicate and label precedence with the Bedrock reader |
+| 59 | **Token accounting was dropped for failure frames.** The `continue` skipped `updateTokensFromEvent`, which every frame reached before that branch existed. A failure frame can still carry a usage block and the upstream charges for those tokens either way — so the skip silently stopped billing for them | `proxy/kiro.go` | Usage is now counted BEFORE the skip |
+| 60 | **The logged failure label was unbounded upstream-controlled text.** The label comes from an event-stream string header whose 16-bit length field permits ~64 KiB, logged verbatim. Proven: a 60,050-byte label containing newlines was accepted, so a hostile or malfunctioning upstream could write 60 KB into the operator log per failed frame AND forge additional log lines | `proxy/kiro.go` | Truncated to 200 bytes and marked when shortened. The observer callback still receives the full label — the bound is on what reaches the log |
+| 61 | **`errorTypeForOpenAIStatus` had no 4xx branch beyond 401/429**, so 400, 402 and 413 all fell through to `server_error`. Every one is a CLIENT-side condition and the mislabelling misleads in the damaging direction: a 400 retried unchanged can never succeed, a 402 retried can never clear the cap, a 413 needs the conversation SHRUNK not resent. So the caller burns quota and latency on a request guaranteed to fail again | `proxy/account_failover.go` | Found while auditing the Claude-side fix — the exact mirror of the asymmetry that fix removed. New cross-surface test requires the fault CLASS to agree across both surfaces; it failed on 400 and 402 before the change |
+
+Method note: #58–#60 came from an independent reviewer whose probe assertions were
+deliberately INVERTED (they pass while the gap exists), so the proof each fix
+works is that its probe now fails with "gap does not exist".
+
+### Round-6 — the last unbounded admin surface
+
+| # | Defect | Site | Notes |
+|---|---|---|---|
+| 62 | **Seven unbounded `json.NewDecoder(r.Body)` calls.** The one admin surface in the package that did not bound its input, while ten routes elsewhere already wrap `r.Body` in `http.MaxBytesReader` at 16 KiB–1 MiB. Proven against the real handler: `POST /admin/new_api_key` accepted a 4,194,329-byte body and returned HTTP 200 — it minted a real customer API key from an oversized request | `proxy/admin_bot_api.go` | One shared `adminBotBodyLimit` (64 KiB) + `decodeAdminBotBody`, applied to all seven sites; per-route drift is what let this file diverge |
+
+Precision worth keeping: `/admin/delete_api_key` and `/admin/recharge_api_key`
+appeared to "reject" the same oversized body, but only because they 400/404 on a
+missing key identifier — validation firing AFTER the unbounded read, not a size
+bound. All seven sites were equally unbounded; only one succeeded far enough to
+prove it.
+
+### Round-7 — a safety invariant with no test (`5c748be`)
+
+No defect. `proxy/token_estimator.go` had no test file at all while carrying a
+property nothing pinned: `estimateApproxTokens` (reporting) is deliberately
+OPTIMISTIC (4.5 ASCII / 1.5 non-ASCII) and `estimateWireTokens` (bounding a
+forwarded request) deliberately PESSIMISTIC (4.0 / 1.0). If the wire estimate ever
+UNDER-counts the reported figure, an oversized request goes upstream and the whole
+call is rejected. Concrete rather than theoretical, because
+`estimateApproxTokensWith` short-circuits strings under 5 runes past the weight
+table entirely and divides by a hardcoded 3.0 — that path could invert the
+relation with no weight change.
+
+Audited: the invariant HOLDS across 250,000 fuzz cases. RED-proven by loosening
+`wireTokenWeights` to match the reporting table — 105,910 short violations (worst
+margin −4) and 49,936 long (worst margin −80) are detected, so the test
+discriminates.
+
+Cumulative: **62 defects** — this is the figure the handoff prompt cites. The
+count above previously stopped at 54 because rounds 5–7 landed as commits without
+being written back here; that gap is now closed.
+
+### Round-8 — billing/credential surfaces (this session)
+
+| # | Defect | Site | Notes |
+|---|---|---|---|
+| 63 | **`GET /api/me` returned `keyMasked: ""` on every request.** It masked `entry.Key`, but keys are hashed at rest — `AddApiKey` clears `Key` and returns the cleartext exactly once at mint time — so the field was ALWAYS empty, silently breaking the one thing it exists for: letting a customer confirm which credential they queried with. The sibling admin view already used the correct helper | `proxy/customer_api.go:124` | Now `config.ApiKeyDisplayMask(*entry)`, which prefers the stored `KeyMask`. RED-proven: the new test asserted non-empty and failed against the unfixed code |
+| 64 | **A recharge re-enabled a key an OPERATOR had disabled.** `RechargeApiKey` flipped `Enabled=true` whenever post-top-up counters were under limit. That rule exists for auto-deactivation (`RecordApiKeyUsage` disables on exhaustion), but `Enabled=false` has TWO causes — exhaustion and a deliberate operator disable for abuse/chargeback/disputed order — and the entry records neither. So a banned buyer could restore their own access by paying again | `config/apikeys.go:290` | Over-limit state is now snapshotted BEFORE limits are raised; being over limit is the only evidence exhaustion caused the disable, so it is the sole license to re-enable. The limit increase still applies either way — declining to lift a quarantine must not discard paid-for allowance |
+
+Same defect class as #39: an automated recovery path overriding an operator's
+deliberate quarantine because the state it keys off is overloaded. #64 carries a
+positive control proving a genuinely quota-exhausted key is still revived, so
+"never re-enable" cannot pass as a fix while breaking the feature's purpose.
+
+Cumulative: **64 defects**.
+
 ---
 
 ## 4. Remaining work
