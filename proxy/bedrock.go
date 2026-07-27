@@ -374,7 +374,13 @@ func (h *Handler) invokeBedrockNonStream(w http.ResponseWriter, p forwardParams)
 	}
 	defer resp.Body.Close()
 
-	respBody, _ := io.ReadAll(resp.Body)
+	respBody, readErr := readBedrockResponseBody(resp)
+	if readErr != nil {
+		// Nothing has been written to the client yet, so returning an error here
+		// lets the dispatch loop fail over instead of serving a truncated body
+		// as a success.
+		return readErr
+	}
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("bedrock: upstream status %d: %s", resp.StatusCode, strings.TrimSpace(string(respBody)))
 	}
@@ -387,6 +393,41 @@ func (h *Handler) invokeBedrockNonStream(w http.ResponseWriter, p forwardParams)
 
 	h.recordBedrockSuccess(p, inputTokens, outputTokens, reqStart)
 	return nil
+}
+
+// bedrockMaxNonStreamResponseBytes bounds a non-streaming Bedrock response body.
+// Matches the ceiling the sibling custom_api forwarder already applies to the same
+// kind of read (custom_api_forward.go:413).
+const bedrockMaxNonStreamResponseBytes = 32 << 20
+
+// readBedrockResponseBody reads a non-streaming Bedrock response body with a byte
+// ceiling and a CHECKED error.
+//
+// Both properties were missing at every non-stream call site, which used
+// `respBody, _ := io.ReadAll(resp.Body)`:
+//
+//   - The discarded error meant that when Bedrock returned 200 and the body then
+//     failed partway through, the partial bytes were written to the client as a
+//     successful response and a success was billed. Nothing had reached the client
+//     when the failure happened, so CLAUDE.md requires an error here instead, to
+//     let the dispatch loop fail over to a healthy account.
+//   - The unbounded read allocated proportionally to whatever the upstream sent.
+//
+// Returning ([]byte, error) rather than writing to the client keeps the decision
+// with the caller, which must write only after a nil error.
+func readBedrockResponseBody(resp *http.Response) ([]byte, error) {
+	if resp == nil || resp.Body == nil {
+		return nil, fmt.Errorf("bedrock: no response body")
+	}
+	// +1 so a body exactly at the ceiling is distinguishable from an over-limit one.
+	body, err := io.ReadAll(io.LimitReader(resp.Body, bedrockMaxNonStreamResponseBytes+1))
+	if err != nil {
+		return nil, fmt.Errorf("bedrock: read response body: %w", err)
+	}
+	if len(body) > bedrockMaxNonStreamResponseBytes {
+		return nil, fmt.Errorf("bedrock: response body exceeds %d bytes", bedrockMaxNonStreamResponseBytes)
+	}
+	return body, nil
 }
 
 // newBedrockRequest builds the HTTP request with the model id carried as an opaque

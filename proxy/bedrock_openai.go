@@ -768,7 +768,11 @@ func (h *Handler) invokeBedrockOpenAINonStream(w http.ResponseWriter, p forwardP
 	}
 	defer resp.Body.Close()
 
-	respBody, _ := io.ReadAll(resp.Body)
+	respBody, readErr := readBedrockResponseBody(resp)
+	if readErr != nil {
+		// Pre-client-byte failure: return so the dispatch loop can fail over.
+		return readErr
+	}
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("bedrock: upstream status %d: %s", resp.StatusCode, strings.TrimSpace(string(respBody)))
 	}
