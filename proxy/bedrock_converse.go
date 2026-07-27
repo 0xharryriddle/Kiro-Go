@@ -783,7 +783,10 @@ func (h *Handler) invokeBedrockConverseAnthropicStream(w http.ResponseWriter, fl
 		return streamErr
 	}
 	if streamErr != nil {
-		logger.Warnf("[Bedrock] converse stream ended with error after partial output (account %s): %v", p.account.ID, streamErr)
+		// Partial stream: cannot fail over, but this is a FAILURE, not a success.
+		// Recording success here cleared the account's error state and cooldown.
+		h.recordBedrockPartialFailure(p, streamErr)
+		return nil
 	} else if conv.emittedAny && !conv.sawMessageStop {
 		logger.Warnf("[Bedrock] converse stream closed without messageStop (account %s); emitted synthetic terminal", p.account.ID)
 	}

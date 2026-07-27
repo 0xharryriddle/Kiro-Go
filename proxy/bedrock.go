@@ -351,8 +351,12 @@ func (h *Handler) invokeBedrockStream(w http.ResponseWriter, flusher http.Flushe
 		return streamErr
 	}
 	if streamErr != nil {
-		// Partial stream: log but treat as served (client already got a prefix).
-		logger.Warnf("[Bedrock] stream ended with error after partial output (account %s): %v", p.account.ID, streamErr)
+		// Partial stream: the client already got a prefix so we cannot fail over,
+		// but this is a FAILURE, not a success. Recording it as a success cleared
+		// the account's error state and cooldown, letting an account that throws
+		// repeated mid-stream exceptions keep looking healthy.
+		h.recordBedrockPartialFailure(p, streamErr)
+		return nil
 	}
 
 	h.recordBedrockSuccess(p, inputTokens, outputTokens, reqStart)
@@ -471,6 +475,33 @@ func newBedrockRequestForURL(rawURL string, body []byte) (*http.Request, error) 
 		return nil, fmt.Errorf("bedrock: refusing request to non-AWS host %q (bad region?)", host)
 	}
 	return req, nil
+}
+
+// recordBedrockPartialFailure records a stream that broke AFTER the client already
+// received bytes.
+//
+// Failover is correctly impossible here — the client holds committed headers and a
+// partial body — but the outcome is still a FAILURE, and it used to be recorded as
+// a success via recordBedrockSuccess. That was wrong in three ways:
+//
+//   - pool.RecordSuccess CLEARS the account's transient error state and cooldown, so
+//     an account throwing repeated mid-stream Bedrock exceptions kept looking
+//     healthy and kept being selected;
+//   - the request log claimed success for a request the client saw fail;
+//   - usage was metered from a truncated stream, whose terminal usage event never
+//     arrived, so the figures were incomplete anyway.
+//
+// This mirrors the custom_api forwarder's mid-stream contract exactly
+// (custom_api_forward.go:467-489): emit nothing further, record the error against
+// the account, log a failure, and do not meter tokens.
+func (h *Handler) recordBedrockPartialFailure(p forwardParams, streamErr error) {
+	endpoint := "claude"
+	if p.endpoint == "openai" || p.endpoint == "responses" {
+		endpoint = "openai"
+	}
+	logger.Warnf("[Bedrock] stream ended with error after partial output (account %s): %v", p.account.ID, streamErr)
+	h.pool.RecordError(p.account.ID, false)
+	h.recordFailureWithDetails(endpoint, p.model, p.account.ID, p.apiKeyID, streamErr)
 }
 
 // recordBedrockSuccess bills the customer API key by tokens and updates account +

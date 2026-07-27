@@ -26,8 +26,6 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-
-	"kiro-go/logger"
 )
 
 // bedrockOpenAIDefaultMaxTokens is used when an OpenAI request omits max_tokens;
@@ -739,7 +737,12 @@ func (h *Handler) invokeBedrockOpenAIStream(w http.ResponseWriter, flusher http.
 		return streamErr
 	}
 	if streamErr != nil {
-		logger.Warnf("[Bedrock] openai stream ended with error after partial output (account %s): %v", p.account.ID, streamErr)
+		// Partial stream: cannot fail over, but this is a failure, not a success.
+		// Still finish the SSE so the client sees a terminated stream rather than
+		// a truncated one.
+		conv.finish(w, flusher)
+		h.recordBedrockPartialFailure(p, streamErr)
+		return nil
 	}
 
 	conv.finish(w, flusher)
