@@ -275,6 +275,51 @@ The third reviewer in that batch (websearch/handler/kiro) **failed with no
 output**, so those surfaces were left unreviewed and a replacement was dispatched
 against the committed state.
 
+### Round-4 — live-deployment audit (the merge was never actually running)
+
+Everything above was verified in the TREE. This round checked the running
+container and found the tree and the deployment had diverged, then found two
+defects that only a live probe could have surfaced.
+
+| # | Defect | Site | Notes |
+|---|---|---|---|
+| 51 | **The container was running pre-merge code for ~37 hours.** Image built 2026-07-25 15:37, reporting version 1.1.2; the merge and every fix postdated it. `docker compose build` compiles from source at build time, so committing and pushing changed nothing about what served traffic. Verified by symbol check on the in-container binary: every new symbol ABSENT, with a positive control confirming the probe worked | deployment | Rebuilt and swapped; live now reports 1.1.5 with all symbols present |
+| 52 | **`ListAvailableProfiles` sent `maxResults: 50`, which the live endpoint REJECTS** with HTTP 400 `REQUEST_BODY_INVALID`. Boundary swept against the real service: 1/5/10 pass, 11/15/20/25/30/40/49/50/100 all fail — the limit is exactly 10. The pre-merge fork sent 10; upstream v1.1.5's paginated rewrite hardcoded 50 and the merge adopted it. Consequence chain: 400 → no `profileArn` → `GetUsageLimits` fails → subscription/usage never populate → the admin UI displays **"Free" on a genuine paid plan** | `proxy/kiro_api.go` | Now `kiroProfilePageSize = 10` with the sweep recorded in the comment. Pagination still honours `nextToken`, so the smaller page costs at most one extra round-trip per 10 profiles |
+| 53 | **An upstream test was actively hiding #52.** `TestListKiroProfilesFollowsNextTokenPagination` asserted `maxResults:50` against a MOCK transport that accepts any body. A mock more permissive than the real service is exactly how a 400-on-every-call bug reaches production | `proxy/kiro_api_test.go` | Assertion now pins the constant, not a literal, so the two cannot drift |
+| 54 | **The unauthenticated `/v1/models` route could drive the whole fleet into cooldown.** No auth, refreshes whenever the aggregate cache is empty, and `refreshModelsCache` deliberately installs an EMPTY aggregate when every account fails — so while the fleet was unhealthy the empty-cache condition stayed true and every anonymous request repeated a full sweep: `ensureValidToken` + `ListAvailableModels` + `handleAccountFailure` for every enabled account, at HTTP request rate. `modelsCacheTime` existed but was **write-only** — never compared anywhere, so there was no TTL guard at all | `proxy/handler.go` | Throttled to one attempt per 60s, keyed on ATTEMPTS not successes (a success-only stamp never arms while failing, which is the whole failure mode). Explicit invalidation clears the stamp so profile switches still rebuild immediately. RED-proven: neutralized → 10 anonymous requests = 10 full fleet sweeps |
+
+Method note that produced #52: hand-rolled HTTP probes gave a plausible but WRONG
+answer (one returned "profiles=1", which I reported before re-running and getting
+`UnknownOperationException` — the probe was malformed). Driving Kiro-Go's own Go
+code paths instead is authoritative by construction, and that is what produced
+the real diagnosis. Retracted the earlier claim rather than building on it.
+
+Cumulative: **54 defects**.
+
+### Unauthenticated surface — fully mapped
+
+| Route | Auth | Can it do expensive/account-affecting work? | Status |
+|---|---|---|---|
+| `/v1/models` | none | YES — was a full fleet sweep per request | FIXED (#54, throttled) |
+| `/v1/stats` | none | No — pure in-memory reads, no upstream calls, no mutation | Disclosure only; awaiting user decision |
+| `/metrics` | none | No — and config-gated, 404s unless `MetricsEnabled` | Documented, default OFF |
+| everything else | API key or admin password | — | — |
+
+`refreshModelsCache`'s other three callers were checked for a bypass: two are the
+30-minute background ticker, one is an admin-authenticated endpoint. `/v1/models`
+was the only unauthenticated path into it.
+
+### Subagent reliability note
+
+A three-reviewer batch **died silently**: the dispatch returned
+`database is locked`, and although the delegation directories were created (which
+I checked at the time and misread as "they are running"), the workers never
+executed. Their logs sat frozen at 1807 bytes — kickoff header only — for 29
+minutes. Re-dispatched successfully against the current HEAD.
+
+Rule: a created delegation directory is NOT evidence of a live worker. Log GROWTH
+is. Check `stat -c %s` twice, a minute apart.
+
 ---
 
 ## 4. Remaining work
