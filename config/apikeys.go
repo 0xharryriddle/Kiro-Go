@@ -6,6 +6,7 @@ import (
 	"crypto/subtle"
 	"encoding/hex"
 	"errors"
+	"math"
 	"strings"
 	"time"
 )
@@ -287,7 +288,27 @@ func ResetApiKeyUsage(id string) error {
 // is benign. Re-enable happens only when the key is under limit after the
 // top-up: a partial recharge that still leaves usage over the (also-raised)
 // limit stays disabled. Returns the updated entry.
+//
+// Overflow is rejected BEFORE anything is mutated, both directions:
+//
+//   - TokenLimit is int64 and `+=` wraps silently. A top-up near math.MaxInt64
+//     drove the limit NEGATIVE, which makes ApiKeyOverLimit permanently true —
+//     a paid top-up bricked the very key it was meant to extend.
+//   - CreditLimit is float64 and saturates to +Inf. saveLocked then cannot
+//     marshal the config at all, and because the in-memory cfg was already
+//     mutated the damage outlived the failed call: EVERY later write (any
+//     account edit, usage counter, ban stamp, new key) failed for the life of
+//     the process. Validating before mutating is what makes a rejected recharge
+//     leave no trace.
+//
+// Both are wire-reachable: math.MaxFloat64 and 9223372036854775807 are ordinary
+// JSON numbers on POST /admin/recharge_api_key, whose only check is `>= 0`.
 func RechargeApiKey(id string, addCredits float64, addTokens int64) (ApiKeyEntry, error) {
+	// Reject non-finite input up front: NaN/±Inf arriving here would poison the
+	// limit and every subsequent config save.
+	if math.IsNaN(addCredits) || math.IsInf(addCredits, 0) {
+		return ApiKeyEntry{}, errors.New("credit top-up must be a finite number")
+	}
 	cfgLock.Lock()
 	defer cfgLock.Unlock()
 	if cfg == nil {
@@ -295,6 +316,16 @@ func RechargeApiKey(id string, addCredits float64, addTokens int64) (ApiKeyEntry
 	}
 	for i := range cfg.ApiKeys {
 		if cfg.ApiKeys[i].ID == id {
+			// Bounds-check against the CURRENT limits before touching them, so a
+			// refused recharge mutates nothing.
+			if addTokens > 0 && cfg.ApiKeys[i].TokenLimit > math.MaxInt64-addTokens {
+				return ApiKeyEntry{}, errors.New("token top-up would overflow the key's token limit")
+			}
+			if addCredits > 0 {
+				if sum := cfg.ApiKeys[i].CreditLimit + addCredits; math.IsInf(sum, 0) || math.IsNaN(sum) {
+					return ApiKeyEntry{}, errors.New("credit top-up would overflow the key's credit limit")
+				}
+			}
 			// Snapshot over-limit state BEFORE raising limits. Enabled=false has two
 			// causes — auto-deactivation on exhaustion (RecordApiKeyUsage) and a
 			// deliberate operator disable (UpdateApiKey / admin toggle, used for
