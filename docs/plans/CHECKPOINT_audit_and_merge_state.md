@@ -334,10 +334,67 @@ the full gate was re-run from the exact staged state.
 PUSHED. `origin/harry` is at `910c773`, confirmed by re-fetch (0 ahead / 0 behind,
 SHAs match). The merge commit `6158c24` is reachable from the remote tip.
 
-### R2 — `stop_reason: "error"` (needs user decision)
-On Claude mid-stream termination I emit `stop_reason: "error"`, which is outside
-Anthropic's documented enum. A strict client may prefer `end_turn` with the
-separate `error` event carrying the signal. Cosmetic but client-visible.
+### R2 — mid-stream error reporting — RESOLVED (extend, not collapse)
+
+User chose to BUILD OUT the error path rather than collapse it to `end_turn`.
+Two changes, landed in `7bfbbb0`.
+
+**1. `stop_reason: "error"` is KEPT deliberately.** It is outside Anthropic's
+documented enum (`end_turn` / `max_tokens` / `stop_sequence` / `tool_use`), and
+that is the point: a mid-stream abort is not a completion. Reporting `end_turn`
+would tell the client the message finished normally, so partial output would be
+treated as the whole answer — silent truncation, which is strictly worse than an
+unknown enum value a client can branch on.
+
+**2. The error TYPE is now classified** (`claudeErrorTypeForStatus`,
+`proxy/account_failover.go`). It was hardcoded to `api_error` for every mid-stream
+failure, while the OpenAI stream classified the SAME error via
+`errorTypeForOpenAIStatus`. That asymmetry is consequential because an Anthropic
+consumer keys its retry policy off `error.type`: a rate limit reported as
+`api_error` invites an immediate retry into an exhausted account instead of a
+backoff, and a revoked credential reported as `api_error` looks transient so the
+client retries forever instead of surfacing "re-authenticate". Every returned
+value is a type Anthropic actually defines; anything unrecognised degrades to
+`api_error` rather than inventing an enum member.
+
+**3. The ROOT CAUSE is now observable** (`proxy/kiro.go`). `parseEventStream` read
+only the `:event-type` header, so an AWS event-stream EXCEPTION frame — which
+carries `:message-type: exception` plus `:exception-type` instead — matched no
+dispatch case and was silently discarded. That is *why* a mid-stream failure could
+only ever reach the handler as a transport error, classifying as HTTP 500 /
+`api_error` no matter what the upstream said. The parser now reads both headers
+and reports them via `KiroStreamCallback.OnUpstreamException`, reusing
+`extractHeaderString` already proven on the Bedrock path.
+
+**Observation, NOT termination — and this is a deliberate stop short.** Promoting
+exception types to fatal would need to know which types Kiro actually emits and
+whether some are benign. No real Kiro exception frame has been observed, and the
+trace corpus cannot supply one: `noteResponseText` stores ASSEMBLED text, so frame
+headers are destroyed before capture. Treating a frame as fatal on the strength of
+the AWS spec alone risks killing live streams mid-answer on the path every request
+uses — a worse failure than the classification imprecision it would fix. The
+frames are now logged, so promoting specific types later is a small change made
+against evidence.
+
+**Honest scope limit:** because mid-stream failures currently surface as transport
+errors, the new classifier will in practice usually still return `api_error` on
+the streaming path. It is correct and unit-tested, and it helps wherever a
+status-bearing error reaches that site, but it is narrower in effect than it looks.
+
+**A false green worth recording.** The first end-to-end SSE test for this passed
+IDENTICALLY with the fix and with the hardcoded version, because the existing
+mid-stream harness dies with `unexpected EOF` → 500 → `api_error` either way. It
+was caught only by neutralizing the fix and seeing the test still pass, then
+deleted rather than left in the suite implying coverage it did not provide. The
+three exception-frame tests ARE red-proven: with detection removed the reporting
+test fails on its real assertion while both "must not change behaviour" tests
+still pass.
+
+Also checked and downgraded: `getSortedEndpoints` indexes `kiroEndpoints[0..2]`
+unconditionally on the "auto" path. Briefly flagged as a production panic risk,
+then verified `kiroEndpoints` is a package-level 3-element literal never
+reassigned outside tests — test-only fragility, documented in the harness rather
+than "fixed" in production.
 
 ### R3 — `toolResult.status` enum — RESOLVED, no change needed
 
