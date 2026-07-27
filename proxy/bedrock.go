@@ -396,13 +396,38 @@ func newBedrockRequest(region, modelID string, streaming bool, body []byte) (*ht
 	return newBedrockRequestForURL(bedrockEndpoint(region, modelID, streaming), body)
 }
 
+// bedrockHostSuffix is the only host suffix a Bedrock request may target.
+const bedrockHostSuffix = ".amazonaws.com"
+
 // newBedrockRequestForURL builds a POST request to an arbitrary Bedrock URL with
 // the given body. Shared by the invoke and Converse paths so both construct the
 // request identically before SigV4 signing.
+//
+// The resolved host is verified to be an AWS Bedrock host before the request is
+// returned. Both callers build the URL by interpolating the account's region into
+// the authority (bedrockEndpoint / bedrockConverseEndpoint), and the region is
+// operator-supplied data that reaches config unvalidated. A crafted value such as
+// "x@attacker.example/" turns the userinfo separator into a host boundary, so the
+// parsed host became attacker.example while the string still LOOKED like an AWS
+// URL — and authorizeBedrockRequest then attached the account's live credential
+// (bearer Bedrock API key, or SigV4 access-key id + signature + session token) to
+// a request aimed at an attacker-controlled server. Failing closed here covers
+// every Bedrock caller through one funnel rather than trusting each URL builder.
 func newBedrockRequestForURL(rawURL string, body []byte) (*http.Request, error) {
 	req, err := http.NewRequest(http.MethodPost, rawURL, bytes.NewReader(body))
 	if err != nil {
 		return nil, fmt.Errorf("bedrock: build request: %w", err)
+	}
+	// Check the PARSED host, not the raw string: the whole point of the attack is
+	// that the two disagree. Reject userinfo outright — a legitimate Bedrock URL
+	// never carries credentials in the authority, and its presence means the
+	// region injected a host boundary.
+	if req.URL.User != nil {
+		return nil, fmt.Errorf("bedrock: refusing request with credentials in the URL authority (bad region?)")
+	}
+	host := strings.ToLower(req.URL.Hostname())
+	if host == "" || !strings.HasSuffix(host, bedrockHostSuffix) {
+		return nil, fmt.Errorf("bedrock: refusing request to non-AWS host %q (bad region?)", host)
 	}
 	return req, nil
 }
