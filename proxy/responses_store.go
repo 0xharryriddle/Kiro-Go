@@ -63,6 +63,7 @@ func saveResponse(resp *ResponsesObject) error {
 		Instructions:       resp.Instructions,
 		StoredInput:        resp.StoredInput,
 		StoredAt:           resp.StoredAt,
+		OwnerApiKeyID:      resp.OwnerApiKeyID,
 	}
 
 	path := filepath.Join(dir, sanitizeResponseID(resp.ID)+".json")
@@ -111,6 +112,7 @@ func loadResponse(id string) (*ResponsesObject, error) {
 		Instructions:       doc.Instructions,
 		StoredInput:        doc.StoredInput,
 		StoredAt:           doc.StoredAt,
+		OwnerApiKeyID:      doc.OwnerApiKeyID,
 	}, nil
 }
 
@@ -182,4 +184,9 @@ type storedResponseDoc struct {
 	Instructions       string               `json:"instructions,omitempty"`
 	StoredInput        json.RawMessage      `json:"stored_input,omitempty"`
 	StoredAt           int64                `json:"stored_at"`
+
+	// OwnerApiKeyID is the customer key that created the response. Persisted so
+	// ownership survives a restart; absent on records written before ownership
+	// tracking existed, which read back as "" (unowned).
+	OwnerApiKeyID string `json:"owner_api_key_id,omitempty"`
 }

@@ -41,6 +41,11 @@ func (h *Handler) handleOpenAIResponses(w http.ResponseWriter, r *http.Request) 
 		storeResponse = *req.Store
 	}
 
+	// Read the caller's key identity BEFORE resolving previous_response_id: the
+	// load below must be ownership-checked, and it used to happen ~70 lines
+	// earlier than apiKeyID was fetched.
+	apiKeyID := apiKeyIDFromContext(r.Context())
+
 	var historyMessages []OpenAIMessage
 	if req.PreviousResponseID != "" {
 		prev, loadErr := loadResponse(req.PreviousResponseID)
@@ -49,7 +54,29 @@ func (h *Handler) handleOpenAIResponses(w http.ResponseWriter, r *http.Request) 
 				fmt.Sprintf("previous_response_id not found: %v", loadErr))
 			return
 		}
-		historyMessages = expandPreviousResponseHistory(prev)
+		// Ownership check. Response IDs are the only thing guarding a stored
+		// conversation, and previous_response_id expands the referenced record's
+		// stored INPUT and OUTPUT into the prompt forwarded upstream. Without
+		// this check any customer key could pass another key's response ID and
+		// receive that tenant's private prompts and answers back as its own
+		// conversation history — the same cross-tenant leak the response cache
+		// already prevents by prefixing its key with apiKeyID
+		// (responseCacheKey, response_cache.go).
+		//
+		// Reported as 404, not 403: a "wrong owner" response would confirm the
+		// ID exists, turning this endpoint into an oracle for probing valid
+		// response IDs. Indistinguishable from "no such response" is correct.
+		//
+		// An empty owner is treated as unowned and stays readable, which
+		// preserves the existing trust model for this deliberately
+		// key-less-by-default proxy (requireApiKey=false) and for records
+		// written before ownership was tracked.
+		if prev.OwnerApiKeyID != "" && prev.OwnerApiKeyID != apiKeyID {
+			h.sendOpenAIError(w, 404, "invalid_request_error",
+				"previous_response_id not found")
+			return
+		}
+		historyMessages = expandPreviousResponseHistory(prev, apiKeyID)
 	}
 
 	inputMessages, err := parseResponsesInput(req.Input)
@@ -110,7 +137,8 @@ func (h *Handler) handleOpenAIResponses(w http.ResponseWriter, r *http.Request) 
 	estimatedInputTokens := estimateOpenAIRequestInputTokens(openaiReq)
 	kiroPayload := OpenAIToKiro(openaiReq, thinking)
 
-	apiKeyID := apiKeyIDFromContext(r.Context())
+	// apiKeyID was already resolved above, before the previous_response_id
+	// ownership check that needs it.
 	respID := generateResponseID()
 	// forwarded marks a request that already passed through one Kiro-Go pool, so a
 	// custom_api account cannot add another hop (loop guard, see forwardToUpstream).
@@ -245,6 +273,9 @@ func (h *Handler) handleResponsesNonStream(
 		respObj := buildResponsesObject(respID, model, finalContent, toolUses, inputTokens, outputTokens, req)
 		respObj.StoredInput = storedInput
 		respObj.Instructions = req.Instructions
+		// Stamp the creating key so a later previous_response_id continuation can
+		// be refused when it arrives from a different tenant.
+		respObj.OwnerApiKeyID = apiKeyID
 
 		if storeResponse {
 			if saveErr := saveResponse(respObj); saveErr != nil {
@@ -651,6 +682,10 @@ func (h *Handler) handleResponsesStream(
 		respObj.CreatedAt = createdAt
 		respObj.StoredInput = storedInput
 		respObj.Instructions = req.Instructions
+		// Same ownership stamp as the non-streaming path; both persist through
+		// saveResponse, so leaving it off either one would leave a tenant's
+		// stored conversation continuable by any key.
+		respObj.OwnerApiKeyID = apiKeyID
 
 		if storeResponse {
 			if saveErr := saveResponse(respObj); saveErr != nil {

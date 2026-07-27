@@ -31,6 +31,17 @@ type ResponsesObject struct {
 	StoredInput        json.RawMessage      `json:"-"`
 	StoredInstr        string               `json:"-"`
 	StoredAt           int64                `json:"stored_at,omitempty"`
+
+	// OwnerApiKeyID records WHICH customer key created this response, so a later
+	// previous_response_id continuation can be refused when it comes from a
+	// different key. Never serialized to the client (`json:"-"`): it is an
+	// internal ownership label, not part of the OpenAI Responses contract.
+	//
+	// Empty means unowned — either a record written before ownership existed, or
+	// a request that carried no key identity at all (this proxy runs with
+	// requireApiKey=false by design, so every caller is "" there and the
+	// pre-existing trust model is preserved exactly).
+	OwnerApiKeyID string `json:"-"`
 }
 
 type ResponseOutputItem struct {

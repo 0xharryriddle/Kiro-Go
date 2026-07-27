@@ -128,7 +128,9 @@ func TestResponsesPreviousResponseIDExpands(t *testing.T) {
 		},
 	}
 
-	expanded := expandPreviousResponseHistory(prev)
+	// Unowned records ("" owner), so any caller identity may expand them; this
+	// test is about history SHAPE, not ownership.
+	expanded := expandPreviousResponseHistory(prev, "")
 	if len(expanded) != 3 {
 		t.Fatalf("expected 3 messages from history, got %d (%+v)", len(expanded), expanded)
 	}
@@ -188,7 +190,8 @@ func TestResponsesPreviousResponseIDExpandsFullChain(t *testing.T) {
 		t.Fatalf("save b: %v", err)
 	}
 
-	expanded := expandPreviousResponseHistory(b)
+	// Unowned records, as above: this test pins multi-hop chain ORDER.
+	expanded := expandPreviousResponseHistory(b, "")
 
 	var transcript []string
 	for _, m := range expanded {

@@ -14,12 +14,24 @@ const maxResponsesHistoryDepth = 64
 // If a link in the chain is missing on disk (e.g. expired past TTL or the
 // referenced ID was deleted), expansion stops at the deepest reachable
 // ancestor instead of failing — the most recent context is still useful.
-func expandPreviousResponseHistory(prev *ResponsesObject) []OpenAIMessage {
+// callerApiKeyID is the authenticated key expanding the history. Every ancestor
+// is ownership-checked against it, not just the entry point: the walk follows
+// previous_response_id links recorded at creation time, and a record whose owner
+// differs from the caller must not contribute its stored prompt or answer.
+//
+// Today the caller's own entry point is already ownership-checked in
+// handleOpenAIResponses, and a stored link could only have been recorded by a
+// request that passed that same check — so the chain SHOULD already be
+// same-owner by induction. That argument is subtle and depends on a check three
+// files away staying in place, while the cost of re-checking each hop is one
+// string compare. This is defense in depth, not a proven-exploitable hole:
+// treating it as belt-and-braces is the honest description.
+func expandPreviousResponseHistory(prev *ResponsesObject, callerApiKeyID string) []OpenAIMessage {
 	if prev == nil {
 		return nil
 	}
 
-	chain := collectAncestorChain(prev)
+	chain := collectAncestorChain(prev, callerApiKeyID)
 
 	messages := make([]OpenAIMessage, 0)
 	for _, node := range chain {
@@ -46,7 +58,7 @@ func expandPreviousResponseHistory(prev *ResponsesObject) []OpenAIMessage {
 // chain in oldest-first order: [root, ..., parent, prev]. The walker is
 // bounded by maxResponsesHistoryDepth and a visited-set to short-circuit
 // any cycle in the stored data.
-func collectAncestorChain(prev *ResponsesObject) []*ResponsesObject {
+func collectAncestorChain(prev *ResponsesObject, callerApiKeyID string) []*ResponsesObject {
 	stack := []*ResponsesObject{prev}
 	visited := map[string]bool{prev.ID: true}
 
@@ -60,6 +72,14 @@ func collectAncestorChain(prev *ResponsesObject) []*ResponsesObject {
 		}
 		ancestor, err := loadResponse(cursor.PreviousResponseID)
 		if err != nil || ancestor == nil {
+			break
+		}
+		// Stop at the first ancestor the caller does not own, rather than
+		// skipping it and continuing deeper: the chain past a foreign link is
+		// not the caller's conversation either. Same empty-owner rule as the
+		// handler — an unowned record is readable, which keeps pre-ownership
+		// records and the key-less default mode working.
+		if ancestor.OwnerApiKeyID != "" && ancestor.OwnerApiKeyID != callerApiKeyID {
 			break
 		}
 		visited[ancestor.ID] = true
