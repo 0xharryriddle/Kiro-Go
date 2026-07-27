@@ -1,7 +1,7 @@
 # Kiro-Go — fresh-session handoff prompt
 
 Paste this whole file as the opening message of the new session. Every fact below
-was verified by command output at handoff time (2026-07-27, HEAD `c013d52`).
+was verified by command output at handoff time (2026-07-27, HEAD `29e799c`).
 Where something is unverified or unknown, it says so — do not upgrade those to
 facts without checking.
 
@@ -24,7 +24,7 @@ Branch: `harry` (tracks `origin/harry`)
 
 | Fact | Value |
 |---|---|
-| HEAD | `c013d52` |
+| HEAD | `29e799c` |
 | Remote | `origin/harry` identical (0 ahead / 0 behind) |
 | Working tree | clean |
 | Tests | 947 top-level test funcs pass across `config` `pool` `auth` `proxy` (measured, not remembered: 936 at round 12 + 6 in round 13 + 5 in round 13b) |
@@ -36,6 +36,8 @@ Branch: `harry` (tracks `origin/harry`)
 Recent commits (newest first):
 
 ```
+29e799c fix(bedrock): do not bill a stream the client never received
+f27d002 docs: record round 13 and sync the handoff to c013d52
 c013d52 fix(bedrock): stop charging client disconnects to the serving account
 bbc8814 docs: record round 12 and sync the handoff to 91f981c
 91f981c fix(kiro): treat a Kiro event-stream with no frames as a failure
