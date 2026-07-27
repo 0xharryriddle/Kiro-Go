@@ -1,7 +1,7 @@
 # Kiro-Go — fresh-session handoff prompt
 
 Paste this whole file as the opening message of the new session. Every fact below
-was verified by command output at handoff time (2026-07-27, HEAD `6911dcd`).
+was verified by command output at handoff time (2026-07-27, HEAD `a1cf36f`).
 Where something is unverified or unknown, it says so — do not upgrade those to
 facts without checking.
 
@@ -11,7 +11,7 @@ facts without checking.
 
 Continue the Kiro-Go audit-and-harden effort. It is not "finish a feature"; it is
 **find real defects, prove them, fix them, verify, deploy**. The previous session
-closed 67 defects across nine rounds. There is no deadline and no fixed list —
+closed 69 defects across ten rounds. There is no deadline and no fixed list —
 work the highest-risk unreviewed surface, then the next.
 
 Repo: `/home/harry-riddle/dev/github.com/0xharryriddle/Kiro-Go`
@@ -23,10 +23,10 @@ Branch: `harry` (tracks `origin/harry`)
 
 | Fact | Value |
 |---|---|
-| HEAD | `6911dcd` |
+| HEAD | `a1cf36f` |
 | Remote | `origin/harry` identical (0 ahead / 0 behind) |
 | Working tree | clean |
-| Tests | 926 pass across `config` `pool` `auth` `proxy` (top-level funcs; confirmed two ways — depth-0 `=== RUN` lines and declared `func Test` count) |
+| Tests | 929 top-level test funcs pass across `config` `pool` `auth` `proxy` (1160 including subtests; both numbers measured, not remembered) |
 | `-race` | clean, 0 data races |
 | `go vet` / `gofmt` | clean tree-wide |
 | Live container | healthy, version **1.1.5** |
@@ -35,6 +35,8 @@ Branch: `harry` (tracks `origin/harry`)
 Recent commits (newest first):
 
 ```
+a1cf36f fix(admin): validate an explicit region before probing or persisting it
+7ba344d docs: record round 9 and re-measure the unreviewed-file inventory
 6911dcd fix(websearch): bill every search round to the account that served it
 2723b7f fix(auth): stop echoing SSO device-flow response bodies into errors
 5c748be test(tokens): pin the wire-vs-report estimator safety invariant
@@ -46,7 +48,7 @@ Recent commits (newest first):
 ```
 
 **Read `docs/plans/CHECKPOINT_audit_and_merge_state.md` first.** It is the
-authoritative record: all 67 defects, the rejected claims (so they are not
+authoritative record: all 69 defects, the rejected claims (so they are not
 re-litigated), and every deliberate non-decision with its reasoning.
 
 ---

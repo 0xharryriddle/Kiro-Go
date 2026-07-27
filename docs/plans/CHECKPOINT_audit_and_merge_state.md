@@ -473,6 +473,37 @@ unprovable.
 
 Cumulative: **67 defects**.
 
+### Round-10 — the same region defect one layer deeper (`a1cf36f`)
+
+Round 9's sibling fix (`7bb854f`) validated the explicit region on
+`POST /admin/add_kiro_api_key`. It fixed the ROUTE, not the class: the shared
+helper both other callers go through was still unguarded.
+
+| # | Defect | Site | Notes |
+|---|---|---|---|
+| 68 | **`resolveApiKeyRegion` probed and returned a caller-supplied region without validating its shape.** `apiAddAccount` (`proxy/handler.go:4270`) forwards `account.Region` from the request body straight in, then writes the result to `account.Region` and persists it. A malformed label (`"bogus"`) was stored verbatim; `regionalizeURLForRegion` refuses that shape (`kiro_api.go:236`) and silently leaves traffic on us-east-1, so the stored bucket disagrees with where requests actually go. Because dedup keys on (UserId, region), the SAME upstream account can then be added again under us-east-1 — two pool slots for one Kiro account, doubling routing weight and double-counting quota in `/admin/pool` | `proxy/admin_bot_api.go:900` | Validate + normalize at the helper, not per-route. RED-proven: account persisted with `Region:"bogus"` at HTTP 200 |
+| 69 | **The same call path stored a case-variant region unnormalized.** `EU-Central-1` was persisted as-is. Every other path lowercases before comparing (`regionalizeURLForRegion`, `kiroProfileRegionCandidates`, `validateRegionOverride` all `strings.ToLower` first), so the stored bucket never matches the one they compute — the same dedup-miss consequence as #68, reached without any malformed input | `proxy/admin_bot_api.go:900` | Same one-site fix; `validateRegionOverride` already lowercases, so returning `normalized` closes both. RED-proven separately |
+
+Fixed at the shared chokepoint rather than at `apiAddAccount`, because the route
+fix in `7bb854f` demonstrated the per-route approach leaves the class open. Both
+callers are now covered by construction.
+
+The second caller (`importKiroAPIKeyCredential`, `proxy/handler.go:6300`) discards
+`validateRegionOverride`'s bool — `region, _ := ...`. Checked, NOT changed: a
+malformed region there collapses to `""`, which routes into full region discovery
+and yields a working region, so the outcome is benign (silently ignoring the
+caller's stated region rather than erroring). Changing it would alter import
+semantics — a product decision, not a defect fix. Recorded so it is not
+re-discovered as new.
+
+Method note: the positive control (`eu-central-1` still accepted and persisted)
+was written and passing BEFORE the fix, which is what distinguishes this from
+"reject every region" — a fix that would satisfy both failing tests while
+breaking the supply path. Neutralization confirmed both new tests fail without
+the fix (`targetRegions = []string{explicit}` restored → 2 fail, 3 pass).
+
+Cumulative: **69 defects**.
+
 ---
 
 ## 4. Remaining work
