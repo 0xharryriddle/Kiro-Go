@@ -58,15 +58,10 @@ func (h *Handler) runWebSearchLoop(w http.ResponseWriter, req *ClaudeRequest, th
 				accountID = account.ID
 			}
 			h.recordFailureWithDetails("claude", req.Model, accountID, apiKeyID, err)
-			status := 502
-			errType := "api_error"
-			if isAuthErrorMessage(err.Error()) {
-				status = 401
-				errType = "authentication_error"
-			} else if isQuotaErrorMessage(err.Error()) {
-				status = 429
-				errType = "rate_limit_error"
-			}
+			// Shared classifier: this site already did the right thing inline,
+			// while the two MCP-search sites below hardcoded 502. Folding all
+			// three onto one helper is what keeps them from drifting again.
+			status, errType := webSearchErrorStatus(err)
 			h.sendClaudeError(w, status, errType, err.Error())
 			return
 		}
@@ -83,7 +78,12 @@ func (h *Handler) runWebSearchLoop(w http.ResponseWriter, req *ClaudeRequest, th
 			if searchErr != nil {
 				logger.Warnf("[WebSearchLoop] MCP search failed: %v", searchErr)
 				h.recordFailureWithDetails("claude", req.Model, lastAccountID, apiKeyID, searchErr)
-				h.sendClaudeError(w, 502, "api_error", "Web search failed: "+searchErr.Error())
+				// Classify rather than hardcoding 502: the pure web-search path
+				// already reports an MCP 429 as rate_limit_error and a 401 as
+				// authentication_error, and a client's retry policy keys off that
+				// value. See webSearchErrorStatus (websearch.go).
+				searchStatus, searchErrType := webSearchErrorStatus(searchErr)
+				h.sendClaudeError(w, searchStatus, searchErrType, "Web search failed: "+searchErr.Error())
 				return
 			}
 			searchCount += roundSearchN
@@ -122,7 +122,9 @@ func (h *Handler) runWebSearchLoop(w http.ResponseWriter, req *ClaudeRequest, th
 			if sErr != nil {
 				logger.Warnf("[WebSearchLoop] final-round MCP search failed: %v", sErr)
 				h.recordFailureWithDetails("claude", req.Model, lastAccountID, apiKeyID, sErr)
-				h.sendClaudeError(w, 502, "api_error", "Web search failed: "+sErr.Error())
+				// Same classification as the intermediate-round site above.
+				sStatus, sErrType := webSearchErrorStatus(sErr)
+				h.sendClaudeError(w, sStatus, sErrType, "Web search failed: "+sErr.Error())
 				return
 			}
 			searched[i] = results

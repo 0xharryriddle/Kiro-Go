@@ -619,6 +619,33 @@ func buildWebSearchContentBlocks(query, toolUseID string, results *WebSearchResu
 
 // ==================== Pure-path handler ====================
 
+// webSearchErrorStatus maps a web-search failure onto the client-facing HTTP
+// status and Anthropic error type.
+//
+// Extracted so every web-search surface classifies the same failure identically.
+// The mixed-tools loop (websearch_loop.go) hardcoded 502/api_error at both of its
+// MCP-search sites, so the SAME upstream MCP 429 was reported as
+// 429/rate_limit_error on a pure web-search request and 502/api_error when the
+// search was mixed with a client tool. A client keys its backoff off that value:
+// told "api_error" it retries immediately into a rate limit instead of backing
+// off, and an MCP auth failure looks like a transient gateway fault it should
+// keep retrying forever rather than a credential it must fix.
+//
+// 502/api_error remains the default for anything unclassified.
+func webSearchErrorStatus(err error) (int, string) {
+	if err == nil {
+		return 502, "api_error"
+	}
+	msg := err.Error()
+	if isAuthErrorMessage(msg) {
+		return 401, "authentication_error"
+	}
+	if isQuotaErrorMessage(msg) {
+		return 429, "rate_limit_error"
+	}
+	return 502, "api_error"
+}
+
 // handleWebSearchRequest serves pure native web_search requests via MCP.
 func (h *Handler) handleWebSearchRequest(w http.ResponseWriter, req *ClaudeRequest, estimatedInputTokens int, apiKeyID string) {
 	query := extractSearchQuery(req)
@@ -639,15 +666,7 @@ func (h *Handler) handleWebSearchRequest(w http.ResponseWriter, req *ClaudeReque
 		}
 		h.recordFailureWithDetails("claude", req.Model, accountID, apiKeyID, err)
 		// Prefer a real error over a silent empty body (issue #120 symptom).
-		status := 502
-		errType := "api_error"
-		if isAuthErrorMessage(err.Error()) {
-			status = 401
-			errType = "authentication_error"
-		} else if isQuotaErrorMessage(err.Error()) {
-			status = 429
-			errType = "rate_limit_error"
-		}
+		status, errType := webSearchErrorStatus(err)
 		h.sendClaudeError(w, status, errType, "Web search failed: "+err.Error())
 		return
 	}
