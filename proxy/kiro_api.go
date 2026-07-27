@@ -20,7 +20,28 @@ import (
 )
 
 const (
-	kiroRestAPIBase               = "https://codewhisperer.us-east-1.amazonaws.com"
+	kiroRestAPIBase = "https://codewhisperer.us-east-1.amazonaws.com"
+
+	// kiroProfilePageSize is the maxResults value sent to ListAvailableProfiles.
+	//
+	// 10 is not a preference, it is the upstream's hard limit, established by a
+	// boundary sweep against the live CodeWhisperer endpoint:
+	//
+	//	maxResults =  1,5,10        -> HTTP 200, profiles returned
+	//	maxResults = 11,15,20,25,30 -> HTTP 400 {"reason":"REQUEST_BODY_INVALID"}
+	//	maxResults = 40,49,50,100   -> HTTP 400 {"reason":"REQUEST_BODY_INVALID"}
+	//
+	// The pre-merge fork sent {"maxResults":10} and worked. Upstream v1.1.5's
+	// paginated rewrite hardcoded 50, and the merge adopted it — which made
+	// EVERY ListAvailableProfiles call fail with a 400 for every account lacking
+	// a cached profileArn. The symptom is indirect and easy to misread: profile
+	// resolution fails, so GetUsageLimits fails, so subscription/usage fields are
+	// never populated and the admin UI falls back to displaying "Free" on a
+	// genuine paid plan.
+	//
+	// Pagination still works (nextToken is honoured), so a bound of 10 per page
+	// costs at most one extra round-trip per 10 profiles and loses nothing.
+	kiroProfilePageSize           = 10
 	profileArnUnsupportedCooldown = 24 * time.Hour
 	maxProfileResponseBytes       = 1 << 20
 	maxProfileErrorBytes          = 64 << 10
@@ -996,9 +1017,9 @@ func listKiroProfilesInRegionContext(
 	invalidCount := 0
 	nextToken := ""
 	// Bound pagination so a misbehaving upstream cannot loop forever. 20 pages
-	// of 50 is far above any realistic Kiro profile count.
+	// of kiroProfilePageSize is far above any realistic Kiro profile count.
 	const maxProfilePages = 20
-	const pageSize = 50
+	const pageSize = kiroProfilePageSize
 	for page := 0; page < maxProfilePages; page++ {
 		requestBody := map[string]interface{}{"maxResults": pageSize}
 		if nextToken != "" {

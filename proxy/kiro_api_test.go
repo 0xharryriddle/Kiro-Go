@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"errors"
+	"fmt"
 	"io"
 	"kiro-go/auth"
 	"kiro-go/config"
@@ -330,8 +331,17 @@ func TestListKiroProfilesFollowsNextTokenPagination(t *testing.T) {
 	if len(profiles) != 2 || profiles[0].Arn == "" || profiles[1].Arn == "" {
 		t.Fatalf("profiles = %+v, want two ARNs across pages", profiles)
 	}
-	if !strings.Contains(pages[0], `"maxResults":50`) {
-		t.Fatalf("first page body = %s, want maxResults 50", pages[0])
+	// This assertion previously demanded maxResults:50, which is what upstream's
+	// paginated rewrite hardcoded. It passed only because the mock transport
+	// above accepts any body — the LIVE CodeWhisperer endpoint rejects anything
+	// above 10 with HTTP 400 REQUEST_BODY_INVALID (boundary swept: 1/5/10 OK,
+	// 11/15/20/25/30/40/49/50/100 rejected). A mock that accepts more than the
+	// real service does is exactly how a 400-on-every-call bug reached
+	// production and made paid accounts display as "Free".
+	//
+	// Pinned to the constant rather than a literal so the two cannot drift.
+	if !strings.Contains(pages[0], fmt.Sprintf(`"maxResults":%d`, kiroProfilePageSize)) {
+		t.Fatalf("first page body = %s, want maxResults %d", pages[0], kiroProfilePageSize)
 	}
 }
 

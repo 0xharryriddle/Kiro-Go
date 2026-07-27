@@ -1,6 +1,31 @@
 # Kiro-Go Feature Roadmap & Design
 
-Status: SHIPPED — all 12 features (F1–F12) implemented, tested, and deployed. Author: engineering review pass.
+Status: SHIPPED — all 12 features (F1–F12) present in code and deployed.
+
+CORRECTION (post-audit, 2026-07-27). The original "implemented, tested, and
+deployed" wording overclaimed, and a later audit proved it wrong in two specific
+places. Both are now fixed, but the lesson is recorded here rather than quietly
+patched, because "SHIPPED" in this document meant "code exists", not "code runs":
+
+- **F3 external-usage auto-action was UNREACHABLE DEAD CODE.** Its gate required
+  `strong_external && acc.Enabled`, but that confidence tier is only ever
+  assigned when `!EnabledLocally` — the same account's same flag. A contradiction,
+  so the branch had never once fired. It also had ZERO test coverage, which is
+  precisely why the contradiction survived a "tested" claim.
+- **F5 response cache was unbounded and unobservable.** No capacity limit, no
+  eviction, and expiry reclaimed only on lookup of the same key — so a stream of
+  distinct requests (a proxy's normal traffic) retained whole HTTP bodies for the
+  process lifetime. It was also enabled in the live config with no counters, so
+  nobody could tell it was misbehaving.
+
+Additionally, the prompt-cache subsystem F5 sits beside CANNOT function on the
+Kiro path at all: `KiroUserInputMessage.Content` is a plain string, so there is
+nowhere for per-block `cache_control` markers to live. The live container
+confirms 0 hits / 0 misses after 32,699 requests. Prompt caching does work on
+the Bedrock path, where `cache_control` passes through untouched.
+
+Treat every "SHIPPED" line below as "the code is present" and verify behaviour
+against a test before relying on it.
 Scope: candidate features derived from a full codebase scan plus a review of the
 production LLM-gateway landscape (LiteLLM, Portkey, Helicone, 2025). This document
 originally existed to decide *what to build next*; it is retained as the design

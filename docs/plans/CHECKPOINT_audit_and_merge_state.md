@@ -284,8 +284,10 @@ Committed as `6158c24`, a real two-parent merge (`99dda52` + upstream `ec4ba56`)
 `MERGE_HEAD` cleared. 70 files, +13651/-850.
 
 All 14 previously-conflicted paths were verified marker-free before staging, and
-the full gate was re-run from the exact staged state. NOT YET PUSHED — `harry` is
-ahead of `origin/harry` and pushing is the user's call.
+the full gate was re-run from the exact staged state.
+
+PUSHED. `origin/harry` is at `910c773`, confirmed by re-fetch (0 ahead / 0 behind,
+SHAs match). The merge commit `6158c24` is reachable from the remote tip.
 
 ### R2 — `stop_reason: "error"` (needs user decision)
 On Claude mid-stream termination I emit `stop_reason: "error"`, which is outside
@@ -343,5 +345,7 @@ node --check web/app.js
 git diff --check
 ```
 
-Pre-existing gofmt flags (NOT introduced here, leave alone unless editing):
-`proxy/usage_anomaly_test.go`, `proxy/response_cache_test.go`.
+gofmt is now clean across the whole tree — both formerly-flagged files
+(`proxy/usage_anomaly_test.go`, `proxy/customer_admin_api_test.go`) were
+whitespace-only alignment and were fixed in passing, so `gofmt -l` should return
+NOTHING. A non-empty result now means the current change introduced it.
