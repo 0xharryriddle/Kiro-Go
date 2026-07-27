@@ -96,13 +96,24 @@ type RequestLog struct {
 	AttemptCount int            `json:"attemptCount,omitempty"`
 
 	// Token detail. Tokens (above) remains the sum for backward compatibility.
-	InputTokens     int `json:"inputTokens,omitempty"`     // gen_ai.usage.input_tokens
-	OutputTokens    int `json:"outputTokens,omitempty"`    // gen_ai.usage.output_tokens
-	CacheReadTokens int `json:"cacheReadTokens,omitempty"` // prompt-cache reads
+	//
+	// These four are deliberately NOT omitempty. A missing key and a zero are
+	// different facts, and conflating them is actively misleading here: with
+	// omitempty, a request that used no cache produced a log entry carrying only
+	// inputTokens/outputTokens, which is indistinguishable from an entry written
+	// by a version that never measured cache at all. An operator reading a large
+	// inputTokens with no cache figures cannot tell "no caching, context intact"
+	// from "context went missing" — the two have opposite remedies.
+	//
+	// An explicit `"cacheReadTokens": 0` states that caching WAS measured and did
+	// not fire. That is the whole point of reporting it.
+	InputTokens     int `json:"inputTokens"`     // gen_ai.usage.input_tokens
+	OutputTokens    int `json:"outputTokens"`    // gen_ai.usage.output_tokens
+	CacheReadTokens int `json:"cacheReadTokens"` // prompt-cache reads
 	// CacheWriteTokens is the prompt-cache CREATION count. Logged alongside reads
 	// because reads alone cannot distinguish "cache is being built" (writes>0,
 	// reads=0) from "caching is not working" (both 0).
-	CacheWriteTokens int `json:"cacheWriteTokens,omitempty"`
+	CacheWriteTokens int `json:"cacheWriteTokens"`
 
 	// Response shape.
 	StopReason    string `json:"stopReason,omitempty"`    // gen_ai.response.finish_reasons

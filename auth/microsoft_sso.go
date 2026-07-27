@@ -1205,11 +1205,65 @@ func redactAssignmentsOfParam(s, name string) string {
 			i = end
 			continue
 		}
+		// Never redact a value that IS a diagnostic marker. An OAuth error code
+		// is not a credential, and `code` is both a sensitive parameter name AND
+		// the word providers use for their error codes — so "error code=invalid_grant"
+		// and {"code":"invalid_token"} both looked like credential assignments.
+		//
+		// Redacting them silently broke auth classification: proxy's
+		// isAuthErrorMessage identifies a revoked credential by finding exactly
+		// these markers (authErrorNarrowMarkers), so a genuinely revoked token
+		// became an unclassifiable error, the account was never flagged for
+		// re-auth, and it kept being routed while every request failed. That is
+		// the same functional regression the colon-form rule already guards
+		// against, reached through the `=` form instead.
+		if isOAuthDiagnosticMarker(s[valueStart:k]) {
+			b.WriteString(s[i:k])
+			i = k
+			continue
+		}
 		b.WriteString(s[i:valueStart])
 		b.WriteString("[REDACTED]")
 		i = k
 	}
 	return b.String()
+}
+
+// oauthDiagnosticMarkers are values that are ERROR CODES, never credentials.
+//
+// These are deliberately the same strings proxy's authErrorNarrowMarkers
+// classifies a revoked credential by (see proxy/account_failover.go). The two
+// lists must agree: anything the classifier needs to READ, the redactor must not
+// destroy. If a marker is added there, add it here.
+var oauthDiagnosticMarkers = map[string]struct{}{
+	"invalid_grant":           {},
+	"invalid grant":           {},
+	"invalid_token":           {},
+	"invalid token":           {},
+	"invalid_request":         {},
+	"invalid_client":          {},
+	"invalid_scope":           {},
+	"unauthorized":            {},
+	"unauthorized_client":     {},
+	"access_denied":           {},
+	"expired_token":           {},
+	"server_error":            {},
+	"temporarily_unavailable": {},
+	"unsupported_grant_type":  {},
+	"authentication failed":   {},
+	"bad credentials":         {},
+	"token expired":           {},
+	"token has expired":       {},
+	"access token expired":    {},
+	"refresh token expired":   {},
+}
+
+// isOAuthDiagnosticMarker reports whether value is a known OAuth error code
+// rather than a secret. Compared case-insensitively and trimmed, because a
+// provider may echo "Invalid_Grant" or pad it with spaces.
+func isOAuthDiagnosticMarker(value string) bool {
+	_, ok := oauthDiagnosticMarkers[strings.ToLower(strings.TrimSpace(value))]
+	return ok
 }
 
 func isQuoteByte(b byte) bool { return b == '"' || b == '\'' }

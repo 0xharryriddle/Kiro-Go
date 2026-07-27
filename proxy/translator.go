@@ -1507,6 +1507,34 @@ type OpenAIUsage struct {
 	PromptTokens     int `json:"prompt_tokens"`
 	CompletionTokens int `json:"completion_tokens"`
 	TotalTokens      int `json:"total_tokens"`
+
+	// PromptTokensDetails carries the cache breakdown in OpenAI's own shape
+	// (`usage.prompt_tokens_details.cached_tokens`), so a client that already
+	// understands OpenAI caching reads it without special-casing this proxy.
+	//
+	// Why this exists: prompt_tokens alone cannot distinguish a request whose
+	// prefix was served from cache from a request that LOST part of its
+	// conversation. Both show a smaller number. Those two have opposite
+	// remedies — one is working as intended, the other is data loss — so the
+	// breakdown is the only thing that tells them apart.
+	//
+	// A pointer with omitempty: absent when the proxy did not measure caching
+	// for this request, rather than reporting a fabricated zero. Once present,
+	// CachedTokens itself is NOT omitempty, so an explicit 0 means "measured,
+	// no cache hit".
+	PromptTokensDetails *OpenAIPromptTokensDetails `json:"prompt_tokens_details,omitempty"`
+}
+
+// OpenAIPromptTokensDetails is the cache breakdown of prompt_tokens.
+type OpenAIPromptTokensDetails struct {
+	// CachedTokens is the portion of prompt_tokens served from a prompt cache.
+	CachedTokens int `json:"cached_tokens"`
+	// CacheWriteTokens is the portion written INTO the cache on this request.
+	// Not an OpenAI field (they do not expose creation separately), so it is
+	// omitempty to avoid implying a standard field where none exists. Included
+	// because reads alone cannot distinguish "cache is warming" (writes>0,
+	// reads=0) from "caching is not working at all" (both 0).
+	CacheWriteTokens int `json:"cache_write_tokens,omitempty"`
 }
 
 // ==================== OpenAI -> Kiro 转换 ====================
