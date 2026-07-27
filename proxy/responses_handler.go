@@ -201,6 +201,21 @@ func (h *Handler) handleResponsesNonStream(
 			}
 			return
 		}
+		// Bedrock accounts hold static IAM/API-key credentials and no Kiro OAuth
+		// material, so they cannot serve this Kiro-translated path. Without this
+		// guard such an account fell through to CallKiroAPIWithDiagnostics below:
+		// the Kiro call 403s, handleAccountFailure then penalises (and can ban) a
+		// perfectly healthy Bedrock credential. The Claude and OpenAI surfaces both
+		// branch on IsBedrock() into the Bedrock invoke path; /v1/responses has no
+		// OpenAI->Anthropic Responses translation yet, so the correct behaviour here
+		// is to SKIP rather than dispatch. Excluded + attempt-- so an ineligible
+		// account does not burn a retry, matching the IsCustomApi() skip above.
+		// Checked BEFORE beginAttempt so a skipped account produces no trace attempt.
+		if account.IsBedrock() {
+			excluded[account.ID] = true
+			attempt--
+			continue
+		}
 
 		var content, reasoningContent string
 		var toolUses []KiroToolUse
@@ -416,6 +431,16 @@ func (h *Handler) handleResponsesStream(
 		// attempt-- so skipping an ineligible account does not burn a retry attempt.
 		// Checked BEFORE beginAttempt so a skipped account produces no trace attempt.
 		if account.IsCustomApi() {
+			excluded[account.ID] = true
+			attempt--
+			continue
+		}
+		// Bedrock accounts carry static credentials and no Kiro OAuth material, so
+		// they cannot serve this Kiro-translated path either. Skipping (rather than
+		// dispatching) keeps a healthy Bedrock credential from being 403'd on the
+		// Kiro endpoint and then penalised by handleAccountFailure. Same contract as
+		// the non-streaming loop; see the comment there.
+		if account.IsBedrock() {
 			excluded[account.ID] = true
 			attempt--
 			continue

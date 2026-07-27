@@ -669,6 +669,38 @@ recorded here so the option is not re-derived from scratch.
 
 Cumulative: **75 defects**.
 
+### Round-14 — /v1/responses had no Bedrock guard (found during roadmap research)
+
+Found while inventorying the system for the research roadmap
+(`docs/plans/ROADMAP_research_driven_upgrades.md`), and independently reported by
+an API-surface research subagent. CLAUDE.md states the invariant plainly: "Bedrock
+accounts must be excluded from every Kiro/AWS-SSO path (or they get 403'd and
+auto-banned). If you add a new Kiro-facing loop, add an `IsBedrock()` guard."
+`/v1/responses` is such a loop and had no guard.
+
+| # | Defect | Site | Notes |
+|---|---|---|---|
+| 76 | **A Bedrock account selected on `/v1/responses` was dispatched to the KIRO endpoint.** Both loops branch on `IsCustomApi()` but never on `IsBedrock()`, so a Bedrock account fell through to `CallKiroAPIWithDiagnostics`. Bedrock accounts carry static IAM/API-key credentials and no Kiro OAuth material, so the call 403s and `handleAccountFailure` then penalises — and can permanently ban — a healthy Bedrock credential. Reachability was verified, not assumed: the pool has no `IsBedrock` filter, `accountHasModel` fails OPEN on a cold model list, and `ensureValidToken` early-returns nil for Bedrock, so nothing upstream stops the selection | `proxy/responses_handler.go:192-203` (non-stream), `:433-437` (stream) | Guard SKIPS rather than dispatches (`excluded` + `attempt--`, matching the sibling `IsCustomApi()` skip), because no OpenAI→Anthropic *Responses* translation exists yet. Claude/OpenAI surfaces branch INTO the Bedrock invoke path; Responses cannot |
+
+**Latent, not live — stated precisely.** The live config has 24 accounts, all
+`idc`/`external_idp`/`api_key`, and zero Bedrock accounts, so this could not fire
+in the current deployment. It becomes live the moment one Bedrock account is added.
+
+**A false green I had to throw away, recorded rather than hidden.** The first
+version of the test grepped `responses_handler.go` for the string `IsBedrock()`.
+It went red before the fix and green after, which looked like a valid RED-proof —
+but neutralizing the guards with `if false && account.IsBedrock()` left BOTH tests
+passing, because the *substring still matched*. A source-text assertion cannot
+distinguish a live guard from a disabled one. Replaced with a behavioural test that
+builds a Bedrock-only pool, points `kiroEndpoints` at an `httptest` server that
+counts hits, and calls the real handlers: with the guards the Kiro endpoint is
+never touched (0 hits, HTTP 503 "no accounts"), and under neutralization it fails
+on the real observable — "a Bedrock account was dispatched to the KIRO endpoint 1
+time(s)" — on both the stream and non-stream subtests, while the Kiro-account
+control stays green.
+
+Cumulative: **76 defects**.
+
 ---
 
 ## 4. Remaining work
