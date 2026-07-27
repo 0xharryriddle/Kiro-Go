@@ -534,6 +534,44 @@ confirmed the defect test fails without the fix while both controls stay green.
 
 Cumulative: **70 defects**.
 
+### Round-12 — the third event-stream reader (`91f981c`)
+
+Third round running where the defect was found by asking whether an earlier fix
+in this series covered every site in its class. This one is the highest-traffic
+path in the proxy.
+
+| # | Defect | Site | Notes |
+|---|---|---|---|
+| 71 | **An HTTP 200 whose body carried no event-stream frames was served to the customer as a billed success.** `parseEventStream` broke out of its loop on the first `io.EOF` and returned nil, so zero frames was indistinguishable from a stream that completed normally. `8f49a4b` fixed exactly this in BOTH Bedrock readers and left this third one — the reader serving the main Kiro path. On the streaming paths that nil is the only failover signal, so: no failover to a healthy account; `pool.RecordSuccess` CLEARS the offending account's error count and cooldown (`pool/account.go:818`) so it keeps looking healthy and keeps being selected; `inputTokens` falls back to `estimatedInputTokens` (`handler.go:2144-2146`) so the customer is billed a full input estimate for zero output; and the client receives `stop_reason: "end_turn"` as though the empty answer were real. The same nil also reaches the non-streaming path (`handler.go:2651`) | `proxy/kiro.go:745` | Mirrors `8f49a4b`: count frames, return `errKiroEmptyStream` on a clean EOF with none. A prelude that ARRIVES counts even when the loop skips it as malformed — a skipped frame still proves the upstream responded |
+
+Classification was checked rather than assumed, because a new error on this path
+could do more harm than the defect: the sentinel carries no HTTP status token, so
+`pool.IsAuthFailure` returns false (no false ban, no auto-disable of a healthy
+account) and `statusForUpstreamError` falls to its default 500 — the right answer
+for an upstream that returned nothing.
+
+Reconciling with a pre-existing test, rather than overriding it: 
+`TestEventStreamHandlesUndersizedFrameLength` pins that a body consisting only of
+an undersized frame parses cleanly and returns nil. Its stated intent is "no
+panic, no hang", and a frame that arrived and was skipped is genuinely not an
+empty stream — so the guard counts it, both tests hold, and neither assertion had
+to be weakened. A fourth control (`TestKiroUndersizedFrameIsNotAnEmptyStream`)
+now pins that distinction explicitly so a future change cannot collapse the two
+cases.
+
+Live-corpus evidence, offered as motivation and explicitly NOT as proof: across
+three days, 2 of 16100 successful streaming responses recorded
+`outputTokens: 0` with `ttfbMs` absent (0 of 667 comparable controls had it
+absent), one billing 429252 input tokens and the other 137562, both against the
+same account, both reported to the client as success. The corpus cannot establish
+that those two were zero-FRAME rather than frames-carrying-no-text —
+`markFirstByte` fires on emitted text, not per frame, and captured bodies store
+only the request side. The defect is proven at the reader instead.
+
+All three event-stream readers in the repo now carry the `framesSeen` guard.
+
+Cumulative: **71 defects**.
+
 ---
 
 ## 4. Remaining work

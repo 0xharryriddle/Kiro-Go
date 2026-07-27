@@ -1,7 +1,7 @@
 # Kiro-Go — fresh-session handoff prompt
 
 Paste this whole file as the opening message of the new session. Every fact below
-was verified by command output at handoff time (2026-07-27, HEAD `668fb85`).
+was verified by command output at handoff time (2026-07-27, HEAD `91f981c`).
 Where something is unverified or unknown, it says so — do not upgrade those to
 facts without checking.
 
@@ -11,7 +11,7 @@ facts without checking.
 
 Continue the Kiro-Go audit-and-harden effort. It is not "finish a feature"; it is
 **find real defects, prove them, fix them, verify, deploy**. The previous session
-closed 70 defects across eleven rounds. There is no deadline and no fixed list —
+closed 71 defects across twelve rounds. There is no deadline and no fixed list —
 work the highest-risk unreviewed surface, then the next.
 
 Repo: `/home/harry-riddle/dev/github.com/0xharryriddle/Kiro-Go`
@@ -23,10 +23,10 @@ Branch: `harry` (tracks `origin/harry`)
 
 | Fact | Value |
 |---|---|
-| HEAD | `668fb85` |
+| HEAD | `91f981c` |
 | Remote | `origin/harry` identical (0 ahead / 0 behind) |
 | Working tree | clean |
-| Tests | 932 top-level test funcs pass across `config` `pool` `auth` `proxy` (1163 including subtests; both numbers measured, not remembered) |
+| Tests | 936 top-level test funcs pass across `config` `pool` `auth` `proxy` (1169 including subtests; both numbers measured, not remembered) |
 | `-race` | clean, 0 data races |
 | `go vet` / `gofmt` | clean tree-wide |
 | Live container | healthy, version **1.1.5** |
@@ -35,6 +35,8 @@ Branch: `harry` (tracks `origin/harry`)
 Recent commits (newest first):
 
 ```
+91f981c fix(kiro): treat a Kiro event-stream with no frames as a failure
+be20b4f docs: record round 11 and sync the handoff to 668fb85
 668fb85 fix(bedrock): record a Converse OpenAI mid-stream failure as a failure
 5c3667a docs: record round 10 and sync the handoff to a1cf36f
 a1cf36f fix(admin): validate an explicit region before probing or persisting it
@@ -50,7 +52,7 @@ a1cf36f fix(admin): validate an explicit region before probing or persisting it
 ```
 
 **Read `docs/plans/CHECKPOINT_audit_and_merge_state.md` first.** It is the
-authoritative record: all 70 defects, the rejected claims (so they are not
+authoritative record: all 71 defects, the rejected claims (so they are not
 re-litigated), and every deliberate non-decision with its reasoning.
 
 ---
