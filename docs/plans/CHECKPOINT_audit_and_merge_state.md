@@ -622,6 +622,53 @@ and leaves all three behavioural controls green.
 
 Cumulative: **73 defects**.
 
+### Round-13b — the two holes round 13 left open (found by adversarial review)
+
+An adversarial subagent review of the round-13 fix found two real gaps. Both share
+one root cause: round 13 only inspected the return value of `Write` on the CONTENT
+chunks, and that is not the only place a departed client is observable. Round 13
+stopped over-PENALISING the account and left two paths that over-CREDIT it — the
+mirror image of the defect it set out to fix.
+
+| # | Defect | Site | Notes |
+|---|---|---|---|
+| 74 | **A disconnect during the TERMINAL chunk was still billed as a success.** `bedrockOpenAIStreamConv.finish` wrote the terminal `finish_reason`+usage chunk and the `[DONE]` sentinel and discarded BOTH `fmt.Fprintf` results, returning nothing. So a client that hung up after the last content chunk — or a stream whose only client write IS the terminal chunk — still reached `recordBedrockSuccess`: `successRequests` incremented, the customer key metered, `pool.RecordSuccess` called, for a response whose terminal frame never arrived | `proxy/bedrock_openai.go:687-704` (helper), call sites `:763` and `proxy/bedrock_converse.go:916` | `finish` now RETURNS a `clientGone`-tagged error; both success call sites classify it and record nothing. The two partial-failure call sites deliberately ignore it (`_ = conv.finish(...)`) — already recorded as failures |
+| 75 | **A flush-time disconnect was invisible, so a stream nobody received was billed as a clean completion.** `net/http`'s `ResponseWriter.Write` succeeds into the connection's `bufio.Writer` while the socket error surfaces only on flush — and the stdlib DISCARDS it: `func (w *response) Flush() { w.FlushError() }`. Verified in the local go1.25.6 source, plus `ResponseController.Flush` preferring `FlushError() error`. Checking `Write` alone therefore cannot see a disconnect between chunks | all four write sites, via `proxy/bedrock_client_disconnect.go:98-114` | New `flushClient` helper uses `http.NewResponseController(rw).Flush()` and tags a failure as client-gone. `http.ErrNotSupported` is ignored (a writer with no flush is not a client fault); non-`ResponseWriter` writers fall back to the error-less `Flusher` so existing buffer-based unit tests are unaffected |
+
+Reviewer questions closed as NON-ISSUES, each checked rather than assumed:
+a genuine upstream error cannot be misclassified as client-gone, because
+`converseStreamConv.process` / `finalize` return an `emit` error verbatim
+(`return emit(ev)`, and `finalize`'s `if err := emit(delta); err != nil { return err }`)
+— never wrapped, so `errors.Is` keeps the sentinel; and `resp.Body.Close()` is a
+`defer` at every site, so returning nil early leaks nothing.
+
+Two RED-proven defect tests plus three controls
+(`proxy/bedrock_terminal_disconnect_test.go`). The fixes were neutralized
+SEPARATELY, and the first attempt was inconclusive and is recorded as such: gating
+out the whole `ResponseController` branch made two tests fail on their
+PRECONDITION guard ("flush was never attempted") rather than on a billing
+assertion. Re-neutralized correctly — still flush, discard the error — the flush
+defect test then failed on its real assertion (`successRequests moved 0 -> 1`)
+while its control passed. Neutralizing the `finish` check at both call sites failed
+both terminal-disconnect tests on real billing assertions
+(`totalTokens moved 0 -> 11` and `0 -> 16`) with all three controls green.
+
+**Billing tradeoff, argued and decided.** On client-gone we now bill nothing, yet
+Bedrock already consumed upstream tokens, so the operator pays for inference the
+customer is not charged for — in principle a client could stream and hang up
+repeatedly for free inference without ever touching its key's `TokenLimit`. It is
+still the right default: (1) it matches the established `custom_api` precedent
+(`custom_api_forward.go:445-447`) and consistency across providers matters more
+than recovering a rare edge cost; (2) billing a response the customer never
+received is the worse failure — it is a real overcharge on every accidental
+disconnect, which is common, whereas the abuse case is deliberate and rare; and
+(3) the abuse is bounded and observable, since the disconnect is logged per
+account. If it is ever seen in practice, the fix is to meter tokens WITHOUT
+`pool.RecordSuccess` (bill the customer, do not credit the account's health) —
+recorded here so the option is not re-derived from scratch.
+
+Cumulative: **75 defects**.
+
 ---
 
 ## 4. Remaining work

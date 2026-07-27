@@ -84,15 +84,41 @@ func classifyBedrockStreamOutcome(streamErr error, started bool) bedrockStreamDi
 	}
 }
 
-// writeAnthropicSSE writes one Anthropic SSE event to the client, tagging a write
-// failure as a client disconnect. Shared by the two passthrough stream sites
-// (native invoke and Converse->Anthropic) so both classify disconnects alike.
-func writeAnthropicSSE(w io.Writer, flusher http.Flusher, evtName string, anthropicJSON []byte) error {
-	if _, err := fmt.Fprintf(w, "event: %s\ndata: %s\n\n", evtName, anthropicJSON); err != nil {
-		return clientGone(err)
+// flushClient flushes buffered SSE bytes and reports a flush failure.
+//
+// net/http's ResponseWriter.Write can succeed into the connection's bufio.Writer
+// while the real socket error surfaces only on flush, and the standard
+// implementation's Flush() DISCARDS it: `func (w *response) Flush() { w.FlushError() }`
+// (net/http/server.go). Checking only Write therefore misses a disconnect that
+// happens between chunks, which would be booked as a clean completion and billed.
+//
+// http.NewResponseController surfaces the error where the writer supports it
+// (unwrapping wrappers, preferring FlushError) and reports ErrNotSupported for a
+// writer with no flush at all — which is not a client fault, so it is ignored.
+func flushClient(w io.Writer, flusher http.Flusher) error {
+	if rw, ok := w.(http.ResponseWriter); ok {
+		if err := http.NewResponseController(rw).Flush(); err != nil {
+			if errors.Is(err, http.ErrNotSupported) {
+				return nil
+			}
+			return clientGone(err)
+		}
+		return nil
 	}
+	// Not a ResponseWriter (unit tests write to a buffer): fall back to the
+	// error-less flusher so behaviour is unchanged for those callers.
 	if flusher != nil {
 		flusher.Flush()
 	}
 	return nil
+}
+
+// writeAnthropicSSE writes one Anthropic SSE event to the client, tagging a write
+// OR flush failure as a client disconnect. Shared by the two passthrough stream
+// sites (native invoke and Converse->Anthropic) so both classify disconnects alike.
+func writeAnthropicSSE(w io.Writer, flusher http.Flusher, evtName string, anthropicJSON []byte) error {
+	if _, err := fmt.Fprintf(w, "event: %s\ndata: %s\n\n", evtName, anthropicJSON); err != nil {
+		return clientGone(err)
+	}
+	return flushClient(w, flusher)
 }

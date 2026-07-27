@@ -684,7 +684,16 @@ func (c *bedrockOpenAIStreamConv) onEvent(w io.Writer, flusher http.Flusher, ant
 
 // finish emits the terminal chunk (finish_reason + usage) and the [DONE]
 // sentinel that OpenAI streaming clients expect.
-func (c *bedrockOpenAIStreamConv) finish(w io.Writer, flusher http.Flusher) {
+//
+// It RETURNS a client-gone error when the terminal write or flush fails. The
+// returned value used to be absent and both Fprintf results discarded, so a client
+// that disconnected after the last content chunk — or during a stream whose only
+// client write IS this terminal chunk — was still booked by the caller as a
+// success: successRequests incremented, the customer key billed, and
+// pool.RecordSuccess called, for a response whose terminal frame and [DONE]
+// sentinel never arrived. The caller classifies the result so that case records
+// nothing, matching the mid-stream contract.
+func (c *bedrockOpenAIStreamConv) finish(w io.Writer, flusher http.Flusher) error {
 	finish := c.finishReason
 	if finish == "" {
 		finish = "stop"
@@ -696,11 +705,15 @@ func (c *bedrockOpenAIStreamConv) finish(w io.Writer, flusher http.Flusher) {
 		"total_tokens":      c.inputTokens + c.outputTokens,
 	}
 	data, _ := json.Marshal(chunk)
-	fmt.Fprintf(w, "data: %s\n\n", data)
-	fmt.Fprintf(w, "data: [DONE]\n\n")
-	if flusher != nil {
-		flusher.Flush()
+	if _, err := fmt.Fprintf(w, "data: %s\n\n", data); err != nil {
+		return clientGone(err)
 	}
+	if _, err := fmt.Fprintf(w, "data: [DONE]\n\n"); err != nil {
+		return clientGone(err)
+	}
+	// A buffered write can succeed while the socket error surfaces only on flush,
+	// so the flush is checked too (see flushClient).
+	return flushClient(w, flusher)
 }
 
 // ---------------------------------------------------------------------------
@@ -754,13 +767,21 @@ func (h *Handler) invokeBedrockOpenAIStream(w http.ResponseWriter, flusher http.
 	case bedrockStreamPartialFailure:
 		// Partial stream: cannot fail over, but this is a failure, not a success.
 		// Still finish the SSE so the client sees a terminated stream rather than
-		// a truncated one.
-		conv.finish(w, flusher)
+		// a truncated one; a failure to deliver that terminal chunk changes
+		// nothing here, since this is already being recorded as a failure.
+		_ = conv.finish(w, flusher)
 		h.recordBedrockPartialFailure(p, streamErr)
 		return nil
 	}
 
-	conv.finish(w, flusher)
+	// The upstream stream completed, but the terminal chunk + [DONE] still have to
+	// REACH the client before this counts as a delivered response. A disconnect
+	// here is the client's, so record nothing rather than billing a response the
+	// customer never received.
+	if finishErr := conv.finish(w, flusher); finishErr != nil {
+		logger.Debugf("[Bedrock] client disconnected before the terminal chunk (account %s): %v", p.account.ID, finishErr)
+		return nil
+	}
 	h.recordBedrockSuccess(p, conv.inputTokens, conv.outputTokens, reqStart)
 	return nil
 }

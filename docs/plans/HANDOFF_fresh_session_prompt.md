@@ -11,7 +11,8 @@ facts without checking.
 
 Continue the Kiro-Go audit-and-harden effort. It is not "finish a feature"; it is
 **find real defects, prove them, fix them, verify, deploy**. The previous session
-closed 73 defects across thirteen rounds. There is no deadline and no fixed list —
+closed 75 defects across thirteen rounds (13 + a 13b follow-up driven by an
+adversarial review of round 13's own fix). There is no deadline and no fixed list —
 work the highest-risk unreviewed surface, then the next.
 
 Repo: `/home/harry-riddle/dev/github.com/0xharryriddle/Kiro-Go`
@@ -26,7 +27,7 @@ Branch: `harry` (tracks `origin/harry`)
 | HEAD | `c013d52` |
 | Remote | `origin/harry` identical (0 ahead / 0 behind) |
 | Working tree | clean |
-| Tests | 942 top-level test funcs pass across `config` `pool` `auth` `proxy` (measured, not remembered: 936 at round 12 + 6 added in round 13) |
+| Tests | 947 top-level test funcs pass across `config` `pool` `auth` `proxy` (measured, not remembered: 936 at round 12 + 6 in round 13 + 5 in round 13b) |
 | `-race` | clean, 0 data races |
 | `go vet` / `gofmt` | clean tree-wide |
 | Live container | healthy, version **1.1.5** |
@@ -54,7 +55,7 @@ a1cf36f fix(admin): validate an explicit region before probing or persisting it
 ```
 
 **Read `docs/plans/CHECKPOINT_audit_and_merge_state.md` first.** It is the
-authoritative record: all 73 defects, the rejected claims (so they are not
+authoritative record: all 75 defects, the rejected claims (so they are not
 re-litigated), and every deliberate non-decision with its reasoning.
 
 Two entries there are worth reading before starting: the **correction to the

@@ -903,17 +903,24 @@ func (h *Handler) invokeBedrockConverseOpenAIStream(w http.ResponseWriter, flush
 		// repeated mid-stream Converse exceptions on the OpenAI surface kept
 		// clearing its own health via pool.RecordSuccess and stayed selectable.
 		//
-		// Still finish the SSE first (matching invokeBedrockOpenAIStream:743) so the
+		// Still finish the SSE first (matching invokeBedrockOpenAIStream) so the
 		// client sees a terminated stream rather than a truncated one, and so the
-		// bytes already committed are not left mid-chunk.
-		oconv.finish(w, flusher)
+		// bytes already committed are not left mid-chunk. A failure to deliver that
+		// terminal chunk changes nothing: this is already a recorded failure.
+		_ = oconv.finish(w, flusher)
 		h.recordBedrockPartialFailure(p, streamErr)
 		return nil
 	}
 	if conv.emittedAny && !conv.sawMessageStop {
 		logger.Warnf("[Bedrock] converse openai stream closed without messageStop (account %s); emitted synthetic terminal", p.account.ID)
 	}
-	oconv.finish(w, flusher)
+	// The terminal chunk + [DONE] must REACH the client before this counts as a
+	// delivered response; a disconnect here is the client's, so record nothing
+	// rather than billing a response the customer never received.
+	if finishErr := oconv.finish(w, flusher); finishErr != nil {
+		logger.Debugf("[Bedrock] client disconnected before the terminal chunk (account %s): %v", p.account.ID, finishErr)
+		return nil
+	}
 	h.recordBedrockSuccess(p, oconv.inputTokens, oconv.outputTokens, reqStart)
 	return nil
 }
