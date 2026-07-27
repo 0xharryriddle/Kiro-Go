@@ -119,9 +119,16 @@ func (h *Handler) handleCustomerMe(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	json.NewEncoder(w).Encode(map[string]interface{}{
-		"id":               entry.ID,
-		"name":             entry.Name,
-		"keyMasked":        config.MaskApiKey(entry.Key),
+		"id":   entry.ID,
+		"name": entry.Name,
+		// ApiKeyDisplayMask, NOT MaskApiKey(entry.Key): keys are hashed at rest,
+		// so the stored entry's Key is always empty (AddApiKey clears it and
+		// returns the cleartext exactly once at mint time). Masking that empty
+		// field produced an empty string on EVERY request, silently breaking the
+		// one thing this field exists for — letting a customer confirm which
+		// credential they queried with. ApiKeyDisplayMask reads the stored
+		// KeyMask, which is what the admin view (admin_apikeys.go) already uses.
+		"keyMasked":        config.ApiKeyDisplayMask(*entry),
 		"status":           customerKeyStatus(*entry),
 		"createdAt":        entry.CreatedAt,
 		"lastUsedAt":       entry.LastUsedAt,
