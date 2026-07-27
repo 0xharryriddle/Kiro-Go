@@ -1,7 +1,7 @@
 # Kiro-Go — fresh-session handoff prompt
 
 Paste this whole file as the opening message of the new session. Every fact below
-was verified by command output at handoff time (2026-07-27, HEAD `91f981c`).
+was verified by command output at handoff time (2026-07-27, HEAD `c013d52`).
 Where something is unverified or unknown, it says so — do not upgrade those to
 facts without checking.
 
@@ -11,7 +11,7 @@ facts without checking.
 
 Continue the Kiro-Go audit-and-harden effort. It is not "finish a feature"; it is
 **find real defects, prove them, fix them, verify, deploy**. The previous session
-closed 71 defects across twelve rounds. There is no deadline and no fixed list —
+closed 73 defects across thirteen rounds. There is no deadline and no fixed list —
 work the highest-risk unreviewed surface, then the next.
 
 Repo: `/home/harry-riddle/dev/github.com/0xharryriddle/Kiro-Go`
@@ -23,18 +23,20 @@ Branch: `harry` (tracks `origin/harry`)
 
 | Fact | Value |
 |---|---|
-| HEAD | `91f981c` |
+| HEAD | `c013d52` |
 | Remote | `origin/harry` identical (0 ahead / 0 behind) |
 | Working tree | clean |
-| Tests | 936 top-level test funcs pass across `config` `pool` `auth` `proxy` (1169 including subtests; both numbers measured, not remembered) |
+| Tests | 942 top-level test funcs pass across `config` `pool` `auth` `proxy` (measured, not remembered: 936 at round 12 + 6 added in round 13) |
 | `-race` | clean, 0 data races |
 | `go vet` / `gofmt` | clean tree-wide |
 | Live container | healthy, version **1.1.5** |
-| Deployed image built from | `6911dcd` — running image digest confirmed identical to the verified build, nothing pending |
+| Deployed image built from | `91f981c` (round 12, digest `b2be7951`) — **round 13 (`c013d52`) is committed but NOT yet deployed**; rebuild and redeploy before treating the container as current |
 
 Recent commits (newest first):
 
 ```
+c013d52 fix(bedrock): stop charging client disconnects to the serving account
+bbc8814 docs: record round 12 and sync the handoff to 91f981c
 91f981c fix(kiro): treat a Kiro event-stream with no frames as a failure
 be20b4f docs: record round 11 and sync the handoff to 668fb85
 668fb85 fix(bedrock): record a Converse OpenAI mid-stream failure as a failure
@@ -52,8 +54,15 @@ a1cf36f fix(admin): validate an explicit region before probing or persisting it
 ```
 
 **Read `docs/plans/CHECKPOINT_audit_and_merge_state.md` first.** It is the
-authoritative record: all 71 defects, the rejected claims (so they are not
+authoritative record: all 73 defects, the rejected claims (so they are not
 re-litigated), and every deliberate non-decision with its reasoning.
+
+Two entries there are worth reading before starting: the **correction to the
+round-12 live-corpus paragraph** (a signature claimed as evidence turned out to be
+a structural artifact of `ttfbMs` being streaming-only — the defect stands on its
+code-level proof instead), and **R13-followup**, a pre-existing observability gap
+where both Bedrock dispatch branches call `beginAttempt` but never `emitTrace`,
+recorded as a candidate rather than fixed.
 
 ---
 
@@ -147,12 +156,12 @@ Line counts below are measured, not remembered (`wc -l`).
 
 | File | Lines | State | Why it matters |
 |---|---|---|---|
-| `proxy/admin_bot_api.go` | 1411 | **UNREVIEWED** (bodies bounded in `16a71ad`, no sibling test) | largest un-audited file in the repo; admin surface |
-| `proxy/bedrock_converse.go` | 908 | audited round 11 → defect #70 | Bedrock Converse translation; partial-stream accounting now pinned |
-| `proxy/bedrock_openai.go` | 794 | **UNREVIEWED** | OpenAI↔Bedrock translation |
-| `proxy/custom_api_forward.go` | 634 | **UNREVIEWED** | transparent passthrough; trust boundary |
-| `proxy/bedrock.go` | 630 | **UNREVIEWED** | the ONLY path where prompt caching actually works |
-| `proxy/request_trace_recorder.go` | 483 | **UNREVIEWED** | decides what reaches disk; PII/redaction relevance |
+| `proxy/admin_bot_api.go` | 1441 | **UNREVIEWED** (bodies bounded in `16a71ad`, no sibling test) | largest un-audited file in the repo; admin surface — the strongest remaining target |
+| `proxy/bedrock_converse.go` | 919 | audited rounds 11 + 13 → defects #70, #72, #73 | Bedrock Converse translation; partial-stream AND client-disconnect accounting now pinned |
+| `proxy/bedrock_openai.go` | 809 | streaming/accounting path audited round 13 → defects #72, #73 | **request TRANSLATION half still unreviewed**: `openAIToAnthropicMessages` and its helpers (system/tool/image conversion) have no adversarial pass |
+| `proxy/custom_api_forward.go` | 634 | read in round 13 as the reference contract (its client-gone handling is what rounds 72/73 mirrored); **no defect pass yet** | transparent passthrough; trust boundary |
+| `proxy/bedrock.go` | 637 | streaming/accounting path audited round 13 → defects #72, #73 | prompt-cache survival through `buildBedrockBody` still unverified |
+| `proxy/request_trace_recorder.go` | 483 | **UNREVIEWED** | decides what reaches disk; PII/redaction relevance. See R13-followup: Bedrock paths never reach it at all |
 | `proxy/websearch_loop.go` | 691 | audited round 9 → defect #67 | the whole loop was read; accounting now pinned |
 | `auth/sso_token.go` | 378 | audited round 9 → defect #66 | credential handling; redaction test added |
 
