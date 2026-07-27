@@ -129,14 +129,50 @@ func claudeErrorTypeForStatus(status int) string {
 	}
 }
 
+// errorTypeForOpenAIStatus maps an authoritative upstream status onto OpenAI's
+// error-type vocabulary for the OpenAI-compatible surface.
+//
+// It previously had NO 4xx branch beyond 401/429, so every other status fell to
+// "server_error" — including 400, 402 and 413, which are all client-side
+// conditions. That is the mirror image of the asymmetry claudeErrorTypeForStatus
+// was written to remove, and it misleads in the more damaging direction: a
+// client told "server_error" is being told to retry, but
+//
+//   - a 400 (malformed / input too long) retried unchanged can never succeed;
+//   - a 402 (spend cap / overage) retried can never clear the cap;
+//   - a 413 (too large) needs the conversation SHRUNK, not resent.
+//
+// So the caller burns quota and latency on a request that is guaranteed to fail
+// again, and never surfaces the action that would actually fix it.
+//
+// The fault CLASS must also agree with the Claude surface for the same upstream
+// failure (pinned by TestClaudeAndOpenAISurfacesAgreeOnFaultClass): a proxy that
+// calls the same condition a client fault on one endpoint and a server fault on
+// the other makes correct client behaviour impossible to write.
+//
+// Values are OpenAI's, not Anthropic's — the two vocabularies differ, and this
+// surface must speak the one its clients parse.
 func errorTypeForOpenAIStatus(status int) string {
-	if status == http.StatusTooManyRequests {
+	switch status {
+	case http.StatusTooManyRequests:
 		return "rate_limit_error"
-	}
-	if status == http.StatusUnauthorized {
+	case http.StatusUnauthorized:
 		return "authentication_error"
+	case http.StatusForbidden:
+		return "permission_error"
+	case http.StatusNotFound:
+		return "not_found_error"
+	case http.StatusBadRequest, http.StatusPaymentRequired, http.StatusRequestEntityTooLarge:
+		// OpenAI does not define a separate billing type on this surface, so a
+		// 402 is reported as an invalid request: it is a client-side condition
+		// the caller must act on, which is the distinction that matters for
+		// retry behaviour.
+		return "invalid_request_error"
+	default:
+		// 5xx and anything unrecognised: a genuine server-side failure, where
+		// retry with backoff is the correct client action.
+		return "server_error"
 	}
-	return "server_error"
 }
 
 func applyRetryAfterHeader(w http.ResponseWriter, err error) {
