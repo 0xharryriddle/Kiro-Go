@@ -335,22 +335,29 @@ func (h *Handler) invokeBedrockStream(w http.ResponseWriter, flusher http.Flushe
 		if evtName == "" || evtName == "chunk" {
 			evtName = innerEventType(anthropicJSON)
 		}
+		// A failed write means the CLIENT went away, not that Bedrock broke, so it
+		// is tagged (writeAnthropicSSE) and classified separately below. streamedAny
+		// is set only after the write succeeds so it means what it says: bytes
+		// actually reached the client.
+		if werr := writeAnthropicSSE(w, flusher, evtName, anthropicJSON); werr != nil {
+			return werr // stop reading; disposition decided by the classifier
+		}
 		streamedAny = true
-		_, werr := fmt.Fprintf(w, "event: %s\ndata: %s\n\n", evtName, anthropicJSON)
-		if werr != nil {
-			return werr // client disconnected; stop reading
-		}
-		if flusher != nil {
-			flusher.Flush()
-		}
 		return nil
 	})
 
-	if streamErr != nil && !streamedAny {
-		// Failed before any client bytes → allow account failover.
+	switch classifyBedrockStreamOutcome(streamErr, streamedAny) {
+	case bedrockStreamClientGone:
+		// The customer hung up. Not the account's fault and nobody is left to fail
+		// over for, so record nothing — matching the custom_api forwarder's
+		// contract (custom_api_forward.go:445-447). Charging this to the account
+		// cooled a healthy one after three departing clients.
+		logger.Debugf("[Bedrock] client disconnected mid-stream (account %s): %v", p.account.ID, streamErr)
+		return nil
+	case bedrockStreamFailover:
+		// Upstream failed before any client bytes → allow account failover.
 		return streamErr
-	}
-	if streamErr != nil {
+	case bedrockStreamPartialFailure:
 		// Partial stream: the client already got a prefix so we cannot fail over,
 		// but this is a FAILURE, not a success. Recording it as a success cleared
 		// the account's error state and cooldown, letting an account that throws

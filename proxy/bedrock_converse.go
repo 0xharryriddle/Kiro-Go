@@ -762,13 +762,13 @@ func (h *Handler) invokeBedrockConverseAnthropicStream(w http.ResponseWriter, fl
 	var streamedAny bool
 	emit := func(anthropicJSON []byte) error {
 		evtName := innerEventType(anthropicJSON)
-		streamedAny = true
-		if _, werr := fmt.Fprintf(w, "event: %s\ndata: %s\n\n", evtName, anthropicJSON); werr != nil {
+		// A failed write means the CLIENT went away, not that Bedrock broke; tag it
+		// so the classifier below does not charge the account. streamedAny is set
+		// only after a successful write so it means bytes really reached the client.
+		if werr := writeAnthropicSSE(w, flusher, evtName, anthropicJSON); werr != nil {
 			return werr
 		}
-		if flusher != nil {
-			flusher.Flush()
-		}
+		streamedAny = true
 		return nil
 	}
 
@@ -779,15 +779,21 @@ func (h *Handler) invokeBedrockConverseAnthropicStream(w http.ResponseWriter, fl
 		streamErr = conv.finalize(emit)
 	}
 
-	if streamErr != nil && !streamedAny {
+	switch classifyBedrockStreamOutcome(streamErr, streamedAny) {
+	case bedrockStreamClientGone:
+		// The customer hung up: not the account's fault and nobody to fail over
+		// for, so record nothing (custom_api_forward.go:445-447).
+		logger.Debugf("[Bedrock] client disconnected mid-stream (account %s): %v", p.account.ID, streamErr)
+		return nil
+	case bedrockStreamFailover:
 		return streamErr
-	}
-	if streamErr != nil {
+	case bedrockStreamPartialFailure:
 		// Partial stream: cannot fail over, but this is a FAILURE, not a success.
 		// Recording success here cleared the account's error state and cooldown.
 		h.recordBedrockPartialFailure(p, streamErr)
 		return nil
-	} else if conv.emittedAny && !conv.sawMessageStop {
+	}
+	if conv.emittedAny && !conv.sawMessageStop {
 		logger.Warnf("[Bedrock] converse stream closed without messageStop (account %s); emitted synthetic terminal", p.account.ID)
 	}
 	h.recordBedrockSuccess(p, conv.inputTokens, conv.outputTokens, reqStart)
@@ -879,10 +885,15 @@ func (h *Handler) invokeBedrockConverseOpenAIStream(w http.ResponseWriter, flush
 		oconv.outputTokens = conv.outputTokens
 	}
 
-	if streamErr != nil && !oconv.started {
+	switch classifyBedrockStreamOutcome(streamErr, oconv.started) {
+	case bedrockStreamClientGone:
+		// The customer hung up: no terminal chunk to write, no account penalty,
+		// no failover (custom_api_forward.go:445-447).
+		logger.Debugf("[Bedrock] client disconnected mid-stream (account %s): %v", p.account.ID, streamErr)
+		return nil
+	case bedrockStreamFailover:
 		return streamErr
-	}
-	if streamErr != nil {
+	case bedrockStreamPartialFailure:
 		// Partial stream: cannot fail over, but this is a FAILURE, not a success.
 		// Recording success here cleared the account's error state and cooldown.
 		//

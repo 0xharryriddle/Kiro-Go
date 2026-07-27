@@ -26,6 +26,8 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+
+	"kiro-go/logger"
 )
 
 // bedrockOpenAIDefaultMaxTokens is used when an OpenAI request omits max_tokens;
@@ -582,11 +584,16 @@ func (c *bedrockOpenAIStreamConv) chunkEnvelope(delta map[string]interface{}, fi
 }
 
 // writeChunk marshals and writes one SSE chunk, flushing when a flusher is set.
-// A write error (client disconnect) is returned so the read loop can stop.
+// A write error means the CLIENT went away, so it is tagged with clientGone and
+// returned to stop the read loop; the caller's classifier then declines to charge
+// the account for a departed customer (see bedrock_client_disconnect.go).
+//
+// c.started is set only AFTER a successful write, so "the client received bytes"
+// cannot be claimed for a chunk that failed to reach it.
 func (c *bedrockOpenAIStreamConv) writeChunk(w io.Writer, flusher http.Flusher, chunk map[string]interface{}) error {
 	data, _ := json.Marshal(chunk)
 	if _, err := fmt.Fprintf(w, "data: %s\n\n", data); err != nil {
-		return err
+		return clientGone(err)
 	}
 	if flusher != nil {
 		flusher.Flush()
@@ -732,11 +739,19 @@ func (h *Handler) invokeBedrockOpenAIStream(w http.ResponseWriter, flusher http.
 		return conv.onEvent(w, flusher, anthropicJSON)
 	})
 
-	if streamErr != nil && !conv.started {
-		// Failed before any client bytes -> allow account failover.
+	switch classifyBedrockStreamOutcome(streamErr, conv.started) {
+	case bedrockStreamClientGone:
+		// The customer hung up. Not the account's fault, and there is nobody left
+		// to serve a terminal chunk to, so write nothing further and record
+		// nothing — matching custom_api_forward.go:445-447. Returning the error
+		// here instead made the dispatch loop exclude this account and retry the
+		// next one against the same dead client, penalising the whole pool.
+		logger.Debugf("[Bedrock] client disconnected mid-stream (account %s): %v", p.account.ID, streamErr)
+		return nil
+	case bedrockStreamFailover:
+		// Upstream failed before any client bytes -> allow account failover.
 		return streamErr
-	}
-	if streamErr != nil {
+	case bedrockStreamPartialFailure:
 		// Partial stream: cannot fail over, but this is a failure, not a success.
 		// Still finish the SSE so the client sees a terminated stream rather than
 		// a truncated one.

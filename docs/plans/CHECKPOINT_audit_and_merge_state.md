@@ -572,9 +572,82 @@ All three event-stream readers in the repo now carry the `framesSeen` guard.
 
 Cumulative: **71 defects**.
 
+#### Correction to the round-12 live-corpus paragraph (written after deploy)
+
+The paragraph above overstated its evidence and is corrected here rather than
+silently edited. The claimed signature — `outputTokens: 0` with `ttfbMs` absent —
+is **not** discriminating: `markFirstByte` is only reachable from streaming code
+paths, so `ttfbMs` is *structurally* absent on every NON-streaming row regardless
+of health. The "0 of 667 comparable controls" figure only sampled streaming rows,
+which is exactly what made a structural artifact look like a signal.
+
+Measured after the round-12 deploy: of 82 successful rows, streaming 81/81 carry
+`ttfbMs`, non-stream 1/1 does not — and that single matching row had 939 output
+tokens, i.e. a perfectly healthy non-streaming response. The two historical rows
+are therefore **unexplained, not evidence of this defect**; the corpus supplies no
+live evidence either way. Defect 71 stands on the code-level proof at the reader,
+which was always the stronger claim.
+
+### Round-13 — client disconnects charged to the account (4 sites)
+
+Found by asking the class question in the other direction: round 11/12 asked "did
+an earlier fix reach every site?", this round asks "does a signal that all four
+sites already handle actually MEAN what they assume?". It does not — the Bedrock
+readers deliver events by writing to the client inside the reader callback, and
+`readBedrockEventStream` propagates a callback error verbatim
+(`bedrock_eventstream.go:53-57`), so a failed write to a departed CLIENT arrived
+at all four callers as the same opaque `streamErr` as an upstream Bedrock fault.
+
+| # | Defect | Site | Notes |
+|---|---|---|---|
+| 72 | **A customer hanging up mid-answer was charged to the serving account as an upstream failure.** The write error reached `recordBedrockPartialFailure` → `pool.RecordError`, so at 3 departing clients the account is cooled for a minute (`pool/account.go:878`) and at 5 its circuit breaker opens for 30s (`pool/account.go:149`). Operator error dashboards also blamed Bedrock for customers closing connections | `proxy/bedrock.go:339`, `proxy/bedrock_openai.go:588`, `proxy/bedrock_converse.go:766`, `:864` | Writes now tagged via `clientGone` / `writeAnthropicSSE`; `classifyBedrockStreamOutcome` routes client-gone to "record nothing" |
+| 73 | **A disconnect on the FIRST chunk made one departed client penalise the whole pool.** With `started`/`streamedAny` still false the tagged error was returned to the dispatch loop, which sets `excluded[account.ID]` and calls `handleAccountFailure`, then retries the next account — whose write to the same dead socket fails identically, walking the pool and penalising every healthy account it touches (`handler.go:1741-1749`, `:2876-2882`) | same four sites | The client-gone check is evaluated BEFORE `started`, so a first-chunk disconnect is never mistaken for a pre-stream upstream fault |
+
+The correct contract already existed in the sibling forwarder and was simply never
+mirrored: `custom_api_forward.go:445-447` does `return nil // client gone; nothing
+to fail over to` — no account penalty, no failover, no billing. `streamedAny` /
+`c.started` is now also set only AFTER a successful write, so "the client received
+bytes" can no longer be claimed for a chunk that failed to reach it.
+
+Two RED-proven defect tests drive the real entrypoints (`invokeBedrockStream`,
+`invokeBedrockOpenAIStream`) over a hermetic upstream through a
+`failOnWriteRecorder` that returns `syscall.EPIPE`, and assert on the observable
+consequence — the account's `ErrorCount` via `pool.DiagnosticsFor`, not an
+internal call count. Four controls, written before the fix: a genuine upstream
+partial failure still penalises the account, a pre-byte upstream failure still
+fails over, a clean stream to a live client still succeeds and still meters
+tokens, and a table test pins all four dispositions. Neutralizing `isClientGone`
+to `return false` flips exactly the two defect tests plus the classifier unit test
+and leaves all three behavioural controls green.
+
+Cumulative: **73 defects**.
+
 ---
 
 ## 4. Remaining work
+
+### R13-followup — Bedrock paths never emit a request trace (CANDIDATE, not fixed)
+
+Found while verifying round 13 and deliberately left alone: it is PRE-EXISTING and
+untouched by that change (`git diff` confirms `handler.go` was not modified in
+round 13).
+
+Both Bedrock dispatch branches call `tr.beginAttempt(account)` and then `return`
+without ever calling `tr.endAttempt` or `h.emitTrace`
+(`handler.go:1737-1752`, `:2872-2885`). The Bedrock accounting path instead uses
+the LEGACY log helpers (`recordSuccessLog` / `recordFailureWithDetails` via
+`bedrock.go:528`), so Bedrock traffic produces a request-log row but no structured
+trace row: no `Attempts[]`, no `TTFBMs`, no `RequestID` correlation, and
+`AttemptCount` is never populated for these requests.
+
+Consequence is observability-only — billing, pool health, and failover are all
+unaffected because those go through the legacy helpers. Worth noting that this is
+also why the round-12 live-corpus reasoning was weak: the corpus's structured
+fields simply do not exist for Bedrock requests.
+
+Fixing it means routing the Bedrock branches through `emitTrace` like the Kiro
+paths, which is a larger change than round 13 and should be its own round with its
+own RED tests.
 
 ### R1 — Complete the merge — DONE
 Committed as `6158c24`, a real two-parent merge (`99dda52` + upstream `ec4ba56`);
