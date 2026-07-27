@@ -721,6 +721,10 @@ const maxEventStreamMessageBytes = 16 * 1024 * 1024
 // allocating gigabytes.
 var errEventStreamFrameTooLarge = errors.New("event-stream: frame totalLength exceeds maximum")
 
+// errKiroEmptyStream reports an HTTP 200 whose body carried no event-stream data
+// at all. It is the Kiro-path counterpart of errBedrockEmptyStream.
+var errKiroEmptyStream = errors.New("kiro stream: upstream returned no events")
+
 // parseEventStream decodes an AWS binary Event Stream response body.
 func parseEventStream(body io.Reader, callback *KiroStreamCallback) error {
 	if callback == nil {
@@ -738,16 +742,40 @@ func parseEventStream(body io.Reader, callback *KiroStreamCallback) error {
 	// no longer placeholder-only and every delta flows normally.
 	suppressPlaceholderReasoning := config.GetThinkingConfig().SuppressPlaceholderReasoning
 
+	// framesSeen distinguishes "the stream ended normally" from "no frame ever
+	// arrived". Both used to return nil, and on the Claude/OpenAI streaming paths
+	// that nil is the ONLY failover signal — so an HTTP 200 with an empty body was
+	// served to the customer as a successful empty answer: no failover to a healthy
+	// account, pool.RecordSuccess CLEARING the offending account's error count and
+	// cooldown (pool/account.go:818), the customer key billed an estimated input
+	// total for zero output (handler.go:2144-2146, :2163-2167), and the client sent
+	// stop_reason "end_turn" as though the empty response were real.
+	//
+	// 8f49a4b fixed exactly this in both Bedrock readers (readBedrockEventStream,
+	// readBedrockConverseEventStream) and left this third reader — the one that
+	// serves the main Kiro path — unguarded. This is that same guard.
+	//
+	// Counted for any prelude that ARRIVES, including a frame the loop then skips
+	// as malformed: a skipped frame still proves the upstream responded, which is
+	// the distinction this guard exists to make (and which
+	// TestEventStreamHandlesUndersizedFrameLength pins).
+	framesSeen := 0
 	for {
 		// Prelude: 12 bytes (total_len + headers_len + crc)
 		prelude := make([]byte, 12)
 		_, err := io.ReadFull(body, prelude)
 		if err == io.EOF {
-			break
+			// Clean EOF on a frame boundary is a normal end of stream — but only
+			// when at least one frame actually arrived.
+			if framesSeen > 0 {
+				break
+			}
+			return errKiroEmptyStream
 		}
 		if err != nil {
 			return err
 		}
+		framesSeen++
 
 		totalLength := int(prelude[0])<<24 | int(prelude[1])<<16 | int(prelude[2])<<8 | int(prelude[3])
 		headersLength := int(prelude[4])<<24 | int(prelude[5])<<16 | int(prelude[6])<<8 | int(prelude[7])
