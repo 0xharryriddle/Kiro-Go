@@ -900,7 +900,37 @@ var probeKiroApiKey = func(key, region string) (*config.AccountInfo, error) {
 func resolveApiKeyRegion(key, explicitRegion string) (string, *config.AccountInfo, bool, error) {
 	targetRegions := kiroApiKeyCandidateRegions()
 	if explicit := strings.TrimSpace(explicitRegion); explicit != "" {
-		targetRegions = []string{explicit}
+		// Validate and NORMALIZE before the value can be probed or persisted, the
+		// same guard handleAdminAddKiroApiKey applies to its own explicit region
+		// (see admin_bot_api.go:675) and every sibling admin route already applies
+		// (kiro_apikey_admin.go:186, :353; handler.go:6480).
+		//
+		// This helper is the shared chokepoint for the callers that DON'T validate
+		// first: apiAddAccount (handler.go:4270) forwards a caller-supplied
+		// account.Region straight in, and whatever comes back is written to
+		// account.Region and persisted. Two consequences, both proven by test:
+		//
+		//   - a malformed label ("bogus") is stored verbatim, but
+		//     regionalizeURLForRegion refuses that shape and silently leaves the
+		//     traffic on us-east-1 — so the stored region bucket disagrees with
+		//     where requests actually go;
+		//   - a case variant ("EU-Central-1") is stored unnormalized, and since
+		//     every other path lowercases before comparing, the bucket does not
+		//     match the one they compute.
+		//
+		// Either way dedup is keyed on (UserId, region), so the SAME upstream
+		// account can be added a second time under the region it really serves:
+		// two pool slots for one Kiro account, doubling its routing weight and
+		// double-counting its quota in /admin/pool.
+		//
+		// Returned retryable=false: a malformed region is a caller error, so
+		// callers map it to 400 rather than 502.
+		normalized, ok := validateRegionOverride(explicit)
+		if !ok || normalized == "" {
+			return "", nil, false, fmt.Errorf(
+				"region must be a valid AWS region label (e.g. us-east-1), got %q", explicit)
+		}
+		targetRegions = []string{normalized}
 	}
 
 	var errs []string
