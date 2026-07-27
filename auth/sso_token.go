@@ -11,6 +11,37 @@ import (
 	"github.com/google/uuid"
 )
 
+// ssoFlowError builds the error for a non-2xx response in the SSO device flow.
+//
+// The body is deliberately NOT included. These endpoints return credentials in
+// their bodies — /client/register returns `clientSecret`, /session/device
+// returns the device session `token` — and the resulting error does not stay
+// local: apiImportSsoToken (proxy/handler.go) appends err.Error() to an
+// `errors` slice that is encoded straight into the API response body. So
+// echoing the body handed a caller the very secrets the flow was establishing,
+// on any non-2xx.
+//
+// The OAuth `error` code IS kept when the body parses as JSON: it is the field
+// that tells an operator "invalid_client_metadata" from "access_denied", it is
+// a fixed vocabulary rather than free text, and it never carries a credential.
+// Everything else about the body is dropped.
+func ssoFlowError(statusCode int, respBody []byte) error {
+	var parsed struct {
+		Error string `json:"error"`
+	}
+	if json.Unmarshal(respBody, &parsed) == nil {
+		if code := parsed.Error; code != "" {
+			// Bound it: the code is short by definition, and a hostile upstream
+			// could otherwise put arbitrary text in this field.
+			if len(code) > 64 {
+				code = code[:64] + "...(truncated)"
+			}
+			return fmt.Errorf("HTTP %d: %s", statusCode, code)
+		}
+	}
+	return fmt.Errorf("HTTP %d", statusCode)
+}
+
 // ImportFromSsoToken 从 SSO Token (x-amz-sso_authn) 导入账号
 func ImportFromSsoToken(bearerToken, region string) (accessToken, refreshToken, clientID, clientSecret string, expiresIn int, err error) {
 	if region == "" {
@@ -97,7 +128,7 @@ func registerDeviceClient(oidcBase, startUrl string) (clientID, clientSecret str
 
 	if resp.StatusCode != 200 {
 		respBody, _ := io.ReadAll(resp.Body)
-		return "", "", fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(respBody))
+		return "", "", ssoFlowError(resp.StatusCode, respBody)
 	}
 
 	var result struct {
@@ -128,7 +159,7 @@ func startDeviceAuth(oidcBase, clientID, clientSecret, startUrl string) (deviceC
 
 	if resp.StatusCode != 200 {
 		respBody, _ := io.ReadAll(resp.Body)
-		return "", "", 0, fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(respBody))
+		return "", "", 0, ssoFlowError(resp.StatusCode, respBody)
 	}
 
 	var result struct {
@@ -175,7 +206,7 @@ func getDeviceSessionToken(portalBase, bearerToken string) (string, error) {
 
 	if resp.StatusCode != 200 {
 		respBody, _ := io.ReadAll(resp.Body)
-		return "", fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(respBody))
+		return "", ssoFlowError(resp.StatusCode, respBody)
 	}
 
 	var result struct {
@@ -211,7 +242,7 @@ func acceptUserCode(oidcBase, userCode, deviceSessionToken string) (*deviceConte
 
 	if resp.StatusCode != 200 {
 		respBody, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(respBody))
+		return nil, ssoFlowError(resp.StatusCode, respBody)
 	}
 
 	var result struct {
@@ -245,7 +276,7 @@ func approveAuth(oidcBase string, deviceContext *deviceContextInfo, deviceSessio
 
 	if resp.StatusCode != 200 {
 		respBody, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(respBody))
+		return ssoFlowError(resp.StatusCode, respBody)
 	}
 	return nil
 }
