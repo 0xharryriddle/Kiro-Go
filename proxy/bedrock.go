@@ -473,19 +473,50 @@ func envFloatDefault(name string, def float64) float64 {
 
 // ---- small JSON usage extractors (tolerant, allocation-light) ----
 
-// extractInputTokens reads message.usage.input_tokens from a message_start event.
+// extractInputTokens reads message.usage input tokens from a message_start event.
+//
+// Cache tokens are ADDED to input_tokens, not ignored. In the native Anthropic
+// wire format input_tokens counts only the FRESH (uncached) prefix; tokens served
+// from cache are reported separately as cache_read_input_tokens, and tokens
+// written to cache as cache_creation_input_tokens. The upstream charges for all
+// three, and buildBedrockBody preserves cache_control, so these fields are live
+// on exactly this path.
+//
+// Reading only input_tokens therefore under-billed every cache-heavy request:
+// 50 fresh + 100 cache-write + 200 cache-read was recorded as 50 tokens instead
+// of 350, against the customer key's TokenLimit, TPM accounting, per-account and
+// global totals, per-model usage, and token-derived credits.
+//
+// This matches how the Kiro path already computes the same figure internally —
+// `inputTokens = uncached + cacheRead + cacheWrite` (proxy/kiro.go:966). The
+// subtraction in billedClaudeInputTokens (cache_tracker.go:745) is a separate
+// concern: it de-duplicates the CLIENT-FACING usage map, where the cache fields
+// are reported alongside input_tokens and would otherwise be double-counted by
+// the reader.
 func extractInputTokens(eventJSON []byte) int {
 	var e struct {
 		Message struct {
-			Usage struct {
-				InputTokens int `json:"input_tokens"`
-			} `json:"usage"`
+			Usage bedrockUsageTokens `json:"usage"`
 		} `json:"message"`
 	}
 	if json.Unmarshal(eventJSON, &e) != nil {
 		return 0
 	}
-	return e.Message.Usage.InputTokens
+	return e.Message.Usage.totalInput()
+}
+
+// bedrockUsageTokens is the usage shape shared by the streaming and non-streaming
+// extractors, so the two can never disagree about what counts as input.
+type bedrockUsageTokens struct {
+	InputTokens              int `json:"input_tokens"`
+	OutputTokens             int `json:"output_tokens"`
+	CacheCreationInputTokens int `json:"cache_creation_input_tokens"`
+	CacheReadInputTokens     int `json:"cache_read_input_tokens"`
+}
+
+// totalInput returns every input token the upstream will charge for.
+func (u bedrockUsageTokens) totalInput() int {
+	return u.InputTokens + u.CacheCreationInputTokens + u.CacheReadInputTokens
 }
 
 // extractOutputTokens reads usage.output_tokens from a message_delta event.
@@ -501,18 +532,18 @@ func extractOutputTokens(eventJSON []byte) int {
 	return e.Usage.OutputTokens
 }
 
-// extractNonStreamUsage reads usage.{input,output}_tokens from a full response.
+// extractNonStreamUsage reads usage input/output tokens from a full response.
+// Input includes cache-read and cache-creation tokens for the reason documented
+// on extractInputTokens: the upstream charges for all three, and counting only
+// the fresh prefix under-bills every cache-heavy request.
 func extractNonStreamUsage(respJSON []byte) (int, int) {
 	var r struct {
-		Usage struct {
-			InputTokens  int `json:"input_tokens"`
-			OutputTokens int `json:"output_tokens"`
-		} `json:"usage"`
+		Usage bedrockUsageTokens `json:"usage"`
 	}
 	if json.Unmarshal(respJSON, &r) != nil {
 		return 0, 0
 	}
-	return r.Usage.InputTokens, r.Usage.OutputTokens
+	return r.Usage.totalInput(), r.Usage.OutputTokens
 }
 
 // innerEventType reads the "type" field of an Anthropic event for SSE naming.
