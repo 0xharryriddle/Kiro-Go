@@ -224,8 +224,30 @@ why the round-12 corpus reasoning was weak for Bedrock.
 
 ## 4. EXTERNAL landscape (research subagents, not verified here)
 
-Three researchers ran against public sources. Summaries retained at
+Four researchers ran against public sources; three produced usable output.
+Summaries retained at
 `/home/harry-riddle/.hermes/cache/delegation/subagent-summary-{0,1,2}-2026072*.txt`.
+
+**Read this section knowing how the research was actually obtained.** The managed
+web-search/extract backend (Parallel) was returning HTTP 402 "Insufficient credit"
+for the whole pass — reproduced directly from the parent client, not merely
+reported by a child. Every researcher therefore fell back to `curl`/`urllib`
+against raw GitHub READMEs, the GitHub API, release feeds, and official docs.
+That is a real limitation on *discovery*: projects nobody named up front were never
+surfaced, so absence from the list below is not evidence of absence in the market.
+Claims that were read directly from a project's own README or docs are sound.
+
+**One researcher's central caveat is false and is not repeated here.** The
+landscape researcher concluded "the promised target inventory was not actually
+present" and consequently marked every target-side comparison UNVERIFIED. Checking
+its own transcript: the inventory *was* delivered (4,663 characters of it, in the
+`context` field — the live log truncates for display only). It had ground truth and
+declined to use it. Its competitor-side data is retained below; its target-side
+"gaps" were re-derived here against the actual code rather than accepted.
+
+A second researcher asked for a repository URL and returned no research at all.
+Subagents cannot call `clarify`, so a question is a dead end — the task simply
+burned. Worth remembering when dispatching: state the target inline or expect this.
 
 The market has split into three families: enterprise/API-key gateways (LiteLLM,
 Bifrost, Portkey, Envoy AI Gateway, Higress, APISIX), distribution/billing
@@ -252,6 +274,25 @@ assessment of each against the measured workload:
 | Redis/shared state for multi-replica | Not a gap **for this deployment**: single node at 0.45% of its write ceiling. Do not build. |
 | Embeddings / batches / audio / files endpoints | Absent (CODE-VERIFIED). Zero demand in corpus: 100% of traffic is chat/responses on one model family. Low priority. |
 | Unknown request fields silently ignored | CODE-VERIFIED (`json.Unmarshal` into narrow structs, no `DisallowUnknownFields`). Real correctness risk: a client believes `tool_choice`/`stop`/`response_format` were honoured when they were dropped. |
+
+### 4b. Candidate gaps from the second research batch — TESTED, mostly false
+
+A second batch of researchers named further differentiators. Rather than append them
+as "gaps", each was checked against the code. The check changed the answer often
+enough to be worth recording:
+
+| Candidate | Verdict after checking the code |
+|---|---|
+| Hashed key storage | **ALREADY SHIPPED — not a gap.** `config/apikeys.go:5,24` hashes customer keys with sha256, and carries a comment explaining why sha256 rather than bcrypt/argon2 (keys are high-entropy random, so a slow KDF buys nothing). `config.go` additionally hashes refresh tokens and Kiro API keys. My first search for this returned *zero* hits and I nearly recorded it as missing — the pattern was case-wrong, not the feature absent. |
+| SSRF protection on operator-supplied upstream URLs | **PARTIAL, and low value here.** `normalizeBaseURL` (`proxy/custom_api_forward.go:288-312`) requires an http(s) scheme, a non-empty host, and rejects query/fragment; it is wired into the admin add path (`admin_bot_api.go:1348`). What it does *not* do is block loopback/link-local/private ranges. But this input is operator-supplied behind admin auth, not customer-supplied — so it is hardening, not a live hole. |
+| Least-busy routing, capability-aware fallback, route explainability, dry-run route simulation, MCP gateway, OIDC/RBAC admin, envelope encryption, distributed refresh lock | Genuinely absent. Of these, only **route explainability** is cheap and useful at this scale (the trace model already records per-attempt selection data; it just never records *why* an account was chosen). The distributed refresh lock is meaningless single-node. MCP gateway, OIDC/RBAC, and envelope encryption are product decisions, not defects. |
+
+**Method note, because it caught me out.** Nine of these were flagged as "gaps" by a
+keyword scan of my own roadmap versus the reports. I then checked two of them against
+the code, and *both* came back shipped or partly shipped — a 2-for-2 false-positive
+rate on the only ones I verified. Keyword absence from a document is not evidence of
+absence from a codebase, and none of the remaining seven should be treated as a
+finding until it too is traced to code.
 
 ## 5. Prioritised roadmap
 
