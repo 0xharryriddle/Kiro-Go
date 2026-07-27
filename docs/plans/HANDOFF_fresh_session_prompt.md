@@ -1,7 +1,7 @@
 # Kiro-Go — fresh-session handoff prompt
 
 Paste this whole file as the opening message of the new session. Every fact below
-was verified by command output at handoff time (2026-07-27, HEAD `5c748be`).
+was verified by command output at handoff time (2026-07-27, HEAD `6911dcd`).
 Where something is unverified or unknown, it says so — do not upgrade those to
 facts without checking.
 
@@ -11,7 +11,7 @@ facts without checking.
 
 Continue the Kiro-Go audit-and-harden effort. It is not "finish a feature"; it is
 **find real defects, prove them, fix them, verify, deploy**. The previous session
-closed 62 defects across seven rounds. There is no deadline and no fixed list —
+closed 67 defects across nine rounds. There is no deadline and no fixed list —
 work the highest-risk unreviewed surface, then the next.
 
 Repo: `/home/harry-riddle/dev/github.com/0xharryriddle/Kiro-Go`
@@ -23,30 +23,30 @@ Branch: `harry` (tracks `origin/harry`)
 
 | Fact | Value |
 |---|---|
-| HEAD | `5c748be` |
+| HEAD | `6911dcd` |
 | Remote | `origin/harry` identical (0 ahead / 0 behind) |
 | Working tree | clean |
-| Tests | 883 pass across `config` `pool` `auth` `proxy` |
+| Tests | 926 pass across `config` `pool` `auth` `proxy` (top-level funcs; confirmed two ways — depth-0 `=== RUN` lines and declared `func Test` count) |
 | `-race` | clean, 0 data races |
 | `go vet` / `gofmt` | clean tree-wide |
 | Live container | healthy, version **1.1.5** |
-| Deployed image built from | `16a71ad` (HEAD is one tests-only commit ahead, so no redeploy is pending) |
+| Deployed image built from | `6911dcd` — running image digest confirmed identical to the verified build, nothing pending |
 
 Recent commits (newest first):
 
 ```
+6911dcd fix(websearch): bill every search round to the account that served it
+2723b7f fix(auth): stop echoing SSO device-flow response bodies into errors
 5c748be test(tokens): pin the wire-vs-report estimator safety invariant
 16a71ad fix(admin): bound request bodies on the admin-bot API surface
 177f975 docs(checkpoint): record the unauthenticated surface as open by design
 5b6fa90 fix(stream): stop labelling OpenAI client faults as server errors
 5172d4b fix(stream): close three defects in the failure-frame observer
 3242fff fix(stream): correct three Claude error-type mappings against the official enum
-cf8ed84 test(stream): pin that exception detection cannot break a working stream
-7bfbbb0 feat(stream): classify Claude mid-stream errors and observe upstream exception frames
 ```
 
 **Read `docs/plans/CHECKPOINT_audit_and_merge_state.md` first.** It is the
-authoritative record: all 62 defects, the rejected claims (so they are not
+authoritative record: all 67 defects, the rejected claims (so they are not
 re-litigated), and every deliberate non-decision with its reasoning.
 
 ---
@@ -64,7 +64,7 @@ re-litigated), and every deliberate non-decision with its reasoning.
   facts. Several were wrong; several probes had *inverted* assertions that
   "confirmed" defects that did not exist.
 - **Adversarial review is expected.** Dispatch subagents on non-trivial changes,
-  especially your own. 15 of the 62 defects were regressions introduced by
+  especially your own. 15 of the 67 defects were regressions introduced by
   earlier fixes in the same series, each caught by re-reviewing the diff — never
   by trusting the original reasoning.
 - **Docs are part of the change set.** Update the checkpoint in the same pass as
@@ -137,16 +137,33 @@ present. Grep for their **values** or their effects instead.
 
 ### 6a. Unreviewed files with no test coverage
 
-| File | Lines | Why it matters |
-|---|---|---|
-| `proxy/websearch_loop.go` | 600 | agentic loop; touched by recent fixes but never audited whole |
-| `proxy/bedrock.go` | 502 | the ONLY path where prompt caching actually works |
-| `proxy/request_trace_recorder.go` | 483 | decides what reaches disk; PII/redaction relevance |
-| `auth/sso_token.go` | 338 | credential handling |
+Line counts below are measured, not remembered (`wc -l`).
+
+| File | Lines | State | Why it matters |
+|---|---|---|---|
+| `proxy/admin_bot_api.go` | 1411 | **UNREVIEWED** (bodies bounded in `16a71ad`, no sibling test) | largest un-audited file in the repo; admin surface |
+| `proxy/bedrock_converse.go` | 893 | **UNREVIEWED** | Bedrock Converse translation |
+| `proxy/bedrock_openai.go` | 794 | **UNREVIEWED** | OpenAI↔Bedrock translation |
+| `proxy/custom_api_forward.go` | 634 | **UNREVIEWED** | transparent passthrough; trust boundary |
+| `proxy/bedrock.go` | 630 | **UNREVIEWED** | the ONLY path where prompt caching actually works |
+| `proxy/request_trace_recorder.go` | 483 | **UNREVIEWED** | decides what reaches disk; PII/redaction relevance |
+| `proxy/websearch_loop.go` | 691 | audited round 9 → defect #67 | the whole loop was read; accounting now pinned |
+| `auth/sso_token.go` | 378 | audited round 9 → defect #66 | credential handling; redaction test added |
 
 Method that worked: find the largest non-test file lacking a sibling `_test.go`,
 read it, look for (a) unbounded reads/allocations, (b) inconsistency with a
-sibling that already does it right, (c) invariants nothing pins.
+sibling that already does it right, (c) invariants nothing pins, (d) values
+accumulated across iterations of a loop where only the last one survives.
+
+**One caveat learned in round 9:** `proxy/websearch_loop.go` had no
+`websearch_loop_test.go` but FIVE other test files exercised its symbols, so
+"no sibling test" overstates how uncovered a file is. Run
+`grep -l '<symbol>' proxy/*_test.go` before assuming zero coverage.
+
+**Second caveat:** the round-9 audit began from a stale task list that named
+three files as unreviewed; two had already been handled, and one line-count loop
+silently reported `0 lines` for all three because the paths were wrong. Re-measure
+before trusting any inventory in this document.
 
 ### 6b. Blocked pending observation — do not force
 

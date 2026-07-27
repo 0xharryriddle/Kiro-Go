@@ -420,6 +420,59 @@ destroying multi-turn.
 
 Cumulative: **65 defects**.
 
+### Round-9 — unreviewed files with no sibling test (`2723b7f`, `6911dcd`)
+
+Targets picked for lacking a sibling `_test.go`: `auth/sso_token.go` and
+`proxy/websearch_loop.go` (338 and 620 lines as audited; 378 and 691 after these
+fixes).
+
+Correction to how they were chosen: `auth/sso_token.go` genuinely had zero test
+coverage, but `proxy/websearch_loop.go` did NOT — five other test files already
+exercised its symbols (`websearch_test.go`, `websearch_max_uses_test.go`,
+`websearch_multi_skip_test.go`, `websearch_loop_provider_guard_test.go`, and the
+new billing test). A missing `<file>_test.go` is a weak proxy for "untested"; the
+accounting defect below survived precisely because the existing five tests
+covered content shape and provider guards, not billing.
+
+| # | Defect | Site | Notes |
+|---|---|---|---|
+| 66 | **SSO device-flow errors echoed raw HTTP response bodies, leaking credentials to the API caller.** Five sites did `fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(respBody))`. Two of those endpoints return secrets: `/client/register` returns `clientSecret`, `/session/device` returns the device session `token`. Not log-only — the leak path was traced end to end: raw body → error string → the `errors` slice in `apiImportSsoToken` (`proxy/handler.go:5901`, called at `:5929`) → `strings.Join(errors, "; ")` → **JSON response body**. So any non-2xx during SSO import handed the caller the very credentials the flow was establishing | `auth/sso_token.go:100,131,178,214,248` | One `ssoFlowError(status, body)` helper. Keeps the OAuth `error` code when the body parses as JSON (bounded to 64 chars) and otherwise reports `HTTP %d` alone; the body is never echoed. RED-proven at all five: the test printed `clientSecret: "CLIENT-SECRET-MUST-NOT-REACH-THE-CALLER"` verbatim before the fix. Diagnostics deliberately verified to SURVIVE — over-redaction destroyed diagnostic markers twice earlier in this series, so a probe confirmed the result is still `HTTP 400: invalid_client_metadata` |
+| 67 | **The web-search loop dropped every intermediate round's tokens and billed the whole request to one account.** Two accounting bugs in one block. (a) `inputTokens := round.inputTokens` read only the TERMINAL round while credits were accumulated with `totalCredits +=` — the disagreement between the two adjacent lines is what shows the token half was an oversight, not a design choice. A 2-round search consuming 500 then 700 input tokens reported 700. (b) All of it went to `lastAccountID`, which is overwritten each round, even though the pool's LRU (`GetNextForModelExcluding` advances `lastDispatchSeq` per dispatch) deliberately hands consecutive rounds to DIFFERENT accounts | `proxy/websearch_loop.go` | Per-round `webSearchAccountUsage` map; each account settles for the rounds it actually served, and `roundInputTokens` sums all rounds. Measured before/after on a real 2-round loop: `servedBy=[bill-B bill-C]` → B=500, C=756, uninvolved A=0, total 1256 = 1200 input + 56 estimated output |
+
+#67's damage is not only the operator-facing per-account totals — those feed
+quota-aware routing, which prefers the account with the most remaining quota, so
+bad numbers flow straight back into routing decisions. The dropped-token half
+lands on `recordSuccessForApiKey`, which drives `TokenLimit` auto-disable: a
+token-budgeted customer key could overrun its budget by the whole of every
+non-final round.
+
+Two method notes worth keeping, both caught by neutralizing rather than by review:
+
+- The first D1 assertion was a **false green**. It checked the POOL total, but
+  per-account settling bills from a different variable (`perAccount[].inputTokens`),
+  so reverting the fix left the pool total correct and the test still passed. It was
+  re-pointed at the two surfaces the dropped value actually reaches — the customer
+  key's `TokensUsed` and the client's reported `usage.input_tokens` — and now fails
+  on both when neutralized (756 vs 1200, and 700 vs 1200).
+- The first version of the attribution assertion passed **vacuously**: with two
+  accounts, the MCP search between rounds consumes a dispatch slot and selection
+  returned to the same account (`servedBy=[bill-A bill-A]`), so "no account billed
+  for work it did not do" was never exercised. A third account makes consecutive
+  rounds land on genuinely different accounts.
+
+Selection order is deliberately NOT asserted — the picker is quota- and
+health-aware, so pinning a schedule would encode a guess. The test records which
+account served each round from the bearer token the proxy actually sent, and
+asserts the invariant against that ground truth.
+
+One production seam was added to make this provable: `mcpEndpointOverride`
+(`proxy/websearch.go`), empty in production, following the existing
+`kiroEndpoints` / `kiroHttpStore` convention. The multi-round loop cannot be
+exercised end to end without it, and cross-round accounting bugs are otherwise
+unprovable.
+
+Cumulative: **67 defects**.
+
 ---
 
 ## 4. Remaining work
