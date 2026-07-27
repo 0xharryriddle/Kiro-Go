@@ -794,9 +794,21 @@ func parseEventStream(body io.Reader, callback *KiroStreamCallback) error {
 		// why promoting these to fatal needs a real observed frame first. The
 		// stream continues exactly as before, so this cannot change behaviour
 		// for any traffic that works today.
-		if msgType := extractHeaderString(msgBuf[0:headersLength], ":message-type"); msgType == "exception" {
-			exceptionType := extractHeaderString(msgBuf[0:headersLength], ":exception-type")
-			logger.Warnf("[KiroStream] upstream exception frame: type=%q payloadBytes=%d", exceptionType, len(payloadBytes))
+		if headers := msgBuf[0:headersLength]; isUpstreamFailureFrame(headers, eventType) {
+			exceptionType := upstreamFailureLabel(headers, eventType)
+			// Count usage BEFORE skipping. A failure frame can still carry a
+			// usage block, and the pre-existing code fed every frame to
+			// updateTokensFromEvent before this branch existed — so skipping
+			// unconditionally silently stopped billing for those tokens. The
+			// upstream charged for them either way.
+			if len(payloadBytes) > 0 {
+				var failureEvent map[string]interface{}
+				if json.Unmarshal(payloadBytes, &failureEvent) == nil {
+					inputTokens, outputTokens = updateTokensFromEvent(failureEvent, inputTokens, outputTokens)
+				}
+			}
+			logger.Warnf("[KiroStream] upstream failure frame: type=%q payloadBytes=%d",
+				truncateForLog(exceptionType, maxLoggedExceptionType), len(payloadBytes))
 			if callback.OnUpstreamException != nil {
 				callback.OnUpstreamException(exceptionType, payloadBytes)
 			}
@@ -1226,6 +1238,60 @@ func firstBoolField(m map[string]interface{}, keys ...string) bool {
 		}
 	}
 	return false
+}
+
+// maxLoggedExceptionType bounds how much of an upstream-supplied failure label
+// reaches the log.
+//
+// The label comes from an event-stream string header, which the 16-bit length
+// field allows to be ~64 KiB. It is entirely upstream-controlled, so logging it
+// verbatim let a hostile or malfunctioning upstream write 60 KB — including
+// newlines, which can forge additional log lines — into the operator's log for
+// every failed frame. 200 bytes is far more than any real exception type
+// ("ThrottlingException", "ValidationException") and keeps the log readable.
+const maxLoggedExceptionType = 200
+
+// truncateForLog bounds a string for logging and marks it when shortened, so a
+// truncated value is never mistaken for the whole one.
+func truncateForLog(s string, max int) string {
+	if max <= 0 || len(s) <= max {
+		return s
+	}
+	return s[:max] + "...(truncated)"
+}
+
+// isUpstreamFailureFrame reports whether an event-stream frame signals an
+// upstream failure rather than carrying content.
+//
+// The predicate deliberately matches the sibling Bedrock reader
+// (bedrock_eventstream.go), which treats `:message-type` of "exception" OR
+// "error", the same two values on `:event-type`, and any non-empty
+// `:exception-type` as a failure. Matching only "exception" — as this did
+// initially — left `:message-type: error` frames silently discarded on the Kiro
+// path while the Bedrock path caught them, so the same upstream condition was
+// observable on one surface and invisible on the other.
+func isUpstreamFailureFrame(headers []byte, eventType string) bool {
+	messageType := extractHeaderString(headers, ":message-type")
+	if messageType == "exception" || messageType == "error" {
+		return true
+	}
+	if eventType == "exception" || eventType == "error" {
+		return true
+	}
+	return extractHeaderString(headers, ":exception-type") != ""
+}
+
+// upstreamFailureLabel returns the most specific available name for a failure
+// frame, preferring the dedicated header over the generic ones. Same precedence
+// as the Bedrock reader so the two surfaces report a given frame identically.
+func upstreamFailureLabel(headers []byte, eventType string) string {
+	if v := extractHeaderString(headers, ":exception-type"); v != "" {
+		return v
+	}
+	if eventType != "" {
+		return eventType
+	}
+	return extractHeaderString(headers, ":message-type")
 }
 
 // extractEventType extracts the event type string from AWS Event Stream message headers.
