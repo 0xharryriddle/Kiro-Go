@@ -883,8 +883,23 @@ func (h *Handler) invokeBedrockConverseOpenAIStream(w http.ResponseWriter, flush
 		return streamErr
 	}
 	if streamErr != nil {
-		logger.Warnf("[Bedrock] converse openai stream ended with error after partial output (account %s): %v", p.account.ID, streamErr)
-	} else if conv.emittedAny && !conv.sawMessageStop {
+		// Partial stream: cannot fail over, but this is a FAILURE, not a success.
+		// Recording success here cleared the account's error state and cooldown.
+		//
+		// This is the fourth of four Bedrock partial-stream sites; c65c161 fixed the
+		// other three (bedrock.go:358, bedrock_openai.go:744,
+		// bedrock_converse.go:788) and missed this one, so an account throwing
+		// repeated mid-stream Converse exceptions on the OpenAI surface kept
+		// clearing its own health via pool.RecordSuccess and stayed selectable.
+		//
+		// Still finish the SSE first (matching invokeBedrockOpenAIStream:743) so the
+		// client sees a terminated stream rather than a truncated one, and so the
+		// bytes already committed are not left mid-chunk.
+		oconv.finish(w, flusher)
+		h.recordBedrockPartialFailure(p, streamErr)
+		return nil
+	}
+	if conv.emittedAny && !conv.sawMessageStop {
 		logger.Warnf("[Bedrock] converse openai stream closed without messageStop (account %s); emitted synthetic terminal", p.account.ID)
 	}
 	oconv.finish(w, flusher)
