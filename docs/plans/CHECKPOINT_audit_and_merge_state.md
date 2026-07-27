@@ -391,7 +391,34 @@ deliberate quarantine because the state it keys off is overloaded. #64 carries a
 positive control proving a genuinely quota-exhausted key is still revived, so
 "never re-enable" cannot pass as a fix while breaking the feature's purpose.
 
-Cumulative: **64 defects**.
+| # | Defect | Site | Notes |
+|---|---|---|---|
+| 65 | **`previous_response_id` was not scoped to the owning customer key — cross-tenant prompt disclosure.** The `/v1/responses` store had NO owner field (`storedResponseDoc` carried id/model/output/stored_input and no key identity), and the handler resolved a continuation with a bare `loadResponse(id)` filename lookup. Any customer key that learned another customer's response ID could replay it: `expandPreviousResponseHistory` expanded the victim's stored INPUT and assistant OUTPUT into the prompt forwarded upstream, and returned it as the attacker's own context. **Proven on real bytes** — the upstream payload captured in the RED test contained tenant A's `MY-PRIVATE-PROMPT-acquisition-price-is-42M` and `MY-PRIVATE-ANSWER-board-approved-the-deal` inside tenant B's `history[]` | `proxy/responses_handler.go:46`, `proxy/responses_store.go` | `OwnerApiKeyID` stamped at both save sites (stream + non-stream), persisted, and checked before expansion. Refused as **404, not 403** — a "wrong owner" reply would confirm the ID exists, turning the endpoint into an oracle for probing valid response IDs |
+
+The precedent this violated is in the same package: `responseCacheKey` prefixes
+`apiKeyID` specifically so one tenant's cached response can never be served to
+another (`proxy/response_cache.go:142-147`), and round-4's `4466808` pinned that
+end to end as "the most serious defect this cache could have". The persistent
+responses store had no equivalent.
+
+Empty owner is treated as unowned and stays readable, which preserves the
+existing trust model exactly: this proxy runs `requireApiKey=false` by design
+(§6c operator decision), so every caller is `""` there, and records written
+before ownership existed keep working.
+
+Class fix, not just the reported site: `collectAncestorChain`
+(`proxy/responses_history.go:61`) was the second unchecked `loadResponse` and now
+stops at the first foreign-owned hop. Scope stated honestly — with the handler
+check in place a mixed-owner chain should not be constructible through the API,
+so that layer is defense in depth rather than a proven-exploitable path.
+
+Both fixes are RED-proven and discriminating: neutralizing the handler guard
+(`if false && ...`) reproduces the leak with the victim's plaintext in the
+upstream payload, and a positive control proves the OWNER can still continue its
+own response, so "reject every `previous_response_id`" cannot pass as a fix while
+destroying multi-turn.
+
+Cumulative: **65 defects**.
 
 ---
 
