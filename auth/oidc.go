@@ -262,8 +262,18 @@ func refreshOIDCToken(refreshToken, clientID, clientSecret, region string, clien
 	if region == "" {
 		region = "us-east-1"
 	}
+	// Validate the region before it is interpolated into the token endpoint's
+	// HOST. This is the most reachable site of that class: the value comes from
+	// the stored account and is used automatically by BACKGROUND refresh, with
+	// no operator action needed to trigger it. An unvalidated region would send
+	// the account's refresh token (a long-lived credential) to whatever host the
+	// region injected. See auth/region.go.
+	normalizedRegion, ok := validAWSRegionLabel(region)
+	if !ok {
+		return "", "", 0, "", fmt.Errorf("invalid AWS region %q", region)
+	}
 
-	url := oidcTokenURL(region)
+	url := oidcTokenURL(normalizedRegion)
 
 	payload := map[string]string{
 		"clientId":     clientID,

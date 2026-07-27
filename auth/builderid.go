@@ -34,7 +34,13 @@ func StartBuilderIdLogin(region string) (*BuilderIdSession, error) {
 		region = "us-east-1"
 	}
 
-	oidcBase := fmt.Sprintf("https://oidc.%s.amazonaws.com", region)
+	// Fail closed on a region that could move the host: the region is
+	// interpolated into the URL authority, so "x@attacker.example/" would send
+	// this flow's OIDC traffic to attacker.example. See auth/region.go.
+	oidcBase, err := awsOidcBase(region)
+	if err != nil {
+		return nil, err
+	}
 	startUrl := "https://view.awsapps.com/start"
 	scopes := []string{
 		"codewhisperer:completions",
@@ -162,7 +168,13 @@ func PollBuilderIdAuth(sessionID string) (accessToken, refreshToken, clientID, c
 		return "", "", "", "", "", 0, "", fmt.Errorf("authorization expired")
 	}
 
-	oidcBase := fmt.Sprintf("https://oidc.%s.amazonaws.com", session.Region)
+	// Re-validate the stored session region: it was validated at start, but this
+	// is the site that actually builds the host, so validating here keeps the
+	// guarantee local rather than depending on a check made earlier elsewhere.
+	oidcBase, regionErr := awsOidcBase(session.Region)
+	if regionErr != nil {
+		return "", "", "", "", "", 0, "", regionErr
+	}
 
 	tokenPayload := map[string]string{
 		"clientId":     session.ClientID,

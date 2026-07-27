@@ -17,7 +17,16 @@ func ImportFromSsoToken(bearerToken, region string) (accessToken, refreshToken, 
 		region = "us-east-1"
 	}
 
-	oidcBase := fmt.Sprintf("https://oidc.%s.amazonaws.com", region)
+	// Validate BEFORE any network work. This flow obtains a real device-session
+	// token from the hardcoded legitimate portal and then posts that live
+	// credential to oidcBase (acceptUserCode / approveAuth below), so a region
+	// that can move the host is a credential-exfiltration primitive: a crafted
+	// value such as "x@attacker.example/" makes the effective host
+	// attacker.example while the URL still looks like an AWS endpoint.
+	oidcBase, err := awsOidcBase(region)
+	if err != nil {
+		return "", "", "", "", 0, err
+	}
 	portalBase := "https://portal.sso.us-east-1.amazonaws.com"
 	startUrl := "https://view.awsapps.com/start"
 

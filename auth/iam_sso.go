@@ -46,7 +46,13 @@ func StartIamSsoLogin(startUrl, region string) (sessionID, authorizeUrl string, 
 		region = "us-east-1"
 	}
 
-	oidcBase := fmt.Sprintf("https://oidc.%s.amazonaws.com", region)
+	// Fail closed on a region that could move the host (see auth/region.go): the
+	// region is interpolated into the URL authority, so a crafted value would
+	// point this OIDC flow at an attacker-controlled server.
+	oidcBase, err := awsOidcBase(region)
+	if err != nil {
+		return "", "", 0, err
+	}
 	redirectUri := "http://127.0.0.1/oauth/callback"
 
 	// 1. 注册 OIDC 客户端
@@ -134,8 +140,14 @@ func CompleteIamSsoLogin(sessionID, callbackUrl string) (accessToken, refreshTok
 		return "", "", "", "", "", 0, fmt.Errorf("未收到授权码")
 	}
 
-	// 用 code 换取 token
-	oidcBase := fmt.Sprintf("https://oidc.%s.amazonaws.com", session.Region)
+	// 用 code 换取 token.
+	// Re-validate the stored session region here, at the site that actually
+	// builds the host, rather than relying on the check made when the session
+	// started (see auth/region.go).
+	oidcBase, regionErr := awsOidcBase(session.Region)
+	if regionErr != nil {
+		return "", "", "", "", "", 0, regionErr
+	}
 	accessToken, refreshToken, expiresIn, err = exchangeToken(
 		oidcBase,
 		session.ClientID,
