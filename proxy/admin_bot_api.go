@@ -658,7 +658,29 @@ func (h *Handler) handleAdminAddKiroApiKey(w http.ResponseWriter, r *http.Reques
 	// (UserId/Email), which is what lets us deduplicate.
 	var targetRegions []string
 	if explicit := strings.TrimSpace(req.Region); explicit != "" {
-		targetRegions = []string{explicit}
+		// Validate the shape before it is probed or persisted, as the sibling admin
+		// routes already do (kiro_apikey_admin.go:186, :353; handler.go:6452).
+		//
+		// An unvalidated label was stored verbatim as the account's Region, but
+		// regionalizeURL refuses a malformed region and silently leaves traffic on
+		// us-east-1. The stored identity bucket then disagrees with where requests
+		// actually go, and because dedup is keyed on (UserId, region) the SAME
+		// upstream account could be added again under us-east-1 — two pool slots
+		// for one account, doubling its routing weight and double-counting its
+		// quota in /admin/pool.
+		//
+		// Same class as the region->host defects fixed earlier in this series; here
+		// the blast radius is accounting rather than credentials only because
+		// regionalizeURL happens to fail closed.
+		normalized, ok := validateRegionOverride(explicit)
+		if !ok || normalized == "" {
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(map[string]string{
+				"error": "region must be a valid AWS region label (e.g. us-east-1)",
+			})
+			return
+		}
+		targetRegions = []string{normalized}
 	} else {
 		targetRegions = kiroApiKeyCandidateRegions()
 	}
