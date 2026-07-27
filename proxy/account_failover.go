@@ -44,6 +44,62 @@ func statusForUpstreamError(err error) int {
 	}
 }
 
+// claudeStopReasonError is the stop_reason emitted when a stream is aborted
+// mid-message by an upstream failure.
+//
+// It is deliberately OUTSIDE Anthropic's documented stop_reason enum
+// (end_turn / max_tokens / stop_sequence / tool_use), and that is the point: a
+// mid-stream abort is not a completion. Reporting end_turn would tell the client
+// the message finished normally, so partial output would be treated as the whole
+// answer — silent truncation, which is worse than an unknown enum value a client
+// can branch on. The accompanying `error` event carries the classified detail.
+const claudeStopReasonError = "error"
+
+// claudeErrorTypeForStatus maps an authoritative upstream HTTP status onto
+// Anthropic's documented error-type enum for the Claude surface.
+//
+// The mid-stream error event previously hardcoded "api_error" for every failure,
+// while the OpenAI stream on the very same failure classified via
+// errorTypeForOpenAIStatus. That asymmetry is client-visible and consequential,
+// because an Anthropic consumer keys its retry policy off error.type:
+//
+//   - a rate limit reported as api_error invites an immediate retry into an
+//     already-exhausted account instead of a backoff;
+//   - a revoked credential reported as api_error looks transient, so a client
+//     retries indefinitely rather than surfacing "re-authenticate";
+//   - an oversized request reported as api_error implies the service failed,
+//     when the correct client action is to shrink the conversation.
+//
+// Every return value is a type Anthropic actually defines. Inventing one would
+// be worse than a generic api_error: a client switching on the enum would fall
+// through to an unknown branch. Anything unrecognised therefore degrades to
+// api_error rather than guessing.
+func claudeErrorTypeForStatus(status int) string {
+	switch status {
+	case http.StatusBadRequest, http.StatusPaymentRequired:
+		// 402 (overage/quota-cap) is a property of the REQUEST against the
+		// account's plan, not a server fault, so it belongs here rather than in
+		// api_error.
+		return "invalid_request_error"
+	case http.StatusUnauthorized:
+		return "authentication_error"
+	case http.StatusForbidden:
+		return "permission_error"
+	case http.StatusNotFound:
+		return "not_found_error"
+	case http.StatusRequestEntityTooLarge:
+		return "request_too_large"
+	case http.StatusTooManyRequests:
+		return "rate_limit_error"
+	case http.StatusServiceUnavailable:
+		// 503 is the one 5xx with a distinct Anthropic type: it tells the client
+		// to retry later, whereas api_error does not.
+		return "overloaded_error"
+	default:
+		return "api_error"
+	}
+}
+
 func errorTypeForOpenAIStatus(status int) string {
 	if status == http.StatusTooManyRequests {
 		return "rate_limit_error"

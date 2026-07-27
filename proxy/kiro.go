@@ -302,6 +302,30 @@ type KiroStreamCallback struct {
 	OnError        func(err error)
 	OnCredits      func(credits float64)
 	OnContextUsage func(percentage float64)
+
+	// OnUpstreamException reports an AWS event-stream EXCEPTION frame, i.e. a
+	// frame whose `:message-type` header is "exception" rather than "event".
+	//
+	// This is OBSERVATION ONLY and deliberately so. The parser previously read
+	// just the `:event-type` header (extractEventType), so an exception frame
+	// matched no case in the dispatch switch and was silently discarded — which
+	// is why a mid-stream upstream failure could only ever reach the handler as
+	// a transport error, classifying as HTTP 500 / api_error no matter what the
+	// upstream actually said.
+	//
+	// It does NOT abort the stream, because the decision of which exception
+	// types are fatal cannot be made responsibly yet: no real Kiro exception
+	// frame has been observed. The trace corpus cannot supply one either —
+	// traceRecorder.noteResponseText stores ASSEMBLED text, so frame headers are
+	// destroyed before capture. Treating a frame as fatal on the strength of the
+	// AWS spec alone risks killing live streams mid-answer on the path every
+	// request uses, which is a worse failure than the classification imprecision
+	// it would fix.
+	//
+	// So this exists to make the frames observable. Once a real one is recorded,
+	// promoting specific exception types to fatal becomes a small change made
+	// against evidence instead of inference.
+	OnUpstreamException func(exceptionType string, payload []byte)
 }
 
 // ==================== API Call ====================
@@ -756,6 +780,29 @@ func parseEventStream(body io.Reader, callback *KiroStreamCallback) error {
 
 		eventType := extractEventType(msgBuf[0:headersLength])
 		payloadBytes := msgBuf[headersLength : len(msgBuf)-4]
+
+		// Surface AWS event-stream EXCEPTION frames.
+		//
+		// The dispatch switch below keys off `:event-type`, which an exception
+		// frame does not carry — it sets `:message-type: exception` plus
+		// `:exception-type`. So such a frame matched no case and was discarded
+		// without a trace, which is why a mid-stream upstream failure reached
+		// the handler only as a transport error (classified HTTP 500 /
+		// api_error) regardless of what the upstream reported.
+		//
+		// Reported, NOT acted on: see KiroStreamCallback.OnUpstreamException for
+		// why promoting these to fatal needs a real observed frame first. The
+		// stream continues exactly as before, so this cannot change behaviour
+		// for any traffic that works today.
+		if msgType := extractHeaderString(msgBuf[0:headersLength], ":message-type"); msgType == "exception" {
+			exceptionType := extractHeaderString(msgBuf[0:headersLength], ":exception-type")
+			logger.Warnf("[KiroStream] upstream exception frame: type=%q payloadBytes=%d", exceptionType, len(payloadBytes))
+			if callback.OnUpstreamException != nil {
+				callback.OnUpstreamException(exceptionType, payloadBytes)
+			}
+			continue
+		}
+
 		if len(payloadBytes) == 0 {
 			continue
 		}

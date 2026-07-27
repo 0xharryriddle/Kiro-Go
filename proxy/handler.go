@@ -2093,9 +2093,23 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 				continue
 			}
 			h.emitTrace(tr, outcomeError, statusForUpstreamError(err))
+			// Classify the error type from the authoritative upstream status.
+			//
+			// This was hardcoded to "api_error" for every failure, while the
+			// OpenAI stream classified the SAME error via
+			// errorTypeForOpenAIStatus. That asymmetry is client-visible and
+			// consequential: an Anthropic consumer keys its retry policy off
+			// error.type, so a rate limit reported as api_error invites an
+			// immediate retry into an exhausted account instead of a backoff,
+			// and a revoked credential reported as api_error looks transient so
+			// the client retries forever instead of surfacing "re-authenticate".
+			midStreamStatus := statusForUpstreamError(err)
 			h.sendSSE(w, flusher, "error", map[string]interface{}{
-				"type":  "error",
-				"error": map[string]string{"type": "api_error", "message": err.Error()},
+				"type": "error",
+				"error": map[string]string{
+					"type":    claudeErrorTypeForStatus(midStreamStatus),
+					"message": err.Error(),
+				},
 			})
 			// Terminate the SSE message properly. Emitting `error` and returning
 			// left any open content_block unclosed and never sent message_delta or
