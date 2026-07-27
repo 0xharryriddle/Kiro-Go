@@ -33,6 +33,31 @@ import (
 // "admin_password" cookie would open a CSRF vector (a cross-site POST from a
 // logged-in admin's browser could mint keys). Bots send explicit headers.
 
+// adminBotBodyLimit bounds every request body decoded in this file.
+//
+// Ten admin routes elsewhere in the package already wrap r.Body in
+// http.MaxBytesReader (16 KiB - 1 MiB depending on the payload); this file had
+// SEVEN unbounded json.NewDecoder(r.Body) calls, so it was the one admin surface
+// where a caller could stream an arbitrarily large body straight into the JSON
+// decoder. Proven before the fix: /admin/new_api_key accepted a 4 MiB body and
+// returned 200, minting a real key from it.
+//
+// These payloads are small by construction — a name, a credit figure, a key id,
+// an account credential blob — so 64 KiB is generous while still refusing a body
+// that could only be an accident or an attack. Deliberately one shared constant
+// rather than seven literals: the previous per-route drift is what let this file
+// diverge from the convention in the first place.
+const adminBotBodyLimit = 64 << 10
+
+// decodeAdminBotBody reads a bounded JSON body into dst.
+//
+// Wrapping with MaxBytesReader (rather than checking a Content-Length header)
+// bounds the bytes actually READ, so a chunked request that declares no length
+// is covered too.
+func decodeAdminBotBody(w http.ResponseWriter, r *http.Request, dst interface{}) error {
+	return json.NewDecoder(http.MaxBytesReader(w, r.Body, adminBotBodyLimit)).Decode(dst)
+}
+
 // authenticateAdminKey verifies the caller holds the admin key. Writes a JSON
 // 401 and returns false on failure. Fails closed when no admin password is
 // configured, so a fresh deployment can't expose key-minting unauthenticated.
@@ -75,7 +100,7 @@ func (h *Handler) handleAdminNewApiKey(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 
 	var req adminNewApiKeyRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := decodeAdminBotBody(w, r, &req); err != nil {
 		w.WriteHeader(http.StatusBadRequest)
 		json.NewEncoder(w).Encode(map[string]string{"error": "Invalid JSON"})
 		return
@@ -130,7 +155,7 @@ func (h *Handler) handleAdminDeleteApiKey(w http.ResponseWriter, r *http.Request
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 
 	var req adminDeleteApiKeyRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := decodeAdminBotBody(w, r, &req); err != nil {
 		w.WriteHeader(http.StatusBadRequest)
 		json.NewEncoder(w).Encode(map[string]string{"error": "Invalid JSON"})
 		return
@@ -207,7 +232,7 @@ func (h *Handler) handleAdminRechargeApiKey(w http.ResponseWriter, r *http.Reque
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 
 	var req adminRechargeApiKeyRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := decodeAdminBotBody(w, r, &req); err != nil {
 		w.WriteHeader(http.StatusBadRequest)
 		json.NewEncoder(w).Encode(map[string]string{"error": "Invalid JSON"})
 		return
@@ -323,7 +348,7 @@ func (h *Handler) handleAdminBotStats(w http.ResponseWriter, r *http.Request) {
 	// hard 400: silently ignoring a broken filter would return EVERY key to a
 	// caller who thought they were querying one.
 	var req adminStatsRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil && !errors.Is(err, io.EOF) {
+	if err := decodeAdminBotBody(w, r, &req); err != nil && !errors.Is(err, io.EOF) {
 		w.WriteHeader(http.StatusBadRequest)
 		json.NewEncoder(w).Encode(map[string]string{"error": "Invalid JSON"})
 		return
@@ -601,7 +626,7 @@ func (h *Handler) handleAdminAddKiroApiKey(w http.ResponseWriter, r *http.Reques
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 
 	var req adminAddKiroApiKeyRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := decodeAdminBotBody(w, r, &req); err != nil {
 		w.WriteHeader(http.StatusBadRequest)
 		json.NewEncoder(w).Encode(map[string]string{"error": "Invalid JSON"})
 		return
@@ -908,7 +933,7 @@ func (h *Handler) handleAdminAddKiroAccount(w http.ResponseWriter, r *http.Reque
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 
 	var req adminAddKiroAccountRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := decodeAdminBotBody(w, r, &req); err != nil {
 		w.WriteHeader(http.StatusBadRequest)
 		json.NewEncoder(w).Encode(map[string]string{"error": "Invalid JSON"})
 		return
@@ -1340,7 +1365,7 @@ func (h *Handler) handleAdminAddCustomApiAccount(w http.ResponseWriter, r *http.
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 
 	var req adminAddCustomApiRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := decodeAdminBotBody(w, r, &req); err != nil {
 		w.WriteHeader(http.StatusBadRequest)
 		json.NewEncoder(w).Encode(map[string]string{"error": "Invalid JSON"})
 		return
