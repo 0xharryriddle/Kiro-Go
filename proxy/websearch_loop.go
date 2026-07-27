@@ -166,6 +166,24 @@ func (h *Handler) callUpstreamForWebSearch(req *ClaudeRequest, thinking bool, es
 		if account == nil {
 			break
 		}
+		// Skip accounts this loop cannot serve. It calls CallKiroAPI
+		// unconditionally below, and a Bedrock or custom_api account has no Kiro
+		// credential: the request would be sent anyway, fail upstream, and the
+		// failure would be charged to a HEALTHY account via handleAccountFailure,
+		// damaging its cooldown and circuit-breaker state. CLAUDE.md states the
+		// invariant — "Bedrock accounts must be excluded from every Kiro/AWS-SSO
+		// path (or they get 403'd and auto-banned). If you add a new Kiro-facing
+		// loop, add an IsBedrock() guard" — and every Kiro-facing loop in
+		// handler.go already branches on these two predicates. This loop did not.
+		//
+		// Excluded rather than failed: a mixed web-search request served by a pool
+		// that also holds Kiro accounts must still succeed on one of those, so this
+		// only removes the account from THIS request's candidate set. No
+		// handleAccountFailure call — the account is not broken, it is ineligible.
+		if account.IsBedrock() || account.IsCustomApi() {
+			excluded[account.ID] = true
+			continue
+		}
 		if err := h.ensureValidToken(account); err != nil {
 			lastErr = err
 			excluded[account.ID] = true
