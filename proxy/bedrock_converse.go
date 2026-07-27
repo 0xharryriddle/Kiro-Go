@@ -429,11 +429,23 @@ func converseStopReasonToAnthropic(sr string) string {
 // readBedrockEventStream's framing/exception handling but yields the raw payload
 // keyed by the :event-type header (messageStart, contentBlockDelta, ...).
 func readBedrockConverseEventStream(body io.Reader, onEvent func(eventType string, payload []byte) error) error {
+	// framesSeen mirrors readBedrockEventStream: an HTTP 200 that carried no frame
+	// at all must be an error, not a silent success. Both readers previously
+	// returned nil for an empty body, and both callers only fail over on a
+	// non-nil error, so an empty upstream response was served to the client as a
+	// success with a zero-token bill and no attempt against a healthy account.
+	framesSeen := 0
 	for {
 		prelude := make([]byte, 12)
 		if _, err := io.ReadFull(body, prelude); err != nil {
-			if err == io.EOF || err == io.ErrUnexpectedEOF {
-				return nil
+			if err == io.EOF {
+				if framesSeen > 0 {
+					return nil
+				}
+				return errBedrockEmptyStream
+			}
+			if err == io.ErrUnexpectedEOF {
+				return errBedrockTruncatedFrame
 			}
 			return err
 		}
@@ -452,6 +464,10 @@ func readBedrockConverseEventStream(body io.Reader, onEvent func(eventType strin
 		if _, err := io.ReadFull(body, msgBuf); err != nil {
 			return err
 		}
+		// A complete frame arrived. Counted before the exception branch for the
+		// same reason as the native reader: an exception frame still proves the
+		// upstream responded, so it must not be treated as an empty stream.
+		framesSeen++
 		if headersLength < 0 || headersLength > len(msgBuf)-4 {
 			continue
 		}

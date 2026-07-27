@@ -21,6 +21,16 @@ import (
 	"io"
 )
 
+// errBedrockEmptyStream reports an HTTP 200 whose body carried no event-stream
+// frame at all. Returned instead of nil so the dispatch loop can fail over to a
+// healthy account rather than serving an empty response as a success.
+var errBedrockEmptyStream = errors.New("bedrock stream: upstream returned no events")
+
+// errBedrockTruncatedFrame reports a frame prelude cut mid-way: the stream is
+// corrupt, not complete. Distinct from errBedrockEmptyStream because a prefix may
+// already have reached the client, which the caller handles differently.
+var errBedrockTruncatedFrame = errors.New("bedrock stream: truncated frame prelude")
+
 // bedrockErrorEvent is returned when a frame carries an AWS-level exception
 // (:message-type = exception / error) rather than a normal chunk.
 type bedrockStreamError struct {
@@ -46,11 +56,31 @@ type bedrockChunkEnvelope struct {
 // underlying read/parse error. onEvent returning an error stops the loop and
 // propagates that error (used to abort if the client disconnects).
 func readBedrockEventStream(body io.Reader, onEvent func(eventType string, anthropicJSON []byte) error) error {
+	// framesSeen distinguishes "the stream ended normally" from "no frame ever
+	// arrived". Both used to return nil, and the caller only fails over on a
+	// non-nil error (bedrock.go: `if streamErr != nil && !streamedAny`), so an
+	// HTTP 200 with an empty body was served to the client as a successful empty
+	// response: no failover to a healthy account, and a zero-token SUCCESS
+	// recorded against the account and the customer key. CLAUDE.md requires a
+	// failure before any client bytes to return an error so failover works.
+	framesSeen := 0
 	for {
 		prelude := make([]byte, 12)
 		if _, err := io.ReadFull(body, prelude); err != nil {
-			if err == io.EOF || err == io.ErrUnexpectedEOF {
-				return nil
+			// Clean EOF on a frame boundary is a normal end of stream — but only
+			// if at least one frame was actually delivered.
+			if err == io.EOF {
+				if framesSeen > 0 {
+					return nil
+				}
+				return errBedrockEmptyStream
+			}
+			// A prelude cut mid-way is a corrupt/truncated stream, never a
+			// complete one, whether or not earlier frames arrived. Reporting it
+			// lets the caller fail over when nothing was streamed yet, and log
+			// it when a prefix already reached the client.
+			if err == io.ErrUnexpectedEOF {
+				return errBedrockTruncatedFrame
 			}
 			return err
 		}
@@ -70,6 +100,11 @@ func readBedrockEventStream(body io.Reader, onEvent func(eventType string, anthr
 		if _, err := io.ReadFull(body, msgBuf); err != nil {
 			return err
 		}
+		// A complete frame arrived. Counted here rather than at onEvent so that
+		// an exception frame, or a control frame we deliberately skip, still
+		// proves the upstream responded — the empty-stream check is about
+		// "nothing came back at all", not "no content events came back".
+		framesSeen++
 		if headersLength < 0 || headersLength > len(msgBuf)-4 {
 			continue
 		}
