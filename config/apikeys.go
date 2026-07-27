@@ -295,6 +295,17 @@ func RechargeApiKey(id string, addCredits float64, addTokens int64) (ApiKeyEntry
 	}
 	for i := range cfg.ApiKeys {
 		if cfg.ApiKeys[i].ID == id {
+			// Snapshot over-limit state BEFORE raising limits. Enabled=false has two
+			// causes — auto-deactivation on exhaustion (RecordApiKeyUsage) and a
+			// deliberate operator disable (UpdateApiKey / admin toggle, used for
+			// abuse, chargebacks, disputed orders) — and the entry does not record
+			// which. Being over limit while the top-up arrives is the only evidence
+			// that exhaustion is what turned the key off, so it is the sole license
+			// to switch it back on. Without this snapshot, a top-up on an
+			// operator-quarantined key silently restored the credential: a banned
+			// buyer could unban themselves by paying again.
+			wasOverToken, wasOverCredit := ApiKeyOverLimit(cfg.ApiKeys[i])
+
 			if addCredits > 0 {
 				cfg.ApiKeys[i].CreditLimit += addCredits
 			}
@@ -303,9 +314,14 @@ func RechargeApiKey(id string, addCredits float64, addTokens int64) (ApiKeyEntry
 			}
 			// Re-enable a key auto-deactivated on exhaustion now that the raised
 			// limit puts it back under quota. No-op if already enabled; stays off if
-			// still over limit after a partial top-up.
-			if overToken, overCredit := ApiKeyOverLimit(cfg.ApiKeys[i]); !overToken && !overCredit {
-				cfg.ApiKeys[i].Enabled = true
+			// still over limit after a partial top-up, and stays off if the key was
+			// never over limit (an operator turned it off, so only an operator may
+			// turn it back on). The limit increase applies either way — declining to
+			// lift a quarantine must not discard paid-for allowance.
+			if wasOverToken || wasOverCredit {
+				if overToken, overCredit := ApiKeyOverLimit(cfg.ApiKeys[i]); !overToken && !overCredit {
+					cfg.ApiKeys[i].Enabled = true
+				}
 			}
 			if err := saveLocked(); err != nil {
 				return ApiKeyEntry{}, err
