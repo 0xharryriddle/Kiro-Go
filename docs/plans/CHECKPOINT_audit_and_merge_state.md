@@ -200,8 +200,8 @@ of them regressions introduced by MY earlier fixes:
 |---|---|---|---|
 | 42 | **Regression I introduced (functional, not cosmetic).** The name-based redactor accepted a BARE colon as an assignment, so real IdP prose was shredded: `"the code: invalid_grant was already redeemed"` → `code: [REDACTED]`. That destroys the `invalid_grant` marker `isAuthErrorMessage` classifies revoked credentials by — a genuinely revoked token became unclassifiable and the account was never flagged for re-auth. Also ate `"error code: 50173"`, `"status code: 401"`, and URLs after a colon | `auth/microsoft_sso.go` | Narrowed to machine syntax only: `=` always, `:` only when the key is JSON-quoted (`"name": "value"`). 6 prose cases + 2 machine-assignment controls pin both directions |
 | 43 | Boundary check treated `-` as a name byte, so `x-refresh_token=<secret>` was skipped as an unrelated identifier and leaked | same | `-` no longer binds a name; `_`/alphanumerics still do (so `error_code=` is still not `code`) |
-| 44 | **Regression I introduced.** `upstreamStatusFromMessage` selected by PATTERN ORDER, not string position. For `refresh failed: 401 {...\"trace\":\"HTTP 503 from edge\"}` it returned **503**, so fix #23's 5xx gate then refused to ban a genuinely revoked credential. The body outvoted the header | `proxy/account_failover.go` | Now returns the LEFTMOST match across all patterns — every formatter writes the authoritative status at the front |
-| 45 | Same positional flaw in the pool sibling, reached differently: `hasUpstream5xxStatusToken` matched any bare 5xx token ANYWHERE, so `refresh failed: 400 {...\"upstream returned 500\"}` hit the 5xx gate and a revoked credential was read as a server outage | `pool/account.go` | Replaced with `firstUpstreamStatusToken` (leftmost 400–599, same boundary rule). The two classifiers now agree on all 18 real formatter strings — pinned by a permanent cross-package agreement test so they cannot silently diverge again |
+| 44 | **Regression I introduced.** `upstreamStatusFromMessage` selected by PATTERN ORDER, not string position. For `refresh failed: 401 {..."trace":"HTTP 503 from edge"}` it returned **503**, so fix #23's 5xx gate then refused to ban a genuinely revoked credential. The body outvoted the header | `proxy/account_failover.go` | Now returns the LEFTMOST match across all patterns — every formatter writes the authoritative status at the front |
+| 45 | Same positional flaw in the pool sibling, reached differently: `hasUpstream5xxStatusToken` matched any bare 5xx token ANYWHERE, so `refresh failed: 400 {..."upstream returned 500"}` hit the 5xx gate and a revoked credential was read as a server outage | `pool/account.go` | Replaced with `firstUpstreamStatusToken` (leftmost 400–599, same boundary rule). The two classifiers now agree on all 18 real formatter strings — pinned by a permanent cross-package agreement test so they cannot silently diverge again |
 
 Verified rather than assumed in this pass:
 - **Redactor is panic-free and terminating** under a brute-force probe over
@@ -437,6 +437,51 @@ three independent `gpt-5.6-sol-thinking` reviewers at max reasoning effort, then
 every claim was re-derived against live bytes by the parent before any fix. 18
 further defects found and fixed; the false alarms are listed so they are not
 re-litigated.
+
+### R6 — Unauthenticated surface: OPEN BY DESIGN (operator decision, closed)
+
+Recorded because an earlier round of this checkpoint described the exposure
+INCORRECTLY, and the wrong version is the kind of thing a future reader would
+try to "fix".
+
+**What I reported at first, and why it was wrong.** I described `/v1/stats` as an
+unauthenticated route and framed it as an information-disclosure decision. Both
+halves were wrong:
+
+- `/v1/stats` DOES have a gate — `handler.go` calls `h.validateApiKey(r)` and
+  returns 401 on failure. There is no missing route check.
+- The gate is bypassed at the source. `authenticate()` (`proxy/auth.go`) opens
+  with `if !config.IsApiKeyRequired() { return nil, nil }`. The live config has
+  `requireApiKey = false` and ZERO api keys, so *every* customer route is open —
+  not just stats.
+
+Proven behaviourally against the running container:
+
+```
+GET  /v1/stats     no-auth -> HTTP 200
+GET  /v1/models    no-auth -> HTTP 200
+POST /v1/messages  no-auth -> HTTP 200   <- real inference, no credential
+```
+
+So the exposure was never disclosure-only; it was fleet spend. The framing
+understated it.
+
+**A wrong fix that was started and reverted.** On the strength of the bad
+diagnosis I began adding a `StatsRequireAuth` config flag. That would have been
+actively harmful: a second, narrower toggle overlapping the existing master
+switch, "securing" one read-only endpoint while `/v1/messages` stayed open, and
+implying the problem was handled. Reverted before commit; no trace in history.
+
+**Operator decision (recorded verbatim in intent).** This proxy is INTERNAL. The
+open posture is deliberate, and the trust boundary is the network, not the
+application — port 8080 binds `0.0.0.0`, so reachability is controlled outside
+this codebase. If auth is ever enabled, only `/v1/messages` needs it; the read
+endpoints may stay open.
+
+**Do NOT flip `requireApiKey` to true as a "hardening" change.** With zero API
+keys defined it 401s every request, including whatever depends on this proxy —
+an outage, not a fix. The only safe sequence is: mint a customer key, update the
+clients, THEN enable the flag.
 
 ### R5 — Design tradeoffs raised by subagents (deliberately not actioned)
 Not defects; they need a product decision, not a unilateral rewrite:
