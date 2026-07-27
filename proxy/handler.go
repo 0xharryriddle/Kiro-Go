@@ -182,9 +182,30 @@ type Handler struct {
 	stopRefresh     chan struct{}
 	stopStatsSaver  chan struct{}
 	// 模型缓存
-	cachedModels       []ModelInfo
-	modelsCacheMu      sync.RWMutex
-	modelsCacheTime    int64
+	cachedModels    []ModelInfo
+	modelsCacheMu   sync.RWMutex
+	modelsCacheTime int64
+	// modelsRefreshAttemptedAt is when the aggregate refresh was last ATTEMPTED
+	// (as opposed to modelsCacheTime, which records when it last succeeded).
+	//
+	// The distinction is the whole point. /v1/models is unauthenticated and
+	// refreshes whenever the cache is empty, and refreshModelsCache deliberately
+	// installs an empty aggregate when every account fails. So while the fleet is
+	// unhealthy the cache stays empty and every anonymous request drove another
+	// full refresh — each one calling ensureValidToken + ListAvailableModels for
+	// every enabled account and routing failures into handleAccountFailure. An
+	// unauthenticated caller could therefore run up error counts and cooldowns on
+	// the whole fleet at request rate, hardest exactly when the fleet was already
+	// struggling.
+	//
+	// Recording ATTEMPTS is what closes it: a failed refresh now also starts the
+	// interval, so repeated failure cannot become repeated load.
+	modelsRefreshAttemptedAt int64
+	// refreshModelsHook, when non-nil, replaces the real aggregate refresh.
+	// Test-only seam: refreshModelsCache talks to upstream for every enabled
+	// account, which a unit test cannot do, and the property under test is how
+	// OFTEN it is called rather than what it fetches.
+	refreshModelsHook  func()
 	promptCache        *promptCacheTracker
 	tokenRefreshMu     sync.Mutex
 	credentialImportMu sync.Mutex
@@ -901,7 +922,23 @@ func (h *Handler) handleModels(w http.ResponseWriter, r *http.Request) {
 	cached := h.cachedModels
 	h.modelsCacheMu.RUnlock()
 	if len(cached) == 0 {
-		h.refreshModelsCache()
+		// THROTTLED. This route is unauthenticated, so this refresh is reachable
+		// by anyone who can reach the port, and a refresh is expensive and
+		// account-affecting: it calls ensureValidToken + ListAvailableModels for
+		// every enabled account and feeds failures to handleAccountFailure.
+		//
+		// Because a total failure installs an EMPTY aggregate, the empty-cache
+		// condition above stays true, so before throttling every anonymous
+		// request repeated the whole sweep and added another error to every
+		// account. Serving the fallback list for the rest of the interval is the
+		// right trade: the response stays useful while the fleet is spared.
+		if h.tryBeginModelsRefresh(time.Now().Unix()) {
+			if h.refreshModelsHook != nil {
+				h.refreshModelsHook()
+			} else {
+				h.refreshModelsCache()
+			}
+		}
 		h.modelsCacheMu.RLock()
 		cached = h.cachedModels
 		h.modelsCacheMu.RUnlock()
@@ -1151,7 +1188,43 @@ func (h *Handler) invalidateAggregatedModelsCache() {
 	h.modelsCacheMu.Lock()
 	h.cachedModels = nil
 	h.modelsCacheTime = 0
+	// Clear the attempt stamp too: an explicit invalidation (profile switch,
+	// region change, account edit) is an operator saying "this list is wrong
+	// now", so the next request must be allowed to rebuild it immediately
+	// rather than serving the fallback until the throttle interval elapses.
+	h.modelsRefreshAttemptedAt = 0
 	h.modelsCacheMu.Unlock()
+}
+
+// modelsRefreshMinInterval is the floor between aggregate model-cache refreshes
+// triggered by the unauthenticated /v1/models route.
+//
+// 60s is chosen against the cost of the operation, not against request latency:
+// one refresh probes EVERY enabled account. At 18 accounts that is 18 upstream
+// round-trips plus up to 18 handleAccountFailure calls, so the pre-throttle
+// behaviour let an anonymous caller generate account errors as fast as it could
+// issue HTTP requests. A client polling /v1/models normally does so far less
+// often than once a minute, so this is invisible in legitimate use.
+const modelsRefreshMinInterval = 60
+
+// tryBeginModelsRefresh reports whether an aggregate refresh may start now, and
+// claims the interval when it returns true.
+//
+// It records the ATTEMPT rather than the success, which is what makes repeated
+// failure safe: refreshModelsCache installs an empty aggregate when every
+// account fails, so a success-only stamp would leave the cache empty, the
+// throttle unarmed, and the sweep repeating on every request.
+//
+// Claim and check happen under one lock hold, so N concurrent requests produce
+// exactly one refresh rather than N.
+func (h *Handler) tryBeginModelsRefresh(now int64) bool {
+	h.modelsCacheMu.Lock()
+	defer h.modelsCacheMu.Unlock()
+	if h.modelsRefreshAttemptedAt != 0 && now-h.modelsRefreshAttemptedAt < modelsRefreshMinInterval {
+		return false
+	}
+	h.modelsRefreshAttemptedAt = now
+	return true
 }
 
 // fetchAndCacheAccountModels 为单个账号拉取并写入模型缓存。
