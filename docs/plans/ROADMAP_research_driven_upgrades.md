@@ -170,20 +170,41 @@ Note the dimension: `UsageLimit` values here are 5000/10000 — these are
 credits, which is misleading). `isOverUsageLimit` (`pool/account.go:1498`) compares
 the right numbers; the comment is wrong.
 
-### F-C. The overage path applies no cooldown (CODE-VERIFIED + MEASURED)
+### F-C. The overage path applied no cooldown — FIXED this pass (round 16)
 
-`handleAccountFailure`'s overage branch calls `disableAccountOverage` +
-`RecordError(false)` (`proxy/account_failover.go:453-455`). `disableAccountOverage`
-only refreshes and persists the upstream `OverageStatus` snapshot (`:414-431`) — it
-sets **no cooldown**.
+`handleAccountFailure`'s overage branch called `disableAccountOverage` +
+`RecordError(false)` (`proxy/account_failover.go:453-455`). Neither parks the
+account: `disableAccountOverage` only refreshes and persists the upstream
+`OverageStatus` snapshot (`:414-431`) — and returns early if that live fetch fails —
+while `RecordError(id, false)` files a 402 as a GENERIC failure, which needs three
+consecutive errors before it applies even a 1-minute cooldown.
 
-`MarkOverLimit` (`pool/account.go:1188`), which *does* set a 1-hour cooldown, has
-**zero non-test callers**. It is dead code.
+`MarkOverLimit` (`pool/account.go:1194`), which *does* set a 1h backoff via
+`setCooldownIfLater` stamped either side of `Reload`, had **zero non-test callers**.
+Dead code — while the repo's own design spec
+(`docs/superpowers/specs/2026-06-28-auth-upstream-reliability-design.md`) states
+`402 → pool.MarkOverLimit`. Shipped behaviour had drifted from shipped intent.
 
-MEASURED consequence on the 21 correctly-tagged cap events: the same account was
-re-dispatched after a cap in **7 s min / 77 s median / 274 s max**; 20/20 inside an
-hour, 6/20 within a minute. A hard-capped account stays in rotation and keeps
-burning round-trips (median wasted upstream latency 1,716 ms per cap event).
+MEASURED consequence, on the 21 correctly-tagged live cap events: **20 of 21
+re-selected the SAME account within 60 s, median gap 0 s.**
+
+**Correcting my own earlier number.** An earlier revision of this file reported
+"7 s min / 77 s median / 274 s max" for this same population. Re-measuring against
+the corpus gives a median gap of 0 s, not 77 s — the earlier figure was computed
+over a different grouping (gaps between cap *events*, not the interval to the next
+dispatch of the capped account) and overstated how long the pool waited. The
+consequence is worse than first reported, not better.
+
+**Fix (round 16).** The overage branch now calls `h.pool.MarkOverLimit(account.ID)`
+FIRST, before the upstream status refresh. Ordering is load-bearing: with the fetch
+first, a slow or failing `FetchOverageStatus` delays or — via its early return —
+entirely skips the backoff.
+
+Also verified while here: **R3 stays refuted.** The 229 untagged `HTTP 402 from
+Kiro IDE:` strings in the corpus that would miss `isOverageErrorMessage` (which
+requires a 402 token AND the word "overage") are all from 07-25, before
+`upstreamError` began injecting the tag at `proxy/kiro.go:427`. Every live 402 is
+tagged and classifies correctly.
 
 ### F-D. Latency-aware routing has a real, controlled opportunity (MEASURED)
 
@@ -310,14 +331,19 @@ projected value crosses `UsageLimit`, without waiting for the refresh tick.
 - Risk: over-gating a healthy account. Mitigate by treating unknown quota as
   neutral (never as zero) and keeping the upstream refresh authoritative on arrival.
 
-**P0-2. Cooldown on a monthly/request cap (closes F-C).**
-Either wire the dead `MarkOverLimit` into the overage branch, or add an explicit
-cap-specific cooldown until `NextResetDate`. A monthly cap is not a transient
-condition and must not be retried in 7 seconds.
-- Acceptance: after one cap, the same account is not re-dispatched within the
-  cooldown; RED-prove with a test that fails when the cooldown is removed.
-- Note: `setCooldownIfLater` must be used, never a raw assignment — round-11 already
-  fixed a bug where a raw write shortened a longer backoff.
+**P0-2. Cooldown on a monthly/request cap (closes F-C). — DONE, round 16.**
+Wired the dead `MarkOverLimit` into the overage branch, placed BEFORE the upstream
+status refresh so a slow or failing fetch cannot delay or skip the backoff.
+RED-proven: `proxy/overage_backoff_test.go`, 6 tests; under neutralization exactly
+the 2 behavioural ones fail (`2/4` re-selections of the capped account observed)
+and all 4 controls stay green.
+- Still open, and deliberately NOT done here: the backoff is a flat 1h, not
+  "until `NextResetDate`". For a *monthly* cap 1h is still too short — the account
+  will be retried ~700 more times before the period actually resets. Sizing the
+  backoff from `NextResetDate` is the remaining half of this item, and needs care
+  because a wrong `NextResetDate` would park a healthy account for weeks.
+- Note: `setCooldownIfLater` is used (via `MarkOverLimit`), never a raw assignment —
+  round-11 already fixed a bug where a raw write shortened a longer backoff.
 
 **P0-3. Reject silently-ignored request fields.**
 Decide per field: implement, or reject with a clear 400. Silent acceptance is the

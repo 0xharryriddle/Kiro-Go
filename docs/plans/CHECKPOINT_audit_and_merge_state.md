@@ -757,6 +757,55 @@ The premise check now polls until a probe actually blocks rather than probing on
 
 Cumulative: **77 defects**.
 
+### Round-16 — a hard-capped account is parked by nothing (dead code was the fix)
+
+Found by working the roadmap's own top-priority item and checking its premise
+rather than trusting it. The roadmap's F-C claimed "the overage path applies no
+cooldown"; that was right, but its supporting measurement was wrong and its
+suggested fix was already sitting in the tree, unused.
+
+| # | Defect | Site | Notes |
+|---|---|---|---|
+| 78 | **A 402/overage account gets no durable backoff, so the pool immediately re-dispatches into an upstream that already refused.** The overage branch called `disableAccountOverage` + `RecordError(id, false)`. Neither parks the account: the former only re-reads and persists the upstream `OverageStatus` snapshot — and returns early if that live fetch fails — while `RecordError(..., false)` files a 402 as a GENERIC failure, which needs THREE consecutive errors before it applies even a 1-minute cooldown. Meanwhile `pool.MarkOverLimit`, which implements exactly the right behaviour (1h backoff via `setCooldownIfLater`, stamped either side of `Reload`), had **zero non-test callers** | `proxy/account_failover.go:453-455` (branch); `pool/account.go:1194` (the dead routine) | Fix calls `MarkOverLimit` FIRST, before the status refresh. Ordering is load-bearing: fetch-first means a slow or failing `FetchOverageStatus` delays the backoff, and via its early return can skip it entirely |
+
+**Shipped behaviour had drifted from the repo's own stated intent.** The design
+spec at `docs/superpowers/specs/2026-06-28-auth-upstream-reliability-design.md`
+specifies `402 -> pool.MarkOverLimit` in two places. The code did something else,
+and the routine the spec names was dead. This was drift, not an oversight in
+design.
+
+**MEASURED consequence.** On the 21 correctly-tagged live 402-overage events:
+**20 of 21 re-selected the SAME account within 60 s, median gap 0 s.**
+
+**Correcting a number I published last pass.** The roadmap previously reported
+"7 s min / 77 s median / 274 s max" for this population. Re-measured: median gap
+is 0 s. The earlier figure was computed over gaps between cap *events* rather than
+the interval to the next dispatch of the capped account, and understated the
+problem. Corrected in the roadmap in the same pass, not silently.
+
+**RED-proof.** `proxy/overage_backoff_test.go` — 6 tests, behavioural (a real
+`Handler` + pool, a seeded two-account pool, `handleAccountFailure` called with the
+live error string form, then `GetNextForModelExcluding` polled to see who gets
+picked). Pre-fix the capped account is re-selected 2 of 4 times. Under full
+neutralization exactly the 2 behavioural tests fail and all 4 controls
+(classifier boundary, no-ban, single-account fallback still works, generic failure
+does NOT get the overage backoff) stay green — so the tests discriminate the fix
+rather than the file.
+
+**R3 re-checked and still refuted.** The corpus holds 229 untagged
+`HTTP 402 from Kiro IDE:` strings that would miss `isOverageErrorMessage` (which
+requires a 402 digit-boundary token AND the word "overage"). All 229 are from
+07-25, before `upstreamError` began injecting the tag (`proxy/kiro.go:427`); the
+21 tagged ones are 07-27. Every live 402 classifies correctly.
+
+**Not fixed, and stated plainly:** the backoff is a flat 1h. For a *monthly* cap
+that is still far too short — the account will be retried roughly 700 more times
+before the period resets. Sizing it from `NextResetDate` is the remaining half and
+carries its own risk (a wrong reset date parks a healthy account for weeks), so it
+is left as roadmap work rather than guessed at here.
+
+Cumulative: **78 defects**.
+
 ---
 
 ## 4. Remaining work

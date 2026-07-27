@@ -1,8 +1,8 @@
 # Kiro-Go — fresh-session handoff prompt
 
 Paste this whole file as the opening message of the new session. Every fact below
-was verified by command output at handoff time (2026-07-28, HEAD `d731d86` + rounds 14/15
-uncommitted-then-committed as noted below).
+was verified by command output at handoff time (2026-07-28, HEAD `82b74a9` + round 16
+committed on top -- re-check with `git log -1` before trusting any SHA here).
 Where something is unverified or unknown, it says so — do not upgrade those to
 facts without checking.
 
@@ -12,8 +12,8 @@ facts without checking.
 
 Continue the Kiro-Go audit-and-harden effort. It is not "finish a feature"; it is
 **find real defects, prove them, fix them, verify, deploy**. The previous session
-closed 77 defects across fifteen rounds (13 + a 13b follow-up driven by an
-adversarial review of round 13's own fix, then 14 and 15). There is no deadline and
+closed 78 defects across sixteen rounds (13 + a 13b follow-up driven by an
+adversarial review of round 13's own fix, then 14, 15 and 16). There is no deadline and
 no fixed list —
 work the highest-risk unreviewed surface, then the next.
 
@@ -53,10 +53,10 @@ these. Verified to be a STALL, not a deadlock — `config` imports nothing from
 
 | Fact | Value |
 |---|---|
-| HEAD | `d731d86` (round 14) + round 15 committed on top — check `git log -1` |
+| HEAD | `82b74a9` (round 15 + doc corrections) + round 16 committed on top — check `git log -1` |
 | Remote | `origin/harry` identical (0 ahead / 0 behind) |
 | Working tree | clean |
-| Tests | 951 top-level test funcs pass across `config` `pool` `auth` `proxy` (measured, not remembered: 936 at round 12 + 6 round 13 + 5 round 13b + 2 round 14 + 2 round 15). `-race` clean |
+| Tests | 957 top-level test funcs pass across `config` `pool` `auth` `proxy` (measured, not remembered: 936 at round 12 + 6 round 13 + 5 round 13b + 2 round 14 + 2 round 15). `-race` clean |
 | `-race` | clean, 0 data races |
 | `go vet` / `gofmt` | clean tree-wide |
 | Live container | healthy, version **1.1.5** |
@@ -97,6 +97,29 @@ a structural artifact of `ttfbMs` being streaming-only — the defect stands on 
 code-level proof instead), and **R13-followup**, a pre-existing observability gap
 where both Bedrock dispatch branches call `beginAttempt` but never `emitTrace`,
 recorded as a candidate rather than fixed.
+
+### Round 16 — the 402/overage path never parked the account (defect 78)
+
+`handleAccountFailure`'s overage branch called `disableAccountOverage` +
+`RecordError(account.ID, false)`. Neither parks the account: the former only
+re-reads the upstream Overages switch (and returns early if that live fetch
+fails), the latter files a 402 as a GENERIC failure needing 3 consecutive errors
+before even a 1-minute cooldown. Meanwhile `pool.MarkOverLimit` — which applies
+the correct 1h backoff via `setCooldownIfLater` — had ZERO non-test callers, even
+though the repo's own design spec says `402 -> pool.MarkOverLimit`.
+
+Measured on the live corpus: of 21 tagged 402-overage events on one account,
+**20 re-selected that same account within 60s, median gap 0s**.
+
+Fix: `h.pool.MarkOverLimit(account.ID)` first, BEFORE the status refresh (ordering
+is load-bearing — fetch-first means a slow/failing fetch delays or skips the
+backoff). Commit: see `git log --oneline -3`. Test: `proxy/overage_backoff_test.go`
+(6 tests; neutralization fails exactly the 2 behavioural ones, 4 controls green).
+
+STILL OPEN from this: the backoff is a flat 1h, not "until `NextResetDate`". For a
+MONTHLY cap that is still far too short. Sizing from `NextResetDate` is the
+remaining half — and needs care, since a wrong reset date parks a healthy account
+for weeks.
 
 ---
 

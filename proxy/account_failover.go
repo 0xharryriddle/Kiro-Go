@@ -451,6 +451,32 @@ func (h *Handler) handleAccountFailure(account *config.Account, err error) {
 		logger.Warnf("[AccountFailover] Upstream rejected the request as too long for %s (account not penalised): %v",
 			accountEmailForLog(account), err)
 	case isOverageErrorMessage(errMsg):
+		// Park the account FIRST, before anything that can fail or block.
+		//
+		// A 402/overage means the upstream refused the request because the
+		// account is out of paid headroom. That state does not clear in
+		// milliseconds, but nothing here used to reflect that:
+		// disableAccountOverage only re-reads the upstream Overages switch —
+		// and returns early if that read fails — while RecordError(id, false)
+		// files it as a GENERIC failure, which needs three consecutive errors
+		// before it applies even a 1-minute cooldown. So the account stayed
+		// immediately re-selectable and the pool kept dispatching into an
+		// upstream that had already said no. Measured on the live corpus: of 21
+		// consecutive 402-overage events on one account, 20 re-selected that
+		// same account within 60s, median gap 0s.
+		//
+		// MarkOverLimit is the routine that already implements the right
+		// behaviour (1h backoff via setCooldownIfLater, stamped either side of
+		// Reload) and it had no callers at all — the repo's own design spec
+		// (docs/superpowers/specs/2026-06-28-auth-upstream-reliability-design.md)
+		// specifies "402 -> pool.MarkOverLimit". This wires the shipped
+		// behaviour back to the shipped intent.
+		//
+		// Ordering matters: disableAccountOverage performs a live upstream
+		// fetch, so calling it first means a slow or failing fetch delays (or
+		// with its early return, entirely skips) the backoff. Cooldown first,
+		// status refresh second.
+		h.pool.MarkOverLimit(account.ID)
 		h.disableAccountOverage(account)
 		h.pool.RecordError(account.ID, false)
 	case isQuotaErrorMessage(errMsg):
