@@ -74,13 +74,38 @@ const claudeStopReasonError = "error"
 // be worse than a generic api_error: a client switching on the enum would fall
 // through to an unknown branch. Anything unrecognised therefore degrades to
 // api_error rather than guessing.
+// Verified against https://docs.anthropic.com/en/api/errors (fetched live, HTTP
+// 200). The doc states these status -> type pairings explicitly:
+//
+//	400 invalid_request_error   401 authentication_error   403 permission_error
+//	404 not_found_error         413 request_too_large      429 rate_limit_error
+//	402 billing_error           500 api_error              504 timeout_error
+//	529 overloaded_error
+//
+// Three earlier mappings here were WRONG and are corrected:
+//
+//   - 402 returned invalid_request_error. The documented type is billing_error,
+//     which is precisely what an overage/payment condition is. A client
+//     branching on error.type would have routed a billing problem into its
+//     malformed-request path and never surfaced "check your billing".
+//   - 503 returned overloaded_error. The doc pairs overloaded_error with 529,
+//     and never lists 503 as an error status at all — so a 503 now falls to
+//     api_error, which is what the doc prescribes for unexpected server-side
+//     failure.
+//   - 504 was unmapped and fell through to api_error. timeout_error is
+//     documented for it and tells the client something actionable (retry, or
+//     use streaming for long requests) that api_error does not.
+//
+// Note 529 is intentionally handled even though statusForUpstreamError cannot
+// currently produce it: this function is a status->type mapping, and leaving a
+// documented pairing out would be a latent bug the moment a caller passes one
+// through.
 func claudeErrorTypeForStatus(status int) string {
 	switch status {
-	case http.StatusBadRequest, http.StatusPaymentRequired:
-		// 402 (overage/quota-cap) is a property of the REQUEST against the
-		// account's plan, not a server fault, so it belongs here rather than in
-		// api_error.
+	case http.StatusBadRequest:
 		return "invalid_request_error"
+	case http.StatusPaymentRequired:
+		return "billing_error"
 	case http.StatusUnauthorized:
 		return "authentication_error"
 	case http.StatusForbidden:
@@ -91,11 +116,15 @@ func claudeErrorTypeForStatus(status int) string {
 		return "request_too_large"
 	case http.StatusTooManyRequests:
 		return "rate_limit_error"
-	case http.StatusServiceUnavailable:
-		// 503 is the one 5xx with a distinct Anthropic type: it tells the client
-		// to retry later, whereas api_error does not.
+	case http.StatusGatewayTimeout:
+		return "timeout_error"
+	case 529: // no net/http constant exists for Anthropic's overloaded status
 		return "overloaded_error"
 	default:
+		// Everything else, including 500 and 503, is an unexpected server-side
+		// failure. Degrading to api_error is what the doc prescribes and keeps
+		// every returned value inside the documented enum, so a client
+		// switching on error.type can never hit an unknown branch.
 		return "api_error"
 	}
 }

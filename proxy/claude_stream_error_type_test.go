@@ -31,11 +31,23 @@ func TestClaudeErrorTypeForStatusMapsDocumentedTypes(t *testing.T) {
 		{http.StatusRequestEntityTooLarge, "request_too_large"},
 		{http.StatusTooManyRequests, "rate_limit_error"},
 		{http.StatusBadRequest, "invalid_request_error"},
-		{http.StatusPaymentRequired, "invalid_request_error"},
+		// 402 is billing_error, NOT invalid_request_error. Verified against the
+		// live doc: "402 - billing_error : There's an issue with your billing or
+		// payment information." Mapping it to invalid_request_error sent a
+		// client's billing problem down its malformed-request path, so it never
+		// surfaced "check your payment details".
+		{http.StatusPaymentRequired, "billing_error"},
 		{http.StatusInternalServerError, "api_error"},
 		{http.StatusBadGateway, "api_error"},
-		{http.StatusServiceUnavailable, "overloaded_error"},
-		{http.StatusGatewayTimeout, "api_error"},
+		// 503 is NOT overloaded_error. The doc pairs overloaded_error with 529
+		// and never lists 503 as an error status at all, so 503 degrades to the
+		// documented catch-all for unexpected server failure.
+		{http.StatusServiceUnavailable, "api_error"},
+		// 504 has its own documented type and previously fell through to
+		// api_error, hiding an actionable signal (retry, or stream long requests).
+		{http.StatusGatewayTimeout, "timeout_error"},
+		// 529 is Anthropic's overloaded status; net/http has no constant for it.
+		{529, "overloaded_error"},
 	}
 	for _, c := range cases {
 		if got := claudeErrorTypeForStatus(c.status); got != c.want {
@@ -48,13 +60,20 @@ func TestClaudeErrorTypeForStatusMapsDocumentedTypes(t *testing.T) {
 // Inventing a type is worse than a generic api_error: a client switching on the
 // enum falls through to an unknown branch.
 func TestClaudeErrorTypeStaysWithinAnthropicEnum(t *testing.T) {
+	// This is the COMPLETE documented enum, transcribed from
+	// https://docs.anthropic.com/en/api/errors (fetched live, HTTP 200). Keeping
+	// the full set here rather than only the values we currently emit means a
+	// future mapping that starts returning billing_error or timeout_error is
+	// accepted, while a typo or an invented type still fails.
 	allowed := map[string]struct{}{
 		"invalid_request_error": {},
 		"authentication_error":  {},
+		"billing_error":         {},
 		"permission_error":      {},
 		"not_found_error":       {},
 		"request_too_large":     {},
 		"rate_limit_error":      {},
+		"timeout_error":         {},
 		"api_error":             {},
 		"overloaded_error":      {},
 	}
