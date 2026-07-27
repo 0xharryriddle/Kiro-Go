@@ -1,7 +1,7 @@
 # Kiro-Go — fresh-session handoff prompt
 
 Paste this whole file as the opening message of the new session. Every fact below
-was verified by command output at handoff time (2026-07-27, HEAD `a1cf36f`).
+was verified by command output at handoff time (2026-07-27, HEAD `668fb85`).
 Where something is unverified or unknown, it says so — do not upgrade those to
 facts without checking.
 
@@ -11,7 +11,7 @@ facts without checking.
 
 Continue the Kiro-Go audit-and-harden effort. It is not "finish a feature"; it is
 **find real defects, prove them, fix them, verify, deploy**. The previous session
-closed 69 defects across ten rounds. There is no deadline and no fixed list —
+closed 70 defects across eleven rounds. There is no deadline and no fixed list —
 work the highest-risk unreviewed surface, then the next.
 
 Repo: `/home/harry-riddle/dev/github.com/0xharryriddle/Kiro-Go`
@@ -23,10 +23,10 @@ Branch: `harry` (tracks `origin/harry`)
 
 | Fact | Value |
 |---|---|
-| HEAD | `a1cf36f` |
+| HEAD | `668fb85` |
 | Remote | `origin/harry` identical (0 ahead / 0 behind) |
 | Working tree | clean |
-| Tests | 929 top-level test funcs pass across `config` `pool` `auth` `proxy` (1160 including subtests; both numbers measured, not remembered) |
+| Tests | 932 top-level test funcs pass across `config` `pool` `auth` `proxy` (1163 including subtests; both numbers measured, not remembered) |
 | `-race` | clean, 0 data races |
 | `go vet` / `gofmt` | clean tree-wide |
 | Live container | healthy, version **1.1.5** |
@@ -35,6 +35,8 @@ Branch: `harry` (tracks `origin/harry`)
 Recent commits (newest first):
 
 ```
+668fb85 fix(bedrock): record a Converse OpenAI mid-stream failure as a failure
+5c3667a docs: record round 10 and sync the handoff to a1cf36f
 a1cf36f fix(admin): validate an explicit region before probing or persisting it
 7ba344d docs: record round 9 and re-measure the unreviewed-file inventory
 6911dcd fix(websearch): bill every search round to the account that served it
@@ -48,7 +50,7 @@ a1cf36f fix(admin): validate an explicit region before probing or persisting it
 ```
 
 **Read `docs/plans/CHECKPOINT_audit_and_merge_state.md` first.** It is the
-authoritative record: all 69 defects, the rejected claims (so they are not
+authoritative record: all 70 defects, the rejected claims (so they are not
 re-litigated), and every deliberate non-decision with its reasoning.
 
 ---
@@ -144,7 +146,7 @@ Line counts below are measured, not remembered (`wc -l`).
 | File | Lines | State | Why it matters |
 |---|---|---|---|
 | `proxy/admin_bot_api.go` | 1411 | **UNREVIEWED** (bodies bounded in `16a71ad`, no sibling test) | largest un-audited file in the repo; admin surface |
-| `proxy/bedrock_converse.go` | 893 | **UNREVIEWED** | Bedrock Converse translation |
+| `proxy/bedrock_converse.go` | 908 | audited round 11 → defect #70 | Bedrock Converse translation; partial-stream accounting now pinned |
 | `proxy/bedrock_openai.go` | 794 | **UNREVIEWED** | OpenAI↔Bedrock translation |
 | `proxy/custom_api_forward.go` | 634 | **UNREVIEWED** | transparent passthrough; trust boundary |
 | `proxy/bedrock.go` | 630 | **UNREVIEWED** | the ONLY path where prompt caching actually works |

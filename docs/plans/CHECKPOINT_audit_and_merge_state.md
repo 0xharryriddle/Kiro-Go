@@ -504,6 +504,36 @@ the fix (`targetRegions = []string{explicit}` restored → 2 fail, 3 pass).
 
 Cumulative: **69 defects**.
 
+### Round-11 — the fourth partial-stream site (`668fb85`)
+
+Same shape as round 10: an earlier fix in this series closed three of four sites
+in a class and the fourth was missed.
+
+| # | Defect | Site | Notes |
+|---|---|---|---|
+| 70 | **A Converse stream on the OpenAI surface that broke AFTER client bytes was recorded as an account SUCCESS.** `c65c161` fixed exactly this in three places (`bedrock.go:358`, `bedrock_openai.go:744`, `bedrock_converse.go:788`) and missed the fourth. The code logged `"converse openai stream ended with error after partial output"` and then fell through to `recordBedrockSuccess` on the next line — it named the failure and billed it as a success. `pool.RecordSuccess` clears the account's error count and cooldown (`pool/account.go:818`), so an account throwing repeated mid-stream Converse exceptions cleared its own health on every one and stayed selectable; the request log also claimed success for a request the client saw fail, and tokens were metered from a truncated stream whose terminal `metadata` usage event never arrived | `proxy/bedrock_converse.go:882-891` | Now calls `oconv.finish()` then `recordBedrockPartialFailure`, matching `invokeBedrockOpenAIStream:743-745` exactly. All four sites verified converging on the same contract after the fix |
+
+Why the existing test did not catch it: `bedrock_partial_failure_test.go` calls
+`recordBedrockPartialFailure` **directly**. It pins the helper's behaviour, not
+that any particular call site reaches it — so the one path that never called the
+helper was invisible to it. The new test drives the real entrypoint
+(`invokeBedrockConverseOpenAIStream`) over a hermetic `httptest` upstream that
+emits two good frames then an exception frame, which is the only way the missed
+branch is observable.
+
+Test seam note: no new production seam was needed — `bedrockHTTPClientFor`
+(already used by `bedrock_region_test.go`) and the existing `converseFrame` /
+`buildFrame` helpers were enough to synthesize a genuine partial AWS
+event-stream.
+
+Two controls, both written before the fix and passing throughout: a complete
+stream still records a success and still meters its tokens (so "always record a
+failure" cannot pass), and a pre-first-byte failure still returns an error so the
+dispatch loop can fail over (so "never fail over" cannot pass). Neutralization
+confirmed the defect test fails without the fix while both controls stay green.
+
+Cumulative: **70 defects**.
+
 ---
 
 ## 4. Remaining work
