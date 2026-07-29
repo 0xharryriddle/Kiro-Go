@@ -578,6 +578,15 @@ type Config struct {
 	// tracker clamps explicit small values up to 256.
 	PromptCacheMaxEntries int `json:"promptCacheMaxEntries,omitempty"`
 
+	// MaxRequestBodyBytes bounds every customer-facing request body
+	// (/v1/messages, /v1/messages/count_tokens, /v1/chat/completions,
+	// /v1/responses). Default 33554432 (32 MiB); an explicit value below
+	// minRequestBodyBytes (64 KiB) is clamped up so a typo cannot reject all
+	// real traffic. These handlers buffer the whole body with io.ReadAll before
+	// any parsing, so without a ceiling one request can make the process
+	// allocate without bound — and when requireApiKey is off, unauthenticated.
+	MaxRequestBodyBytes int `json:"maxRequestBodyBytes,omitempty"`
+
 	// Global statistics (persisted across restarts)
 	TotalRequests   int     `json:"totalRequests,omitempty"`   // Total API requests received
 	SuccessRequests int     `json:"successRequests,omitempty"` // Successful requests count
@@ -2489,6 +2498,42 @@ func UpdatePromptCacheMaxRatio(ratio float64) error {
 	defer cfgLock.Unlock()
 	cfg.PromptCacheMaxRatio = ratio
 	return Save()
+}
+
+// defaultMaxRequestBodyBytes is the customer-request ceiling: 32 MiB.
+//
+// Sized against the live trace corpus rather than guessed. 22,855 billed
+// requests carried a p99 prompt of 779,709 tokens and a maximum of 903,947.
+// Even at a deliberately pessimistic 12 bytes/token (the highest ratio measured
+// on any non-truncated recorded body) the largest real request lands near
+// 10 MiB, so 32 MiB leaves ~3x headroom over observed peak traffic while still
+// bounding the allocation. The corpus cannot measure this directly — it stores
+// the rewritten UPSTREAM body, truncated at TraceMaxBodyBytes (256 KiB) — so
+// this is an inference from token counts, not a byte measurement.
+//
+// The point is the ceiling's existence, not its exact value: before it, a single
+// request could make the process buffer without bound.
+const defaultMaxRequestBodyBytes = 32 << 20
+
+// minRequestBodyBytes (64 KiB) is the clamp floor. A misconfigured tiny value
+// would otherwise reject every real request — the p50 prompt alone is ~150k
+// tokens — turning a safety knob into an outage.
+const minRequestBodyBytes = 64 << 10
+
+// GetMaxRequestBodyBytes returns the customer-request body ceiling. Defaults to
+// 32 MiB when unset (≤ 0); an explicit value below 64 KiB is clamped up.
+// Mirrors GetPromptCacheMaxEntries: unset means default, too-small means floor,
+// so neither an empty config nor a typo can produce a hostile limit.
+func GetMaxRequestBodyBytes() int {
+	cfgLock.RLock()
+	defer cfgLock.RUnlock()
+	if cfg == nil || cfg.MaxRequestBodyBytes <= 0 {
+		return defaultMaxRequestBodyBytes
+	}
+	if cfg.MaxRequestBodyBytes < minRequestBodyBytes {
+		return minRequestBodyBytes
+	}
+	return cfg.MaxRequestBodyBytes
 }
 
 const defaultPromptCacheMaxEntries = 131072

@@ -896,14 +896,100 @@ here so they are not re-litigated):
   map, so the aliases are a last-resort fallback.
 
 **Open, prioritised in the proposal** (measured where a number appears): A3
-body-size ceilings — 9 unguarded `io.ReadAll(r.Body)` sites on the customer hot
-path, an unauthenticated memory-DoS surface; A4 admin brute-force limiting; B1
-in-flight quota accounting, the largest measured efficiency win, since quota state
-is up to 30 min stale and produced 112 cap errors in 8 minutes on one account; B3
-latency-aware routing, 1.42x median spread controlled for prompt size; D1 context
-propagation, 32 `http.NewRequest` vs 1 `http.NewRequestWithContext`.
+body-size ceilings — ~~9~~ **5** unguarded `io.ReadAll(r.Body)` sites on the
+customer hot path, an unauthenticated memory-DoS surface (**closed in round 17c
+below**; the "9" was my own miscount, corrected there); A4 admin brute-force
+limiting; B1 in-flight quota accounting, the largest measured efficiency win, since
+quota state is up to 30 min stale and produced 112 cap errors in 8 minutes on one
+account; B3 latency-aware routing, 1.42x median spread controlled for prompt size;
+D1 context propagation, 32 `http.NewRequest` vs 1 `http.NewRequestWithContext`.
 
 Cumulative: **78 defects** (unchanged — round 17 closed absences, not defects).
+
+---
+
+### Round-17c — the customer hot path had no body ceiling (A3 + C-1)
+
+Same class as round 17a/b: a missing capability, not incorrect behaviour, so the
+defect count again stays put. What makes this one sharper than the other two is the
+exposure. `authenticate()` returns `(nil, nil)` when `requireApiKey` is off
+(`proxy/auth.go`) — the live posture, deliberately so — which means the four
+customer handlers were reachable with no credential AND buffered an unbounded body
+with a bare `io.ReadAll(r.Body)` before any parsing. One request could make the
+process allocate without limit. `ReadTimeout: 60s` bounds *duration*, not *size*.
+
+| Surface | Site | Was |
+|---|---|---|
+| `/v1/messages` | `handleClaudeMessagesInternal` `handler.go:1561` | unbounded |
+| `/v1/messages/count_tokens` | `handleCountTokens` `handler.go:1519` | unbounded |
+| `/v1/chat/completions` | `handleOpenAIChat` `handler.go:2771` | unbounded |
+| `/v1/responses` | `handleOpenAIResponses` `responses_handler.go:22` | unbounded |
+| `/auth/import-cli-json` (admin) | `apiImportCliJson` `handler.go:6787` | unbounded, unlike its 4 siblings |
+
+**Correcting a number I published in the proposal last pass.** That document said
+"13 `MaxBytesReader` sites vs **9** bare `io.ReadAll(r.Body)`" while the table
+directly beneath it listed **five**. Re-measured per site: there are 9
+`io.ReadAll(r.Body)` occurrences, but **4 already had a `MaxBytesReader` assignment
+on the preceding line** (`apiImportCredentials:5997`, `apiPreviewCredentials:6612`,
+`apiApplyCredentials:6641`, `apiPreviewCliJson:6719`). Unguarded count: **5**. The
+table was right, the prose was wrong. This mattered practically — "9 unguarded"
+would have sent the next reader to re-guard four already-correct sites. Corrected in
+the proposal in the same pass, not silently.
+
+**Fix.** New `config.GetMaxRequestBodyBytes()` (field `maxRequestBodyBytes`) and a
+new `proxy/request_body_limit.go` helper wrapping `http.MaxBytesReader`, returning a
+sentinel so each surface answers **413** in its own dialect with type
+`request_too_large` — the same type `account_failover.go:115` already maps an
+upstream 413 to. `apiImportCliJson` instead took the plain `1<<20` bound its own
+preview half already had, because those two endpoints are one feature and should
+refuse at the same size. Wrapping the reader rather than trusting `Content-Length`
+follows the convention already documented in `admin_bot_api.go`: a chunked or lying
+header cannot slip past a reader that counts bytes.
+
+**The default is an inference from the corpus, and is labelled as one.** The corpus
+CANNOT measure customer body size — it stores the rewritten *upstream* body,
+truncated at `TraceMaxBodyBytes` (256 KiB: 19,647 of 23,417 stored bodies are
+flagged truncated), and among non-truncated records the stored request is usually
+empty (p50 = 0 B/token), so bytes-per-token is not calibratable from it. What it
+does measure, across 22,855 billed requests: p99 prompt **779,709 tokens**, max
+**903,947**. At a pessimistic 12 B/token (highest ratio on any non-truncated record)
+the largest real request is ~10 MiB, so **32 MiB** leaves ~3x headroom. Rejection
+rate at candidate caps on that corpus: 1 MiB → **32.0%** of real requests rejected,
+2 MiB → **4.6%**, 4 MiB+ → **0%**. Worth recording because a cap picked by intuition
+would plausibly have been 1 MiB, i.e. an outage. Floor clamp `minRequestBodyBytes`
+(64 KiB) exists for the same reason in the other direction — the p50 prompt alone is
+~150k tokens, so a typo'd tiny value would reject everything.
+
+**RED-proof.** `proxy/request_body_limit_test.go` (5 tests) and
+`config/request_body_limit_test.go` (2 tests). Neutralizing the proxy helper to its
+pre-fix bare `io.ReadAll`: all **4 behavioural subtests fail**, all **3 controls**
+(normal body still accepted, genuine read error still 400 not 413, nil body
+tolerated) stay green. Neutralizing the config default/clamp: **both** config tests
+fail with the exact expected messages. Both files restored byte-identical, sha
+verified against a pre-neutralization hash.
+
+**A test-design lesson, recorded because it nearly produced a false conclusion.**
+The first RED run did not fail an assertion — it **SIGSEGV'd**. Pre-fix, the
+oversized body is buffered and the handler proceeds to dispatch, where a bare test
+`Handler` has a nil pool (`pool/account.go:471`). That panic aborted the entire test
+binary, so the three control tests never executed and the neutralization output was
+unreadable; it looked like a broken test rather than a proven defect. The assertion
+now invokes the handler under a `recover()` that records a panic AS the failure,
+since reaching dispatch at all is exactly the defect being proven. **A RED signal
+that crashes the runner is not a usable RED signal** — re-run per-test in isolation
+to confirm which side actually failed.
+
+Also fixed a process error of mine in the same pass: the first restore attempt failed
+because the backup `cp` had written to a different filename than the restore read
+(`kirogo_a3_helper_backup.go` vs `kirogo_a3_helper_orig.go`). Recovered from the real
+backup and confirmed by sha. Lesson: verify the backup EXISTS before neutralizing,
+not after.
+
+Gate: build / vet / gofmt clean, `go test ./... -race -count=1` green across
+auth/config/pool/proxy. Test count measured per package, not asserted: **970**
+top-level test funcs (was 963, +7 — config 72, pool 91, auth 54, proxy 753).
+
+Cumulative: **78 defects** (unchanged — A3 and C-1 are hardening, not defects).
 
 ---
 

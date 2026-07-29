@@ -185,10 +185,25 @@ quota nobody will read. Round 13 established the correct contract (`clientGone` 
 never an account fault); this extends that from *billing* to *actually stopping the
 work*.
 
-### N-4. The customer hot path reads request bodies with no size cap (CODE-VERIFIED)
+### N-4. The customer hot path reads request bodies with no size cap — FIXED this pass (round 17c)
 
-MEASURED: 13 `MaxBytesReader` sites vs 9 bare `io.ReadAll(r.Body)`. The bare ones,
-with their enclosing functions:
+**Status: closed, together with C-1 below.** `config.GetMaxRequestBodyBytes()` (new,
+default 32 MiB, clamped up from anything under 64 KiB) plus a new
+`proxy/request_body_limit.go` helper now bound all four customer surfaces, and
+`apiImportCliJson` was given the same 1 MiB cap its four siblings already had.
+
+**A number in my own text, corrected.** The line below originally read "13
+`MaxBytesReader` sites vs **9** bare `io.ReadAll(r.Body)`", which contradicted the
+five-row table directly beneath it. Re-measured: there are **9 `io.ReadAll(r.Body)`
+occurrences**, but **4 of them are already preceded by a `MaxBytesReader` assignment
+on the line above** (`apiImportCredentials:5997`, `apiPreviewCredentials:6612`,
+`apiApplyCredentials:6641`, `apiPreviewCliJson:6719`). So the unguarded count was
+**5**, not 9 — the table was right and the prose was wrong. The distinction matters
+because "9 unguarded sites" would have sent a later reader to re-guard four sites
+that were already correct.
+
+MEASURED, corrected: 13 `MaxBytesReader` sites vs 9 `io.ReadAll(r.Body)` sites, of
+which **5 were unguarded**. Those five, with their enclosing functions:
 
 | Site | Function | Exposure |
 |---|---|---|
@@ -208,15 +223,56 @@ This interacts badly with the documented posture that `requireApiKey = false` an
 "the trust boundary is the network": anyone who can reach the port can OOM the proxy
 with a single request, with no credential.
 
-### C-1 (CANDIDATE DEFECT). `apiImportCliJson` is the only credential importer without a body cap
+### C-1. `apiImportCliJson` was the only credential importer without a body cap — FIXED (round 17c)
 
 Its four siblings all cap at 1 MiB on the line immediately before the read —
-`apiImportCredentials:5993`, `apiPreviewCredentials:6608`, `apiApplyCredentials:6637`,
-`apiPreviewCliJson:6715`. `apiImportCliJson:6783` does not.
+`apiImportCredentials:5997`, `apiPreviewCredentials:6612`, `apiApplyCredentials:6641`,
+`apiPreviewCliJson:6719`. `apiImportCliJson:6787` did not.
 
-Four out of five siblings sharing a guard, with the fifth missing it, reads as an
-oversight rather than a decision. Needs a RED test (oversized body → expect 413,
-observe the current unbounded read) before being claimed.
+Four out of five siblings sharing a guard, with the fifth missing it, read as an
+oversight rather than a decision, and it was: `apiImportCliJson` now takes the same
+`1<<20` bound as `apiPreviewCliJson`, the preview half of its own pair. Kept at the
+admin limit rather than routed through the new customer helper, because these two
+endpoints are one feature and should refuse at the same size.
+
+Filed as a hardening item, not as defect #79: an admin credential is required to
+reach it, and — unlike the customer surfaces — no unauthenticated path exists.
+
+### How N-4 / C-1 were verified
+
+`proxy/request_body_limit.go` wraps `http.MaxBytesReader` and returns a sentinel so
+each surface can answer **413** in its own error dialect (`request_too_large`, the
+type `account_failover.go:115` already uses for an upstream 413) instead of the 400
+it would send for an unreadable body. Wrapping the reader rather than trusting
+`Content-Length` is deliberate and matches the convention already documented in
+`admin_bot_api.go`: a chunked or lying `Content-Length` cannot slip past a reader
+that counts actual bytes.
+
+**The 32 MiB default is an inference, and is labelled as one.** The corpus cannot
+measure customer body size directly — it stores the *rewritten upstream* body,
+truncated at `TraceMaxBodyBytes` (256 KiB), and among non-truncated records the
+stored request is usually empty (p50 = 0 B/token), so bytes-per-token cannot be
+calibrated from it. What it *can* measure: across 22,855 billed requests the p99
+prompt is **779,709 tokens** and the maximum **903,947**. At a deliberately
+pessimistic 12 B/token (the highest ratio seen on any non-truncated record) the
+largest real request lands near 10 MiB, so 32 MiB leaves ~3x headroom over observed
+peak traffic. Rejection rates at candidate caps, computed on that corpus: 1 MiB
+would reject **32.0%** of real requests, 2 MiB **4.6%**, 4 MiB and above **0%**. A
+cap chosen by intuition would plausibly have been 1 MiB — an outage.
+
+RED-proof: `proxy/request_body_limit_test.go` (5 tests) + `config/request_body_limit_test.go`
+(2 tests). Under neutralization of the proxy helper, all 4 behavioural subtests fail
+and all 3 controls stay green; under neutralization of the config clamp, both config
+tests fail. Both files restored byte-identical, sha verified.
+
+**A test-design correction worth keeping.** The first RED run did not fail an
+assertion — it **segfaulted**. Pre-fix, an oversized body is buffered and the handler
+proceeds to dispatch, where a bare test `Handler` has a nil pool. That aborted the
+whole test binary, so the sibling subtests never ran and the neutralization result
+was unreadable — the failure looked like a broken test rather than a proven defect.
+The assertion now runs the handler under a `recover()` that records a panic *as* the
+failure, because reaching dispatch at all is precisely the defect. Lesson:
+**a RED signal that crashes the runner is not a usable RED signal.**
 
 ### N-5. The admin surface has no brute-force protection (CODE-VERIFIED)
 
@@ -328,12 +384,16 @@ Bedrock code.
   -count=1` on push and PR, pinned to Go 1.23 (Dockerfile builder parity).
   Concurrency-cancelled per ref, `permissions: contents: read`. Each step
   RED-proven — see N-1.
-- **A2. Graceful shutdown** (N-2): `signal.NotifyContext` + `srv.Shutdown(ctx)` +
-  `Handler.Close()` to flush trace/config writes. Drain deadline configurable.
-- **A3. Body-size ceilings** (N-4, C-1): one `MaxBytesReader` helper applied at the
-  four customer entry points and the one unguarded importer. Cap configurable,
-  defaulting generously (Claude payloads are large) — the goal is a ceiling, not a
-  tight limit. Return 413 with a proper Anthropic-shaped error.
+- **A2. Graceful shutdown** (N-2) — **DONE, round 17b** (`28cb891`).
+  `signal.NotifyContext` + `srv.Shutdown(ctx)` bounded by `shutdownGrace = 30s` +
+  a new `Handler.Close()` that stops both background loops and flushes stats,
+  prompt cache and trace store. Verified end-to-end with a real `SIGTERM` — see N-2.
+- **A3. Body-size ceilings** (N-4, C-1) — **DONE, round 17c.** One helper
+  (`proxy/request_body_limit.go`) applied at the four customer entry points, plus
+  the 1 MiB sibling cap on the one unguarded importer. Cap configurable via
+  `maxRequestBodyBytes`, default 32 MiB (~3x observed peak, 0% of real traffic
+  rejected), clamped up from anything under 64 KiB. Returns 413 `request_too_large`
+  in each surface's own error dialect — see N-4.
 - **A4. Admin brute-force resistance** (N-5): per-IP failure counter, exponential
   backoff, webhook alert on threshold.
 - **A5. Context propagation** (N-3): thread `r.Context()` into all 32 upstream call
@@ -429,12 +489,13 @@ Carried forward from the roadmap's evidence, restated so it is not re-litigated:
 
 Ordered by (impact × evidence) ÷ risk, with cheap-and-safe pulled forward:
 
-1. ~~**A1 CI gate**~~ — **DONE, round 17.** Smallest diff, now protects all 957
-   tests on every push and PR.
-2. **A2 graceful shutdown** — ~15 lines, ends mid-stream kills on deploy.
-   **Next up.**
-3. **A3 body caps + C-1** — closes an unauthenticated memory-DoS surface.
-4. **A4 admin brute-force** — small, closes an unlimited-guess hole.
+1. ~~**A1 CI gate**~~ — **DONE, round 17a** (`60fa604`). Smallest diff, now protects
+   all 970 tests on every push and PR.
+2. ~~**A2 graceful shutdown**~~ — **DONE, round 17b** (`28cb891`). Ends mid-stream
+   kills on deploy; also closed a latent `null`-clobber hazard in `UpdateStats`.
+3. ~~**A3 body caps + C-1**~~ — **DONE, round 17c.** Closed an unauthenticated
+   memory-DoS surface on all four customer entry points.
+4. **A4 admin brute-force** — small, closes an unlimited-guess hole. **Next up.**
 5. **B1 in-flight quota** — largest measured efficiency win; unlocks B3.
 6. **B2 cap backoff sizing** — finishes round 16 honestly.
 7. **F1 handler split** — unblocks every later round; safe once CI guards it.

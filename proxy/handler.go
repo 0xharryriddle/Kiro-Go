@@ -1516,8 +1516,12 @@ func (h *Handler) handleCountTokens(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	body, err := io.ReadAll(r.Body)
+	body, err := readLimitedRequestBody(w, r)
 	if err != nil {
+		if isRequestBodyTooLarge(err) {
+			h.sendClaudeError(w, http.StatusRequestEntityTooLarge, "request_too_large", "Request body exceeds the configured limit")
+			return
+		}
 		h.sendClaudeError(w, 400, "invalid_request_error", "Failed to read request body")
 		return
 	}
@@ -1558,8 +1562,12 @@ func (h *Handler) handleClaudeMessagesInternal(w http.ResponseWriter, r *http.Re
 	}
 
 	// 读取请求
-	body, err := io.ReadAll(r.Body)
+	body, err := readLimitedRequestBody(w, r)
 	if err != nil {
+		if isRequestBodyTooLarge(err) {
+			h.sendClaudeError(w, http.StatusRequestEntityTooLarge, "request_too_large", "Request body exceeds the configured limit")
+			return
+		}
 		h.sendClaudeError(w, 400, "invalid_request_error", "Failed to read request body")
 		return
 	}
@@ -2768,8 +2776,12 @@ func (h *Handler) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	body, err := io.ReadAll(r.Body)
+	body, err := readLimitedRequestBody(w, r)
 	if err != nil {
+		if isRequestBodyTooLarge(err) {
+			h.sendOpenAIError(w, http.StatusRequestEntityTooLarge, "request_too_large", "Request body exceeds the configured limit")
+			return
+		}
 		h.sendOpenAIError(w, 400, "invalid_request_error", "Failed to read request body")
 		return
 	}
@@ -6784,6 +6796,10 @@ func (h *Handler) apiPreviewIdeCache(w http.ResponseWriter, r *http.Request) {
 // importOne core the legacy endpoint uses. Per-item results are returned so a
 // partial batch still reports which credentials landed.
 func (h *Handler) apiImportCliJson(w http.ResponseWriter, r *http.Request) {
+	// Bounded at 1 MiB to match apiPreviewCliJson, the preview half of this same
+	// pair, which already wrapped its body. The import half did not — the only
+	// asymmetry among the four credential import/preview endpoints.
+	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
 		w.WriteHeader(400)

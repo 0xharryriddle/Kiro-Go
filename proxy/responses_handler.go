@@ -3,7 +3,6 @@ package proxy
 import (
 	"encoding/json"
 	"fmt"
-	"io"
 	"kiro-go/config"
 	"net/http"
 	"strings"
@@ -18,8 +17,12 @@ func (h *Handler) handleOpenAIResponses(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	body, err := io.ReadAll(r.Body)
+	body, err := readLimitedRequestBody(w, r)
 	if err != nil {
+		if isRequestBodyTooLarge(err) {
+			h.sendOpenAIError(w, http.StatusRequestEntityTooLarge, "request_too_large", "Request body exceeds the configured limit")
+			return
+		}
 		h.sendOpenAIError(w, 400, "invalid_request_error", "Failed to read request body")
 		return
 	}
