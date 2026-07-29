@@ -42,7 +42,40 @@ mass; `auth` 5,925; `config` 5,448; `pool` 4,705; `logger` 141.
 
 ## 2. NEW findings this pass (absent from the existing roadmap)
 
-### N-1. CI never compiles or tests the code (CODE-VERIFIED — highest-leverage gap)
+### N-1. CI never compiles or tests the code — FIXED this pass (round 17)
+
+**Status: closed.** `.github/workflows/ci.yml` added — two jobs, four gate steps
+(`go build ./...`, `go vet ./...`, a `gofmt -l` check, and `go test ./... -race
+-count=1`), pinned to Go 1.23 to match the Dockerfile builder stage that compiles
+the shipped binary (not the local 1.25.6 toolchain).
+
+RED-proven, each step independently, by temporarily introducing probe files and
+observing a real failure — a gate that cannot fail is a false green:
+
+| Step | Probe | Observed |
+|---|---|---|
+| `go vet` | `fmt.Printf("%s", int)` | exit 1, `wrong type int` |
+| `gofmt -l` | misformatted spacing | exit 1, file listed |
+| `go test` | `t.Fatal` in a probe test | exit 1, `--- FAIL` |
+| `go build` | (n/a — covered by vet's compile) | exit 0 on clean tree |
+
+Two corrections found while proving it, both of which would have shipped a weaker
+gate:
+
+1. My first probe was *accidentally well-formatted*, so the `gofmt` step passed and
+   proved nothing. Rewrote the probe with real misformatting before claiming it.
+2. The `go test` step initially failed on a **build** error from the vet-hostile
+   probe, not on the failing test — so the test job's ability to report a genuine
+   *test* failure was still unproven. Removed the vet probe and re-ran with only
+   `t.Fatal` present to isolate it.
+
+Baseline on the clean tree: build/vet/gofmt clean, and `go test ./... -race
+-count=1` green in ~37s (auth 1.1s, config 2.3s, pool 2.7s, proxy 31.3s) — well
+inside the 20-minute job timeout. Both probe files removed; tree verified restored.
+
+The original finding, for the record:
+
+#### Original finding (CODE-VERIFIED — highest-leverage gap)
 
 `.github/workflows/` contains exactly four files: `docker.yml` and three issue
 templates. `docker.yml` runs `docker/build-push-action` only.
@@ -219,8 +252,11 @@ Bedrock code.
 
 ### Track A — Correctness & safety (do these first)
 
-- **A1. CI gate** (N-1): `go build ./... && go vet ./... && gofmt -l . && go test ./... -race`
-  on push and PR. Add `-count=1` to defeat the test cache.
+- **A1. CI gate** (N-1) — **DONE, round 17.** `.github/workflows/ci.yml`:
+  `go build ./...`, `go vet ./...`, `gofmt -l` check, and `go test ./... -race
+  -count=1` on push and PR, pinned to Go 1.23 (Dockerfile builder parity).
+  Concurrency-cancelled per ref, `permissions: contents: read`. Each step
+  RED-proven — see N-1.
 - **A2. Graceful shutdown** (N-2): `signal.NotifyContext` + `srv.Shutdown(ctx)` +
   `Handler.Close()` to flush trace/config writes. Drain deadline configurable.
 - **A3. Body-size ceilings** (N-4, C-1): one `MaxBytesReader` helper applied at the
@@ -322,8 +358,10 @@ Carried forward from the roadmap's evidence, restated so it is not re-litigated:
 
 Ordered by (impact × evidence) ÷ risk, with cheap-and-safe pulled forward:
 
-1. **A1 CI gate** — smallest diff, protects all 957 tests. Do this first.
+1. ~~**A1 CI gate**~~ — **DONE, round 17.** Smallest diff, now protects all 957
+   tests on every push and PR.
 2. **A2 graceful shutdown** — ~15 lines, ends mid-stream kills on deploy.
+   **Next up.**
 3. **A3 body caps + C-1** — closes an unauthenticated memory-DoS surface.
 4. **A4 admin brute-force** — small, closes an unlimited-guess hole.
 5. **B1 in-flight quota** — largest measured efficiency win; unlocks B3.

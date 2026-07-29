@@ -1,0 +1,85 @@
+name: CI
+
+# Build/vet/format/test gate. Before this existed the only workflow was
+# docker.yml (an image build), so a failing test, a data race or gofmt drift
+# could merge green — the repo's 950+ tests only ran when someone remembered to
+# run them locally. See docs/plans/PROPOSAL_comprehensive_upgrade.md, finding N-1.
+#
+# Go version is pinned to 1.23 to match the Dockerfile builder stage, i.e. the
+# toolchain that actually compiles the shipped binary. go.mod declares the 1.21
+# language level; building with 1.23 keeps CI honest about the release path
+# rather than testing a toolchain nobody deploys.
+
+on:
+  push:
+    branches: [main, master, dev, harry]
+    tags: ['v*']
+  pull_request:
+    branches: [main, master, dev, harry]
+  workflow_dispatch:
+
+# A newer push to the same ref makes an in-flight run obsolete. Cancel it so the
+# queue reflects current HEAD instead of burning minutes on stale commits.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  GO_VERSION: '1.23'
+
+jobs:
+  build:
+    name: build / vet / gofmt
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: go build
+        run: go build ./...
+
+      - name: go vet
+        run: go vet ./...
+
+      # gofmt exits 0 even when it lists unformatted files, so the file list is
+      # the signal and must be turned into a failure explicitly.
+      - name: gofmt check
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then
+            echo "::error::gofmt found unformatted files:"
+            echo "$unformatted"
+            exit 1
+          fi
+          echo "gofmt clean"
+
+  test:
+    name: test
+    runs-on: ubuntu-latest
+    # 16 audit rounds of regression tests live here; the race detector is the
+    # point of this job, since concurrent pool/dispatch bugs are the class this
+    # repo actually hits.
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      # -count=1 defeats the test result cache, so a green run always means the
+      # tests actually executed against this commit.
+      - name: go test -race
+        run: go test ./... -race -count=1
