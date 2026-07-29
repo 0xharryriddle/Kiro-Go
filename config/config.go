@@ -1862,9 +1862,25 @@ func UpdateSettingsPatch(apiKey *string, requireApiKey *bool, password string) e
 	return Save()
 }
 
+// UpdateStats persists the running request/token counters.
+//
+// The nil guard matters for two reasons, both found in round 17 when
+// Handler.Close began calling this on the shutdown path (proxy/shutdown.go):
+//  1. Without it this nil-dereferences and crashes the process during shutdown
+//     whenever Init was never called or failed.
+//  2. Worse, Save() would marshal a nil cfg to the 4-byte literal `null`, which
+//     is non-empty and therefore sails past atomicWriteConfig's empty-write
+//     refusal — clobbering a real config file with `null`.
+//
+// Readers in this file already guard cfg this way; writers historically did not,
+// because every writer ran after a successful Init. A shutdown hook is the first
+// caller for which that is no longer guaranteed.
 func UpdateStats(totalReq, successReq, failedReq, totalTokens int, totalCredits float64) error {
 	cfgLock.Lock()
 	defer cfgLock.Unlock()
+	if cfg == nil {
+		return fmt.Errorf("config not initialized: refusing to persist stats")
+	}
 	cfg.TotalRequests = totalReq
 	cfg.SuccessRequests = successReq
 	cfg.FailedRequests = failedReq

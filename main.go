@@ -14,6 +14,8 @@
 package main
 
 import (
+	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"kiro-go/config"
@@ -23,10 +25,23 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strconv"
+	"syscall"
 	"time"
 )
+
+// shutdownGrace bounds how long a graceful shutdown waits for in-flight requests
+// to finish before connections are closed abruptly.
+//
+// 30s is a compromise. SSE streams here can legitimately run for minutes, so no
+// realistic deadline guarantees every stream completes; waiting indefinitely
+// instead would hang a deploy behind one slow client. Docker's default SIGKILL
+// timeout after SIGTERM is 10s, so a container stop will usually cut this short
+// anyway — set `stop_grace_period` in docker-compose.yml above this value if the
+// full drain matters for a given deployment.
+const shutdownGrace = 30 * time.Second
 
 func main() {
 	// CLI flags. -port/-host let an operator run on a different address without
@@ -106,7 +121,63 @@ func main() {
 		IdleTimeout:       120 * time.Second,
 	}
 
-	if err := srv.ListenAndServe(); err != nil {
-		logger.Fatalf("Server failed: %v", err)
+	// Graceful shutdown (round 17). Previously this was a bare ListenAndServe with
+	// no signal handling, so `docker compose up -d` sent SIGTERM and the process
+	// died instantly: in-flight SSE streams were severed mid-token, and pending
+	// stats / prompt-cache / queued trace rows were lost because nothing flushed.
+	//
+	// signal.NotifyContext cancels ctx on the first SIGINT/SIGTERM. The SECOND
+	// signal restores default handling, so an operator who does not want to wait
+	// out the drain can always Ctrl-C again and kill it immediately.
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	// ListenAndServe blocks, so it runs on its own goroutine and reports why it
+	// returned. A graceful Shutdown makes it return ErrServerClosed, which is the
+	// expected path and must not be treated as a failure.
+	serveErr := make(chan error, 1)
+	go func() {
+		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			serveErr <- err
+			return
+		}
+		serveErr <- nil
+	}()
+
+	select {
+	case err := <-serveErr:
+		// The listener failed on its own (e.g. port already bound). Nothing to
+		// drain — but still release Handler resources so the final stats save and
+		// cache flush happen before exit.
+		if err != nil {
+			handler.Close()
+			logger.Fatalf("Server failed: %v", err)
+		}
+		handler.Close()
+		return
+	case <-ctx.Done():
+		logger.Infof("Shutdown signal received; draining in-flight requests (up to %s)", shutdownGrace)
 	}
+
+	// stop() restores default signal handling now that the drain has begun, so a
+	// second SIGTERM is fatal rather than being swallowed by this handler.
+	stop()
+
+	// Bound the drain. An SSE stream can legitimately run for minutes, so this is
+	// a deadline, not a promise: Shutdown returns DeadlineExceeded if a stream is
+	// still open when the grace period expires, and we log that rather than
+	// pretending the shutdown was clean.
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownGrace)
+	defer cancel()
+
+	if err := srv.Shutdown(shutdownCtx); err != nil {
+		logger.Warnf("Graceful shutdown incomplete (%v); some connections were closed abruptly", err)
+	} else {
+		logger.Infof("HTTP server drained cleanly")
+	}
+
+	// Stop background loops and flush state AFTER the listener has drained, so any
+	// request that completed during the drain is included in the final save.
+	handler.Close()
+	logger.Infof("Shutdown complete")
 }

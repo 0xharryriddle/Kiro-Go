@@ -90,7 +90,78 @@ race, or a `gofmt` drift merges green.
 Severity: this is the highest return-on-effort item in the entire document. It is
 ~40 lines of YAML and it protects everything else.
 
-### N-2. No graceful shutdown — in-flight streams are killed on every deploy (CODE-VERIFIED)
+### N-2. No graceful shutdown — FIXED this pass (round 17)
+
+**Status: closed.** `main.go` now runs `ListenAndServe` on its own goroutine under
+`signal.NotifyContext(os.Interrupt, syscall.SIGTERM)`, drains via
+`srv.Shutdown(ctx)` bounded by a new `shutdownGrace = 30s`, then calls a new
+`Handler.Close()`. `proxy/shutdown.go` closes both stop channels, saves stats, and
+flushes the prompt cache + trace store.
+
+The half-built infrastructure this completes: `stopRefresh` and `stopStatsSaver`
+already had **four readers** — `backgroundRefresh` (`handler.go:527`),
+`importWatchLoop` (`import_watcher.go:71`), `backgroundStatsSaver` (`:2223`) and
+`backgroundTracePrune` (`:2388`) — and **zero writers**. No `Close`/`Stop`/`Shutdown`
+method existed on `Handler` at all. The loops could only ever die with the process.
+
+Design points worth keeping:
+
+- `Close()` must survive the **169 bare `&Handler{...}` literals** in the test
+  suite, which leave stop channels and caches nil. Closing a nil channel panics and
+  `promptCacheTracker.Stop` dereferences its receiver, so both are guarded.
+  Idempotency uses a `closeState` struct wrapping `sync.Once`, so a zero value is
+  usable and no existing test literal needed editing.
+- `Close()` runs **after** the drain, so requests completing during shutdown are
+  included in the final stats save.
+- A **second** signal restores default handling (`stop()` is called once the drain
+  begins), so an operator can always force-kill instead of waiting out the grace
+  period.
+- 30s is a compromise, documented as such: SSE streams here can run for minutes, so
+  no realistic deadline guarantees completion, and waiting forever would hang a
+  deploy behind one slow client. Docker's default 10s SIGKILL timeout will usually
+  cut it shorter anyway — `stop_grace_period` must be raised if a full drain
+  matters.
+
+**A real bug in my own `Close()`, caught by my own test.** The first RED run did not
+fail on the assertion — it **segfaulted**: `config.UpdateStats` (`config.go:1865`)
+dereferences `cfg` with no nil guard, and `Close()` is the first caller that can run
+before `Init` succeeds. Two consequences, the second worse than the first:
+
+1. A crash during shutdown whenever `Init` never ran or failed.
+2. `Save()` would marshal a nil `cfg` to the 4-byte literal `null` —
+   **verified empirically**, `json.MarshalIndent` returns `("null", nil)` — which is
+   non-empty and therefore passes `atomicWriteConfig`'s empty-write refusal,
+   clobbering a real config file with `null`.
+
+Fixed at the source in `config.UpdateStats`. Note the convention this respects: 19
+config *readers* nil-guard `cfg`, writers historically did not, because every writer
+ran after a successful `Init`. A shutdown hook is the first caller for which that
+assumption no longer holds. **Not counted among the 78 proven defects** — it was
+unreachable in shipped code and only became reachable via this new path.
+
+RED-proof: `proxy/shutdown_test.go`, 6 tests. Under neutralization (Close reduced to
+its pre-fix no-op) exactly the 3 behavioural tests fail — both channel-selector
+tests hang to their 2s deadline and the prompt-cache flush never lands — while all 3
+controls (idempotency, bare-literal survival, nil receiver) stay green. Restored
+byte-identical, sha verified.
+
+**End-to-end proof, not just unit tests.** Built to `/tmp`, ran with an isolated
+`CONFIG_PATH` on port 18099, confirmed `/healthz` served, sent a real `SIGTERM`, and
+observed the full ordered sequence in the process log:
+
+```
+Shutdown signal received; draining in-flight requests (up to 30s)
+HTTP server drained cleanly
+Handler closed: background loops stopped, state flushed
+Shutdown complete
+```
+
+Process exited 0. The live `data/config.json` (24 real accounts) was verified
+byte-identical before and after, since the e2e wrote only to its isolated path.
+
+The original finding, for the record:
+
+#### Original finding (CODE-VERIFIED)
 
 `main.go:109` calls `srv.ListenAndServe()` and nothing else. MEASURED across the
 tree: `signal.Notify` = **0 occurrences**, `.Shutdown(` = **0 occurrences**.

@@ -192,6 +192,10 @@ type Handler struct {
 	startTime       int64
 	stopRefresh     chan struct{}
 	stopStatsSaver  chan struct{}
+	// closeState guards Handler.Close so it is idempotent. A zero value is
+	// usable, so the test suite's `&Handler{...}` literals need no change.
+	// See proxy/shutdown.go.
+	closeState closeState
 	// 模型缓存
 	cachedModels    []ModelInfo
 	modelsCacheMu   sync.RWMutex
