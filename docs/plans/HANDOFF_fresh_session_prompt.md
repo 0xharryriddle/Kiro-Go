@@ -1,8 +1,8 @@
 # Kiro-Go — fresh-session handoff prompt
 
 Paste this whole file as the opening message of the new session. Every fact below
-was verified by command output at handoff time (2026-07-29, HEAD `d85d7de`,
-round 17c -- re-check with `git log -1` before trusting any SHA here).
+was verified by command output at handoff time (2026-07-29, HEAD `cd53437`,
+round 17d -- re-check with `git log -1` before trusting any SHA here).
 Where something is unverified or unknown, it says so — do not upgrade those to
 facts without checking.
 
@@ -61,10 +61,10 @@ these. Verified to be a STALL, not a deadlock — `config` imports nothing from
 
 | Fact | Value |
 |---|---|
-| HEAD | `d85d7de` (round 17c, request-body ceilings) — check `git log -1` |
+| HEAD | `cd53437` (round 17d, admin brute-force lockout) — check `git log -1` |
 | Remote | `origin/harry` identical (0 ahead / 0 behind) |
 | Working tree | clean at commit time |
-| Tests | 970 top-level test funcs pass across `config` `pool` `auth` `proxy` (measured per-package, not remembered: 957 at round 16 + 6 round 17b + 7 round 17c. Breakdown: config 72, pool 91, auth 54, proxy 753) |
+| Tests | 980 top-level test funcs pass across `config` `pool` `auth` `proxy` (measured per-package, not remembered: 957 at round 16 + 6 round 17b + 7 round 17c + 10 round 17d. Breakdown: config 72, pool 91, auth 54, proxy 763) |
 | `-race` | clean, 0 data races (`go test ./... -race -count=1`) |
 | `go vet` / `gofmt` | clean tree-wide |
 | CI | **now gated** — `.github/workflows/ci.yml` runs build + vet + gofmt + `-race` on push/PR to `main`/`master`/`dev`/`harry`. Go 1.23, matching the Dockerfile builder |
@@ -74,6 +74,8 @@ these. Verified to be a STALL, not a deadlock — `config` imports nothing from
 Recent commits (newest first):
 
 ```
+cd53437 fix(admin): lock out brute-force guessing on both admin gates (round 17d, closes A4)
+8419c59 docs: sync the handoff to d85d7de (round 17c)
 d85d7de fix(limits): bound every customer request body (round 17c, closes A3 + C-1)
 af16975 docs: record round 17 and sync the handoff to 28cb891
 28cb891 fix(shutdown): drain in-flight requests and flush state on SIGTERM (round 17b)
@@ -206,12 +208,66 @@ Also a process error of mine, recorded rather than hidden: the first restore fai
 because the backup `cp` wrote a different filename than the restore read. Verify the
 backup EXISTS before neutralizing, not after.
 
-**Next items from the proposal, in priority order:** A4 admin brute-force limiting
-(small, closes an unlimited-guess hole), B1 in-flight quota accounting (largest
-*measured* efficiency win: quota state is up to 30 min stale, which produced 112
-cap errors in 8 minutes on one account), B2 sizing the overage backoff from
-`NextResetDate` (finishes round 16 honestly), B3 latency-aware routing (1.42x
-measured median spread, controlled for prompt size).
+### Round 17d — the admin password accepted unlimited guesses (A4, `cd53437`)
+
+Both admin gates compared the shared secret in **constant time** — which closes a
+timing oracle and does nothing at all about volume. Nobody counted failures.
+MEASURED before the change: zero occurrences of `rateLimiter`, `Admit`, `lockout` or
+`failedAttempt` in either gate; the per-key `rateLimiter` is wired to *customer* keys
+only (`auth.go:100`).
+
+**There are TWO admin gates, and my own proposal only named one.** `N-5` described
+`authenticateAdminKey` (`admin_bot_api.go:64`, the 9 machine-integration routes) and
+missed `handleAdminAPI` (`handler.go:3675`), which gates all of `/admin/api/*`
+**including `/admin/api/config/export`** — raw `config.json`, refresh tokens and
+`ksk_` keys. That is the higher-value target of the two. Fixing only the named gate
+would have left the better door open. Both now share ONE throttle deliberately:
+separate counters would let an attacker spend the full budget twice by alternating
+surfaces. **Lesson: when a doc names "the" auth path, grep for siblings before
+believing it.**
+
+`proxy/admin_bruteforce.go`: per-source-IP counter, lockout doubling from 2s to a
+15-min cap past 5 failures, 30-min decay, bounded 4096-entry map that never evicts an
+active lockout. `Allow` is checked *before* the secret comparison, so a locked-out
+source learns nothing.
+
+Three decisions to preserve:
+
+1. **Keyed on `RemoteAddr` only — never `X-Forwarded-For`.** Zero XFF handling exists
+   in this tree and there is no trusted-proxy config to validate one against. On a
+   direct connection those headers are attacker-supplied, so keying on them lets a
+   source reset its own counter every request. **A lockout the attacker controls is
+   not a lockout.** Cost, stated in the code rather than hidden: behind a reverse
+   proxy failures aggregate to one apparent source, so an attacker can lock real
+   admins out of that address. Safer direction — admin access recovers in ≤15 min, an
+   unlimited guess budget against credential export does not.
+2. **The state map is bounded** because its keys are attacker-controlled; an
+   unbounded map would recreate exactly the memory-growth surface round 17c closed.
+   Never evicting a live lockout denies the bypass of flooding the map to clear your
+   own penalty.
+3. **A nil throttle is tolerated** (auth still enforced, lockout skipped) so the bare
+   `&Handler{...}` literals across the suite keep working — same constraint 17b hit.
+
+**The methodology lesson, and it is the important part of this round.**
+`TestAdminLockoutIsPerSourceAddress` passes **with and without** the fix — the exact
+false-green shape this project calls worthless. Rather than assume it was a fine
+control, it was run against the specific mutant it exists to catch:
+`adminAuthClientIP` collapsed to one constant key (a global lockout). It was the
+**only** test in the file that failed, so it does constrain something real. Mutant
+reverted from backup, confirmed absent by grep. **For a control that cannot fail
+under neutralization, mutate the thing it claims to constrain — otherwise it is
+decoration.**
+
+Not built, deliberately: the proposal also floated a webhook alert on repeated
+failures. The lockout is the security control; an alert is observability and belongs
+with D2 rather than being bundled in unproven.
+
+**Next items from the proposal, in priority order:** B1 in-flight quota accounting
+(largest *measured* efficiency win: quota state is up to 30 min stale, which produced
+112 cap errors in 8 minutes on one account), B2 sizing the overage backoff from
+`NextResetDate` (finishes round 16 honestly), F1 splitting the 8.2k-line
+`handler.go` (now safe to attempt, since CI guards it), B3 latency-aware routing
+(1.42x measured median spread, controlled for prompt size).
 
 ### Round 16 — the 402/overage path never parked the account (defect 78)
 
