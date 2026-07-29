@@ -1,8 +1,8 @@
 # Kiro-Go — fresh-session handoff prompt
 
 Paste this whole file as the opening message of the new session. Every fact below
-was verified by command output at handoff time (2026-07-29, HEAD `28cb891`,
-round 17b -- re-check with `git log -1` before trusting any SHA here).
+was verified by command output at handoff time (2026-07-29, HEAD `d85d7de`,
+round 17c -- re-check with `git log -1` before trusting any SHA here).
 Where something is unverified or unknown, it says so — do not upgrade those to
 facts without checking.
 
@@ -61,10 +61,10 @@ these. Verified to be a STALL, not a deadlock — `config` imports nothing from
 
 | Fact | Value |
 |---|---|
-| HEAD | `28cb891` (round 17b, graceful shutdown) — check `git log -1` |
+| HEAD | `d85d7de` (round 17c, request-body ceilings) — check `git log -1` |
 | Remote | `origin/harry` identical (0 ahead / 0 behind) |
 | Working tree | clean at commit time |
-| Tests | 963 top-level test funcs pass across `config` `pool` `auth` `proxy` (measured per-package, not remembered: 957 at round 16 + 6 round 17b. Breakdown: config 70, pool 91, auth 54, proxy 748) |
+| Tests | 970 top-level test funcs pass across `config` `pool` `auth` `proxy` (measured per-package, not remembered: 957 at round 16 + 6 round 17b + 7 round 17c. Breakdown: config 72, pool 91, auth 54, proxy 753) |
 | `-race` | clean, 0 data races (`go test ./... -race -count=1`) |
 | `go vet` / `gofmt` | clean tree-wide |
 | CI | **now gated** — `.github/workflows/ci.yml` runs build + vet + gofmt + `-race` on push/PR to `main`/`master`/`dev`/`harry`. Go 1.23, matching the Dockerfile builder |
@@ -74,6 +74,8 @@ these. Verified to be a STALL, not a deadlock — `config` imports nothing from
 Recent commits (newest first):
 
 ```
+d85d7de fix(limits): bound every customer request body (round 17c, closes A3 + C-1)
+af16975 docs: record round 17 and sync the handoff to 28cb891
 28cb891 fix(shutdown): drain in-flight requests and flush state on SIGTERM (round 17b)
 60fa604 ci: add a build/vet/gofmt/test gate (round 17, closes N-1)
 5e7b1ae docs: whole-surface completion & upgrade proposal (round 17 audit)
@@ -162,12 +164,54 @@ an isolated `CONFIG_PATH`, sent a real `SIGTERM`, observed all four ordered log
 stages and exit 0, and confirmed the live `data/config.json` (24 real accounts)
 byte-identical before and after.
 
-**Next items from the proposal, in priority order:** A3 body-size ceilings (9
-unguarded `io.ReadAll(r.Body)` sites on the customer hot path — unauthenticated
-memory DoS), A4 admin brute-force limiting, B1 in-flight quota accounting (largest
+### Round 17c — no ceiling on customer request bodies (A3 + C-1, `d85d7de`)
+
+Four customer handlers did a bare `io.ReadAll(r.Body)` with no size bound before any
+parsing. What makes this sharper than a normal hardening item: `authenticate()`
+returns `(nil, nil)` when `requireApiKey` is off (`proxy/auth.go`) — the live,
+deliberate posture — so those handlers are reachable **with no credential**, and one
+request could make the process allocate without limit. `ReadTimeout: 60s` bounds
+duration, not size.
+
+Closed by `config.GetMaxRequestBodyBytes()` (field `maxRequestBodyBytes`, default
+32 MiB, clamped up from anything under 64 KiB) plus `proxy/request_body_limit.go`,
+which wraps `http.MaxBytesReader` and returns a sentinel so each surface answers
+**413 `request_too_large`** in its own error dialect. `apiImportCliJson` separately
+took the plain 1 MiB bound its own preview half already had.
+
+**A number in my own proposal, corrected.** It claimed "9 bare `io.ReadAll(r.Body)`"
+while its own table listed five. Re-measured: 9 occurrences, but **4 already had a
+`MaxBytesReader` on the preceding line** — unguarded count was **5**. Left in the
+docs as a visible correction because "9 unguarded" would have sent the next reader to
+re-guard four already-correct sites.
+
+**The default is an inference, labelled as one.** The corpus cannot measure customer
+body size: it stores the rewritten *upstream* body truncated at 256 KiB (19,647 of
+23,417 stored bodies are flagged truncated), and non-truncated records are usually
+empty (p50 = 0 B/token). What it does measure over 22,855 billed requests: p99 prompt
+779,709 tokens, max 903,947 — so at a pessimistic 12 B/token the largest real request
+is ~10 MiB. Rejection rate at candidate caps: **1 MiB would reject 32.0% of real
+traffic**, 2 MiB 4.6%, 4 MiB+ 0%. Intuition would plausibly have picked 1 MiB, i.e.
+an outage. That is why the floor clamp exists too.
+
+**The lesson worth carrying forward: a RED signal that crashes the runner is not a
+usable RED signal.** The first RED run SIGSEGV'd rather than asserting — pre-fix the
+oversized body is buffered and dispatch proceeds, where a bare test `Handler` has a
+nil pool (`pool/account.go:471`). That aborted the whole binary, so the three control
+tests never ran and the neutralization output was unreadable. The assertion now runs
+the handler under `recover()` and records a panic AS the failure, since reaching
+dispatch at all is the defect. Re-run per-test in isolation when a RED run dies.
+
+Also a process error of mine, recorded rather than hidden: the first restore failed
+because the backup `cp` wrote a different filename than the restore read. Verify the
+backup EXISTS before neutralizing, not after.
+
+**Next items from the proposal, in priority order:** A4 admin brute-force limiting
+(small, closes an unlimited-guess hole), B1 in-flight quota accounting (largest
 *measured* efficiency win: quota state is up to 30 min stale, which produced 112
-cap errors in 8 minutes on one account), B3 latency-aware routing (1.42x measured
-median spread, controlled for prompt size).
+cap errors in 8 minutes on one account), B2 sizing the overage backoff from
+`NextResetDate` (finishes round 16 honestly), B3 latency-aware routing (1.42x
+measured median spread, controlled for prompt size).
 
 ### Round 16 — the 402/overage path never parked the account (defect 78)
 
