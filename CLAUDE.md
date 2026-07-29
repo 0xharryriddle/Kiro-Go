@@ -86,10 +86,21 @@ go test ./proxy/ -run Bedrock -v      # Bedrock tests only
 
 ## Known scope gaps (candidate follow-ups)
 
-- OpenAI-compatible surface is not wired for Bedrock (needs OpenAI→Anthropic request
-  translation). Bedrock accounts are currently skipped in the OpenAI loops.
-- Model aliases in `defaultBedrockModelMap` are convenience defaults; real IDs vary by
-  region/enablement. A `bedrock:ListFoundationModels` auto-discovery would remove the
-  guesswork.
+- ~~OpenAI-compatible surface is not wired for Bedrock~~ **CLOSED.**
+  `/v1/chat/completions` serves Bedrock accounts today: `proxy/bedrock_openai.go`
+  (794 lines) implements the OpenAI↔Anthropic bridge and is dispatched from
+  `handleOpenAIStream` (`handler.go:2873`) and `handleOpenAINonStream` (`:3346`).
+  The remaining gap is narrower: **`/v1/responses`** has no
+  OpenAI-Responses→Anthropic translation, so it deliberately *skips* Bedrock
+  accounts (`responses_handler.go:214`, `:443`) rather than 403-ing them. A
+  Bedrock-only pool therefore cannot answer `/v1/responses`.
+- ~~Model aliases in `defaultBedrockModelMap` are guesswork; ListFoundationModels
+  would remove it~~ **CLOSED.** Auto-discovery ships in
+  `proxy/bedrock_discovery.go` (415 lines): `discoverBedrockModels` (`:257`) calls
+  `/foundation-models`, filters to ACTIVE on-demand text models (`:100`), merges
+  inference profiles (`:138`), and caches per account with a TTL (`:180-215`).
+  `resolveBedrockModelID` consults `BedrockModelMap` → `discoveredBedrockModelFor`
+  (`bedrock.go:111`) → `defaultBedrockModelMap` (`:119`), so the static aliases are
+  now only a last-resort fallback behind live discovery.
 - Secrets are stored plaintext in config JSON (matches existing OAuth/Kiro-key
   storage). Encrypting secrets at rest would be a repo-wide improvement.
