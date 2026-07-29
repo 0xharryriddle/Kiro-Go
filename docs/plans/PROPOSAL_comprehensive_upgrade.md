@@ -274,7 +274,12 @@ The assertion now runs the handler under a `recover()` that records a panic *as*
 failure, because reaching dispatch at all is precisely the defect. Lesson:
 **a RED signal that crashes the runner is not a usable RED signal.**
 
-### N-5. The admin surface has no brute-force protection (CODE-VERIFIED)
+### N-5. The admin surface has no brute-force protection — FIXED this pass (round 17d)
+
+**Status: closed.** New `proxy/admin_bruteforce.go`: a per-source-IP failure counter
+with exponential lockout, wired into **both** admin gates.
+
+The original finding, and a scope error in it, first:
 
 `authenticateAdminKey` (`proxy/admin_bot_api.go:64-83`) does a single
 `subtle.ConstantTimeCompare` against `config.GetPassword()`. Correct as far as it
@@ -285,9 +290,59 @@ But MEASURED: zero occurrences of `rateLimiter`, `Admit`, `lockout`, or
 is wired to *customer* keys only (`proxy/auth.go:100`).
 
 So the admin password — one shared static secret guarding account creation, key
-minting, and credit recharge — accepts unlimited guesses at full line rate, with no
-delay, no lockout, and no alert. A per-IP failure counter with exponential backoff
-plus a webhook alert on repeated failures is a small, contained change.
+minting, and credit recharge — accepted unlimited guesses at full line rate, with no
+delay and no lockout.
+
+**Correcting my own scope.** This section named only `authenticateAdminKey`. There
+are **two independent admin authentication paths**, and fixing one would have left a
+door open: `handleAdminAPI` (`handler.go:3675`) gates all of `/admin/api/*` with its
+own separate `ConstantTimeCompare` — including `/admin/api/config/export`, which
+returns the raw `config.json` (refresh tokens, `ksk_` keys). That is the *higher*
+value target of the two, and the original write-up missed it. Both gates now share
+one throttle, deliberately: separate counters would let an attacker spend the full
+budget twice by alternating surfaces.
+
+**Design decisions worth recording.**
+
+- **Keyed on `RemoteAddr` only, never `X-Forwarded-For`.** MEASURED: zero
+  `X-Forwarded-For` handling anywhere in the tree, and no trusted-proxy config to
+  validate such a header against. On a direct connection those headers are
+  attacker-supplied, so keying on them would let one source reset its own counter
+  every request by varying a header — *a lockout the attacker controls is not a
+  lockout*. The tradeoff is stated plainly in the code: behind a reverse proxy all
+  requests share one apparent source, so failures aggregate and a determined
+  attacker can lock legitimate admins out of that address. That is the safer
+  direction — lost admin access recovers in ≤15 min, an unlimited guess budget
+  against a credential-export secret does not. A trusted-proxy allowlist would let
+  the header be honoured safely; that is a separate change.
+- **Threshold 5, not 1.** An operator fat-fingering a password, or a bot integration
+  restarting with a stale secret, must not be locked out on the first mistake.
+- **Lockout doubles from 2s, capped at 15 min**, with a 30-min decay window so two
+  typos months apart never accumulate. The cap keeps a locked-out operator's
+  recovery bounded without a restart.
+- **The state map is bounded (4096 sources) with LRU eviction, and an ACTIVE lockout
+  is never evicted.** The map is keyed by attacker-controlled addresses, so an
+  unbounded map would make this defence its own memory-growth surface — the exact
+  class of bug round 17c closed on the request path. Not evicting live lockouts
+  denies the obvious bypass: flood the map with fresh source addresses to clear your
+  own penalty.
+- **A nil throttle is tolerated** (auth still enforced, lockout skipped) so the many
+  bare `&Handler{...}` literals in the test suite keep working — the same
+  constraint round 17b hit with `Close()`.
+
+**RED-proof.** `proxy/admin_bruteforce_test.go`, 10 tests. Under neutralization of
+both gates to their pre-fix shape, exactly the **4 behavioural** tests fail
+(bot-gate lockout, api-gate lockout, cross-gate sharing, XFF-spoof resistance) and
+every pre-existing admin test keeps passing — so the neutralization removed only the
+new capability.
+
+**One control needed a mutation, not a neutralization, to prove it had teeth.**
+`TestAdminLockoutIsPerSourceAddress` passes both with and without the fix, which is
+exactly the false-green shape this project treats as worthless. Rather than assume,
+it was tested against the specific mutant it exists to catch — `adminAuthClientIP`
+collapsed to a single constant key, i.e. a global lockout. It was the **only** test
+in the file that failed. Reverted from backup, verified absent from the tree by
+grep. A control that no mutation can break is decoration; this one is not.
 
 ### N-6. No TLS support in-process (CODE-VERIFIED)
 
@@ -394,8 +449,14 @@ Bedrock code.
   `maxRequestBodyBytes`, default 32 MiB (~3x observed peak, 0% of real traffic
   rejected), clamped up from anything under 64 KiB. Returns 413 `request_too_large`
   in each surface's own error dialect — see N-4.
-- **A4. Admin brute-force resistance** (N-5): per-IP failure counter, exponential
-  backoff, webhook alert on threshold.
+- **A4. Admin brute-force resistance** (N-5) — **DONE, round 17d.**
+  `proxy/admin_bruteforce.go`: per-source-IP failure counter, lockout doubling from
+  2s to a 15-min cap after 5 failures, 30-min decay, bounded 4096-entry state map
+  that never evicts a live lockout. Wired into **both** admin gates
+  (`authenticateAdminKey` and `handleAdminAPI`) sharing one counter. Keyed on
+  `RemoteAddr` only — see N-5 for why honouring `X-Forwarded-For` would hand the
+  attacker the reset. Webhook alerting on threshold was NOT built; the lockout is
+  the security control, an alert is observability and belongs with D2.
 - **A5. Context propagation** (N-3): thread `r.Context()` into all 32 upstream call
   sites; classify `context.Canceled` as client-gone, never an account fault.
   Large — stage it per surface, Claude path first.
@@ -495,8 +556,9 @@ Ordered by (impact × evidence) ÷ risk, with cheap-and-safe pulled forward:
    kills on deploy; also closed a latent `null`-clobber hazard in `UpdateStats`.
 3. ~~**A3 body caps + C-1**~~ — **DONE, round 17c.** Closed an unauthenticated
    memory-DoS surface on all four customer entry points.
-4. **A4 admin brute-force** — small, closes an unlimited-guess hole. **Next up.**
-5. **B1 in-flight quota** — largest measured efficiency win; unlocks B3.
+4. ~~**A4 admin brute-force**~~ — **DONE, round 17d.** Closed an unlimited-guess
+   hole on both admin gates, including the one guarding credential export.
+5. **B1 in-flight quota** — largest measured efficiency win; unlocks B3. **Next up.**
 6. **B2 cap backoff sizing** — finishes round 16 honestly.
 7. **F1 handler split** — unblocks every later round; safe once CI guards it.
 8. **A5 ctx propagation**, then B3/B4, then Track C/D/E by need.

@@ -993,6 +993,87 @@ Cumulative: **78 defects** (unchanged — A3 and C-1 are hardening, not defects)
 
 ---
 
+### Round-17d — the admin password accepted unlimited guesses (A4)
+
+Same class again: a missing control, not wrong behaviour, so the defect count holds
+at 78. Both admin gates already compared the shared secret in **constant time**,
+which closes a timing oracle and does nothing whatsoever about volume. Nobody was
+counting failures.
+
+| Gate | Site | Guards |
+|---|---|---|
+| `authenticateAdminKey` | `admin_bot_api.go:64` | the 9 machine-integration routes (mint / delete / recharge keys, add accounts) |
+| `handleAdminAPI` | `handler.go:3675` | all of `/admin/api/*` — **including `/admin/api/config/export`**, which returns raw `config.json` with refresh tokens and `ksk_` keys |
+
+MEASURED before the change: zero occurrences of `rateLimiter`, `Admit`, `lockout`,
+or `failedAttempt` in either file. The per-key `rateLimiter` exists but is wired to
+*customer* keys only (`auth.go:100`).
+
+**Correcting the scope of my own proposal.** The N-5 write-up named only
+`authenticateAdminKey`. There are **two independent gates**, each with its own
+`ConstantTimeCompare`, and the one the write-up missed is the higher-value target —
+`/admin/api/config/export` hands over every stored credential. Fixing only the named
+gate would have left the better door open. Both now share ONE throttle, deliberately:
+separate counters would let an attacker spend the full budget twice by alternating
+surfaces.
+
+**Fix.** New `proxy/admin_bruteforce.go` — per-source-IP failure counter, lockout
+doubling from 2 s to a 15-minute cap once a source passes 5 failures, 30-minute decay
+so old typos never accumulate, and a bounded 4096-entry state map with LRU eviction
+that **never evicts an active lockout**. Both gates check `Allow` *before* comparing
+the secret (a locked-out source learns nothing), book `RecordFailure` on every
+rejection including the no-password-configured case, and call `RecordSuccess` on a
+valid password so an operator who mistyped twice is not locked out by their next
+mistake.
+
+Three decisions worth keeping:
+
+1. **Keyed on `RemoteAddr` ONLY — never `X-Forwarded-For`.** Zero XFF handling exists
+   in this tree and there is no trusted-proxy config to validate such a header
+   against. On a direct connection those headers are attacker-supplied, so keying on
+   them lets one source reset its own counter every request by varying a header. **A
+   lockout the attacker controls is not a lockout.** The cost is stated in the code
+   rather than hidden: behind a reverse proxy all requests share one apparent source,
+   so failures aggregate and an attacker can lock real admins out of that address.
+   That is the safer direction — lost admin access recovers in ≤15 min; an unlimited
+   guess budget against a credential-export secret does not.
+2. **Bounded state map.** The keys are attacker-controlled, so an unbounded map would
+   make this defence its own memory-growth surface — precisely what round 17c closed
+   on the request path. Refusing to evict live lockouts denies the obvious bypass
+   (flood the map with fresh addresses to clear your own penalty).
+3. **A nil throttle is tolerated** — auth still enforced, only the lockout skipped —
+   so the bare `&Handler{...}` literals across the suite keep working. Same
+   constraint round 17b hit with `Close()`.
+
+**RED-proof.** `proxy/admin_bruteforce_test.go`, 10 tests. Neutralizing BOTH gates to
+their pre-fix shape fails exactly the **4 behavioural** tests (bot-gate lockout,
+api-gate lockout, cross-gate sharing, XFF-spoof resistance) while **every
+pre-existing admin test keeps passing** — so the neutralization removed the new
+capability and nothing else. Both files restored and verified byte-identical against
+pre-neutralization backups.
+
+**A control that survived neutralization, and what I did instead of assuming.**
+`TestAdminLockoutIsPerSourceAddress` passes with AND without the fix — the exact
+false-green shape this project treats as worthless, since a lockout that never fires
+also never leaks across sources. Instead of trusting it, it was run against the
+specific mutant it exists to catch: `adminAuthClientIP` collapsed to a single
+constant key (a global lockout). It was the **only** test in the file that failed.
+Mutant reverted from backup and confirmed absent from the tree by grep. **Lesson: for
+a control that cannot fail under neutralization, mutate the thing it claims to
+constrain — otherwise it is decoration.**
+
+**Not built, stated plainly:** the proposal also suggested a webhook alert on repeated
+failures. Skipped deliberately — the lockout is the security control; an alert is
+observability and belongs with D2 rather than being bundled in here unproven.
+
+Gate: build / vet / gofmt clean, `go test ./... -race -count=1` green across
+auth/config/pool/proxy. Test count measured per package, not asserted: **980**
+top-level test funcs (was 970, +10 — config 72, pool 91, auth 54, proxy 763).
+
+Cumulative: **78 defects** (unchanged — A4 is a missing control, not a defect).
+
+---
+
 ## 4. Remaining work
 
 ### R13-followup — Bedrock paths never emit a request trace (CANDIDATE, not fixed)

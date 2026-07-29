@@ -241,6 +241,11 @@ type Handler struct {
 	auditLogsMu sync.RWMutex
 	// F6: per-API-key sliding-window RPM/TPM limiter (in-process).
 	rateLimiter *rateLimiter
+	// A4: per-source-IP admin authentication failure throttle (in-process),
+	// shared by handleAdminAPI and authenticateAdminKey. Nil is tolerated —
+	// admin auth still applies, only the lockout is skipped — so the bare
+	// &Handler{...} literals throughout the test suite keep working.
+	adminAuthThrottle *adminAuthThrottle
 	// F5: in-process exact-match response cache (opt-in, non-stream only).
 	responseCache *responseCache
 	// Pending Kiro-issued API-key probes. Secrets live only in this TTL-bound,
@@ -476,10 +481,13 @@ func NewHandler() *Handler {
 		stopStatsSaver:  make(chan struct{}),
 		promptCache:     newPromptCacheTracker(defaultPromptCacheTTL),
 		rateLimiter:     newRateLimiter(),
-		responseCache:   newResponseCache(),
-		traceStore:      newTraceStore(tracesDir(), 0),
-		traceBodies:     newTraceBodyStore(traceBodiesDir()),
-		customApiLedger: newCustomApiCreditLedger(),
+		// A4: shared by both admin gates so a brute-force attempt cannot be
+		// spread across the two surfaces to get twice the budget.
+		adminAuthThrottle: newAdminAuthThrottle(),
+		responseCache:     newResponseCache(),
+		traceStore:        newTraceStore(tracesDir(), 0),
+		traceBodies:       newTraceBodyStore(traceBodiesDir()),
+		customApiLedger:   newCustomApiCreditLedger(),
 		// MERGE POLICY NOTE (fork ↔ upstream v1.1.5): upstream's Microsoft SSO maps
 		// are appended; the shared keys above are identical on both sides.
 		microsoftSelections:  make(map[string]*microsoftProfileSelection),
@@ -3696,8 +3704,19 @@ func (h *Handler) handleAdminAPI(w http.ResponseWriter, r *http.Request) {
 	// The API-key path already fails closed in exactly this situation (see
 	// authenticate in auth.go: "Auth required but nothing configured → fail
 	// closed"); this now matches it.
+	// A4: a locked-out source is refused before the secret is compared at all,
+	// so crossing the threshold yields no information about the password.
+	// Checked after the header/cookie read but before GetPassword so the
+	// throttle applies even on a deployment with no password configured.
+	adminIP := adminAuthClientIP(r)
+	if allowed, retryAfter := h.adminAuthThrottle.Allow(adminIP, time.Now()); !allowed {
+		rejectAdminAuthThrottled(w, retryAfter)
+		return
+	}
+
 	expected := config.GetPassword()
 	if expected == "" {
+		h.adminAuthThrottle.RecordFailure(adminIP, time.Now())
 		w.WriteHeader(401)
 		json.NewEncoder(w).Encode(map[string]string{
 			"error": "Admin access is not available: no admin password is configured",
@@ -3705,13 +3724,16 @@ func (h *Handler) handleAdminAPI(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Constant-time comparison so an unauthenticated, unrate-limited endpoint
-	// does not leak the password prefix through response timing.
+	// Constant-time comparison so an unauthenticated endpoint does not leak the
+	// password prefix through response timing. Constant time removes the timing
+	// oracle; the throttle above is what removes the unlimited guess budget.
 	if subtle.ConstantTimeCompare([]byte(password), []byte(expected)) != 1 {
+		h.adminAuthThrottle.RecordFailure(adminIP, time.Now())
 		w.WriteHeader(401)
 		json.NewEncoder(w).Encode(map[string]string{"error": "Unauthorized"})
 		return
 	}
+	h.adminAuthThrottle.RecordSuccess(adminIP)
 
 	path := strings.TrimPrefix(r.URL.Path, "/admin/api")
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")

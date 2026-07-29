@@ -62,6 +62,14 @@ func decodeAdminBotBody(w http.ResponseWriter, r *http.Request, dst interface{})
 // 401 and returns false on failure. Fails closed when no admin password is
 // configured, so a fresh deployment can't expose key-minting unauthenticated.
 func (h *Handler) authenticateAdminKey(w http.ResponseWriter, r *http.Request) bool {
+	// A4: refuse a locked-out source BEFORE comparing the secret, so a
+	// brute-force attempt gets no signal at all once it crosses the threshold.
+	ip := adminAuthClientIP(r)
+	if allowed, retryAfter := h.adminAuthThrottle.Allow(ip, time.Now()); !allowed {
+		rejectAdminAuthThrottled(w, retryAfter)
+		return false
+	}
+
 	provided := ""
 	if auth := r.Header.Get("Authorization"); strings.HasPrefix(auth, "Bearer ") {
 		provided = strings.TrimPrefix(auth, "Bearer ")
@@ -74,11 +82,18 @@ func (h *Handler) authenticateAdminKey(w http.ResponseWriter, r *http.Request) b
 	// Constant-time compare; also rejects the empty-password case because an
 	// empty `provided` never reaches here with a non-empty expected value.
 	if expected == "" || subtle.ConstantTimeCompare([]byte(provided), []byte(expected)) != 1 {
+		// Book the failure. The unconfigured-password case is counted too: it
+		// is still an unauthenticated attempt against an admin route, and not
+		// counting it would leave a fresh deployment freely probeable.
+		h.adminAuthThrottle.RecordFailure(ip, time.Now())
 		w.Header().Set("Content-Type", "application/json; charset=utf-8")
 		w.WriteHeader(http.StatusUnauthorized)
 		json.NewEncoder(w).Encode(map[string]string{"error": "Unauthorized"})
 		return false
 	}
+	// Proven possession of the secret clears the streak, so an operator who
+	// mistyped twice is not locked out by their next mistake.
+	h.adminAuthThrottle.RecordSuccess(ip)
 	return true
 }
 
