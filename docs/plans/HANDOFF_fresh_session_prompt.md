@@ -1,8 +1,8 @@
 # Kiro-Go — fresh-session handoff prompt
 
 Paste this whole file as the opening message of the new session. Every fact below
-was verified by command output at handoff time (2026-07-28, HEAD `82b74a9` + round 16
-committed on top -- re-check with `git log -1` before trusting any SHA here).
+was verified by command output at handoff time (2026-07-29, HEAD `28cb891`,
+round 17b -- re-check with `git log -1` before trusting any SHA here).
 Where something is unverified or unknown, it says so — do not upgrade those to
 facts without checking.
 
@@ -11,11 +11,19 @@ facts without checking.
 ## 1. Your task
 
 Continue the Kiro-Go audit-and-harden effort. It is not "finish a feature"; it is
-**find real defects, prove them, fix them, verify, deploy**. The previous session
-closed 78 defects across sixteen rounds (13 + a 13b follow-up driven by an
-adversarial review of round 13's own fix, then 14, 15 and 16). There is no deadline and
-no fixed list —
-work the highest-risk unreviewed surface, then the next.
+**find real defects, prove them, fix them, verify, deploy**. The previous sessions
+closed 78 defects across seventeen rounds (13 + a 13b follow-up driven by an
+adversarial review of round 13's own fix, then 14, 15, 16, and 17a/17b). There is
+no deadline and no fixed list — work the highest-risk unreviewed surface, then the
+next.
+
+**Round 17 changed the shape of this work.** Rounds 1-16 were defect-driven: find a
+bug, prove it, fix it. Round 17 added a *completeness* axis — a full-surface audit
+of what the gateway does not do at all, written up in
+`docs/plans/PROPOSAL_comprehensive_upgrade.md` (Tracks A-D, each item marked
+CODE-VERIFIED, DONE, or ALREADY SHIPPED). Work that document alongside the defect
+hunt; it is the answer to the user's standing ask ("check everything and propose
+all features to fully complete and comprehensively upgrade kiro-go").
 
 Repo: `/home/harry-riddle/dev/github.com/0xharryriddle/Kiro-Go`
 Branch: `harry` (tracks `origin/harry`)
@@ -53,18 +61,25 @@ these. Verified to be a STALL, not a deadlock — `config` imports nothing from
 
 | Fact | Value |
 |---|---|
-| HEAD | `82b74a9` (round 15 + doc corrections) + round 16 committed on top — check `git log -1` |
+| HEAD | `28cb891` (round 17b, graceful shutdown) — check `git log -1` |
 | Remote | `origin/harry` identical (0 ahead / 0 behind) |
-| Working tree | clean |
-| Tests | 957 top-level test funcs pass across `config` `pool` `auth` `proxy` (measured, not remembered: 936 at round 12 + 6 round 13 + 5 round 13b + 2 round 14 + 2 round 15). `-race` clean |
-| `-race` | clean, 0 data races |
+| Working tree | clean at commit time |
+| Tests | 963 top-level test funcs pass across `config` `pool` `auth` `proxy` (measured per-package, not remembered: 957 at round 16 + 6 round 17b. Breakdown: config 70, pool 91, auth 54, proxy 748) |
+| `-race` | clean, 0 data races (`go test ./... -race -count=1`) |
 | `go vet` / `gofmt` | clean tree-wide |
+| CI | **now gated** — `.github/workflows/ci.yml` runs build + vet + gofmt + `-race` on push/PR to `main`/`master`/`dev`/`harry`. Go 1.23, matching the Dockerfile builder |
 | Live container | healthy, version **1.1.5** |
-| Deployed image built from | `29e799c` (round 13b, digest `71f4e867`) — **rounds 14 (`d731d86`) and 15 are committed but NOT yet deployed**; rebuild and redeploy before treating the container as current |
+| Deployed image built from | `29e799c` (round 13b, digest `71f4e867`) — **rounds 14, 15, 16 and 17 are committed but NOT yet deployed**; rebuild and redeploy before treating the container as current |
 
 Recent commits (newest first):
 
 ```
+28cb891 fix(shutdown): drain in-flight requests and flush state on SIGTERM (round 17b)
+60fa604 ci: add a build/vet/gofmt/test gate (round 17, closes N-1)
+5e7b1ae docs: whole-surface completion & upgrade proposal (round 17 audit)
+cf8dab7 fix(failover): park an over-quota account after a 402 overage (round 16)
+82b74a9 docs: correct roadmap provenance after an unverified research batch
+5872556 fix(pool): stop holding the pool lock across config reads (round 15)
 d731d86 fix(responses): guard Bedrock accounts out of the Kiro dispatch loops
 ec6784d docs: sync the handoff to 29e799c (round 13b)
 29e799c fix(bedrock): do not bill a stream the client never received
@@ -88,7 +103,7 @@ a1cf36f fix(admin): validate an explicit region before probing or persisting it
 ```
 
 **Read `docs/plans/CHECKPOINT_audit_and_merge_state.md` first.** It is the
-authoritative record: all 77 defects, the rejected claims (so they are not
+authoritative record: all 78 defects, the rejected claims (so they are not
 re-litigated), and every deliberate non-decision with its reasoning.
 
 Two entries there are worth reading before starting: the **correction to the
@@ -97,6 +112,62 @@ a structural artifact of `ttfbMs` being streaming-only — the defect stands on 
 code-level proof instead), and **R13-followup**, a pre-existing observability gap
 where both Bedrock dispatch branches call `beginAttempt` but never `emitTrace`,
 recorded as a candidate rather than fixed.
+
+### Round 17 — the completeness axis (N-1, N-2 closed)
+
+Round 17 audited what the gateway does **not** do, rather than what it does wrong.
+Output: `docs/plans/PROPOSAL_comprehensive_upgrade.md`. Two items were closed in the
+same pass; the rest are open and prioritised there.
+
+**N-1 — no CI gate (`60fa604`).** The repo had 963 test funcs, 32k lines of test
+code, and *nothing* running them on push. `.github/workflows/ci.yml` now gates
+build + vet + gofmt + `go test -race`, pinned to Go 1.23 to match the Dockerfile
+builder (`go.mod` still says 1.21 — the mismatch is real but deliberate, CI must
+mirror what ships). RED-proven the only way a CI gate can be: four throwaway probe
+files, one per step, each confirmed to make its own step exit non-zero. Probes
+removed, tree restored.
+
+**N-2 — no graceful shutdown (`28cb891`).** `main.go` called `ListenAndServe()` and
+nothing else; measured tree-wide, `signal.Notify` = 0 and `.Shutdown(` = 0. Every
+deploy severed in-flight SSE streams mid-token and dropped pending stats,
+prompt-cache and trace rows. The infrastructure was half-built: `stopRefresh` and
+`stopStatsSaver` had **four readers and zero writers**, and no `Close` method
+existed on `Handler` at all.
+
+Now: `ListenAndServe` on a goroutine under `signal.NotifyContext`, drained by
+`srv.Shutdown` bounded by `shutdownGrace = 30s`, then a new `Handler.Close()`
+(`proxy/shutdown.go`) that closes both channels, saves stats, flushes prompt cache
+and trace store. Close runs *after* the drain so requests finishing during shutdown
+still make the final stats save. A second signal restores default handling so an
+operator can force-kill.
+
+Two things worth carrying forward from it:
+
+1. **`Close()` must tolerate the 169 bare `&Handler{...}` literals in the test
+   suite**, which leave channels and caches nil. Closing a nil channel panics.
+   Idempotency uses a `closeState` struct wrapping `sync.Once` so the *zero value*
+   is usable — that choice is why no existing test literal needed editing.
+2. **My own test caught a latent config-corruption bug in my own fix.** The first
+   RED run segfaulted instead of asserting: `config.UpdateStats` (`config.go:1865`)
+   dereferences `cfg` with no nil guard, and `Close()` is the first caller that can
+   run before `Init` succeeds. Worse than the crash — `Save()` would then marshal a
+   nil `cfg` to the 4-byte literal `null` (verified: `json.MarshalIndent` returns
+   `("null", nil)`), which is non-empty and so passes `atomicWriteConfig`'s
+   empty-write refusal, **clobbering a real config with `null`**. Guarded at the
+   source. Deliberately NOT counted among the 78 defects: unreachable in shipped
+   code, reachable only via the new path.
+
+Verified end-to-end, not just by unit test: built to `/tmp`, ran on port 18099 with
+an isolated `CONFIG_PATH`, sent a real `SIGTERM`, observed all four ordered log
+stages and exit 0, and confirmed the live `data/config.json` (24 real accounts)
+byte-identical before and after.
+
+**Next items from the proposal, in priority order:** A3 body-size ceilings (9
+unguarded `io.ReadAll(r.Body)` sites on the customer hot path — unauthenticated
+memory DoS), A4 admin brute-force limiting, B1 in-flight quota accounting (largest
+*measured* efficiency win: quota state is up to 30 min stale, which produced 112
+cap errors in 8 minutes on one account), B3 latency-aware routing (1.42x measured
+median spread, controlled for prompt size).
 
 ### Round 16 — the 402/overage path never parked the account (defect 78)
 

@@ -808,6 +808,105 @@ Cumulative: **78 defects**.
 
 ---
 
+### Round-17 — the completeness axis (no new defects; two absences closed)
+
+Round 17 is a different KIND of round and the count reflects that. Rounds 1-16
+asked "what does this code do wrong". Round 17 asked "what does it not do at all",
+which is the user's standing ask: *check everything and propose all features to
+fully complete and comprehensively upgrade kiro-go*. The audit output is
+`docs/plans/PROPOSAL_comprehensive_upgrade.md` (Tracks A-D, every item tagged
+CODE-VERIFIED / DONE / ALREADY SHIPPED).
+
+**Cumulative stays 78.** Neither item below is filed as a defect: they are missing
+capabilities, not incorrect behaviour. Inflating the defect count with them would
+corrupt the one number this document exists to keep honest.
+
+| Item | Absence | Closed by |
+|---|---|---|
+| N-1 | **No CI gate at all.** 963 test funcs and ~32k lines of test code, with nothing running them on push or PR. A failing test, a data race, or gofmt drift could merge green | `60fa604` — `.github/workflows/ci.yml`: build + vet + gofmt + `go test -race`, pinned Go 1.23 to match the Dockerfile builder |
+| N-2 | **No graceful shutdown.** `main.go:109` called `srv.ListenAndServe()` and nothing else. MEASURED tree-wide before the change: `signal.Notify` = 0 occurrences, `.Shutdown(` = 0 occurrences. Every deploy / `docker compose stop` / Ctrl-C killed the process outright, severing in-flight SSE streams mid-token and dropping pending stats, prompt-cache and trace rows | `28cb891` — `proxy/shutdown.go` + `main.go` + `proxy/handler.go` |
+
+**N-2 completed infrastructure that was already half-built.** `stopRefresh` and
+`stopStatsSaver` had **four readers** — `backgroundRefresh` (`handler.go:527`),
+`importWatchLoop` (`import_watcher.go:71`), `backgroundStatsSaver` (`:2223`),
+`backgroundTracePrune` (`:2388`) — and **zero writers**. No `Close`/`Stop`/`Shutdown`
+method existed on `Handler` at all, so those loops could only ever die with the
+process. `promptCacheTracker` had a `Stop()` that nothing called.
+
+Two design points that are load-bearing and easy to break later:
+
+1. `Close()` runs **after** the drain, so requests that complete during shutdown are
+   included in the final stats save.
+2. `Close()` must survive the **169 bare `&Handler{...}` literals** in the test
+   suite, which leave stop channels and caches nil — closing a nil channel panics.
+   Idempotency uses a `closeState` struct wrapping `sync.Once` so the ZERO VALUE is
+   usable; that is the reason no existing test literal had to be edited.
+
+**A latent config-corruption hazard, found by my own test failing the wrong way.**
+The first RED run did not fail an assertion — it segfaulted. `config.UpdateStats`
+(`config.go:1865`) dereferences `cfg` with no nil guard, and `Close()` is the first
+caller in the tree that can run before `Init` succeeds. The crash is the lesser
+half. The worse half: `Save()` would then marshal a nil `cfg` to the 4-byte literal
+`null` — verified empirically, `json.MarshalIndent(nil, ...)` returns `("null", nil)`
+— which is NON-EMPTY and therefore passes `atomicWriteConfig`'s empty-write refusal,
+**clobbering a real config file with `null`**. Guarded at the source.
+
+This respects an existing convention rather than inventing one: 19 config *readers*
+nil-guard `cfg`; writers historically did not, because every writer ran after a
+successful `Init`. A shutdown hook is the first caller for which that assumption
+does not hold. **Deliberately NOT counted as defect #79** — it was unreachable in
+shipped code and became reachable only via the path added in this same commit.
+
+**RED-proof, both items.**
+
+- N-1: a CI gate can only be proven by making it fail. Four throwaway probe files,
+  one per step (`go vet` type mismatch, gofmt drift, `t.Fatal`, build break), each
+  confirmed to exit non-zero on its own step. Probes removed, tree restored.
+- N-2: `proxy/shutdown_test.go`, 6 tests. Under neutralization (`Close` reduced to
+  its pre-fix no-op) exactly the **3 behavioural** tests fail — both channel-selector
+  tests hang to their 2 s deadline, the prompt-cache flush never lands — while all
+  **3 controls** (idempotency, bare-literal survival, nil receiver) stay green.
+  Restored byte-identical, sha verified.
+
+**N-2 verified end-to-end, not only by unit test.** Built to `/tmp`, ran with an
+isolated `CONFIG_PATH` on port 18099, confirmed `/healthz` served, sent a real
+`SIGTERM`, and observed the full ordered sequence in the process log — *signal
+received (up to 30s)* / *HTTP server drained cleanly* / *handler closed: background
+loops stopped, state flushed* / *shutdown complete* — with **exit 0**. The live
+`data/config.json` (24 real accounts) was verified **byte-identical** before and
+after, since the e2e wrote only to its isolated path.
+
+**Stated plainly as a compromise, not a claim:** `shutdownGrace = 30s`. SSE streams
+here can run for minutes, so no realistic deadline guarantees completion, and
+waiting forever would hang a deploy behind one slow client. Docker's default 10 s
+SIGKILL timeout will usually cut it shorter anyway — `stop_grace_period` must be
+raised in compose if a full drain actually matters.
+
+**Two claims I wrote into `CLAUDE.md` earlier and refuted in this pass** (recorded
+here so they are not re-litigated):
+
+- "The OpenAI-compatible surface is not wired for Bedrock" — FALSE.
+  `proxy/bedrock_openai.go` (794 lines) implements the bridge and is dispatched from
+  `handleOpenAIStream` (`handler.go:2873`) and `handleOpenAINonStream` (`:3346`). The
+  real gap is narrower: only `/v1/responses` is unserved for Bedrock.
+- "Bedrock model aliases are guesswork; ListFoundationModels would remove it" —
+  FALSE. `proxy/bedrock_discovery.go` (415 lines) already calls `/foundation-models`,
+  filters to ACTIVE on-demand text models, merges inference profiles, and caches per
+  account with a TTL. `resolveBedrockModelID` consults discovery BEFORE the static
+  map, so the aliases are a last-resort fallback.
+
+**Open, prioritised in the proposal** (measured where a number appears): A3
+body-size ceilings — 9 unguarded `io.ReadAll(r.Body)` sites on the customer hot
+path, an unauthenticated memory-DoS surface; A4 admin brute-force limiting; B1
+in-flight quota accounting, the largest measured efficiency win, since quota state
+is up to 30 min stale and produced 112 cap errors in 8 minutes on one account; B3
+latency-aware routing, 1.42x median spread controlled for prompt size; D1 context
+propagation, 32 `http.NewRequest` vs 1 `http.NewRequestWithContext`.
+
+Cumulative: **78 defects** (unchanged — round 17 closed absences, not defects).
+
+---
+
 ## 4. Remaining work
 
 ### R13-followup — Bedrock paths never emit a request trace (CANDIDATE, not fixed)
