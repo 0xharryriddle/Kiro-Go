@@ -1,8 +1,8 @@
 # Kiro-Go — fresh-session handoff prompt
 
 Paste this whole file as the opening message of the new session. Every fact below
-was verified by command output at handoff time (2026-07-29, HEAD `cd53437`,
-round 17d -- re-check with `git log -1` before trusting any SHA here).
+was verified by command output at handoff time (2026-07-30, deployed source
+`5360970`; re-check `git log -1` and the running image before trusting any SHA here).
 Where something is unverified or unknown, it says so — do not upgrade those to
 facts without checking.
 
@@ -61,19 +61,21 @@ these. Verified to be a STALL, not a deadlock — `config` imports nothing from
 
 | Fact | Value |
 |---|---|
-| HEAD | `cd53437` (round 17d, admin brute-force lockout) — check `git log -1` |
+| HEAD before this handoff-only sync | `5360970` (round 17d handoff sync) — check `git log -1` for the resulting doc commit |
 | Remote | `origin/harry` identical (0 ahead / 0 behind) |
 | Working tree | clean at commit time |
 | Tests | 980 top-level test funcs pass across `config` `pool` `auth` `proxy` (measured per-package, not remembered: 957 at round 16 + 6 round 17b + 7 round 17c + 10 round 17d. Breakdown: config 72, pool 91, auth 54, proxy 763) |
 | `-race` | clean, 0 data races (`go test ./... -race -count=1`) |
 | `go vet` / `gofmt` | clean tree-wide |
 | CI | **now gated** — `.github/workflows/ci.yml` runs build + vet + gofmt + `-race` on push/PR to `main`/`master`/`dev`/`harry`. Go 1.23, matching the Dockerfile builder |
-| Live container | healthy, version **1.1.5** |
-| Deployed image built from | `29e799c` (round 13b, digest `71f4e867`) — **rounds 14, 15, 16 and 17 are committed but NOT yet deployed**; rebuild and redeploy before treating the container as current |
+| Live container | **healthy**, Docker health `healthy`, failing streak 0, restart count 0; `/healthz`, `/v1/models`, and `/admin` all returned HTTP 200 after a full healthcheck interval |
+| Deployed image built from | `5360970`; image `sha256:2958ed773ea8450d4b1edf9ecc89d8880200c73d509c4083c93bc2eea284e1fb`. Rounds 14-17 are deployed |
+| Rollback | tag `kiro-go-kiro-go:rollback-71f4e867` -> image `sha256:71f4e867f1746743b6ba8126448c5e41932d43653af4cb7b723e43acf0350cad`; extracted binary SHA-256 `ea1c94aca6ce42068e8abbf1870f5a4180eb13264c19c2bae6c82af4b52b9e03` |
 
 Recent commits (newest first):
 
 ```
+5360970 docs: sync the handoff to cd53437 (round 17d)
 cd53437 fix(admin): lock out brute-force guessing on both admin gates (round 17d, closes A4)
 8419c59 docs: sync the handoff to d85d7de (round 17c)
 d85d7de fix(limits): bound every customer request body (round 17c, closes A3 + C-1)
@@ -269,6 +271,33 @@ with D2 rather than being bundled in unproven.
 `handler.go` (now safe to attempt, since CI guards it), B3 latency-aware routing
 (1.42x measured median spread, controlled for prompt size).
 
+### 2026-07-30 production recovery — external termination, then round 17 deploy
+
+The old production container was found stopped with exit code 2 about 20 seconds
+after startup. The available container log ended at the startup banner and had no
+panic or fatal line. Do not rewrite this as an application crash: the old image was
+run twice with an anonymous data volume containing a byte-identical copy of live
+`config.json`, first minimally and then with the production watcher + AWS-cache
+environment. Both runs stayed healthy beyond the original failure window.
+
+The discriminating experiment was signal injection. Sending either SIGINT or
+SIGTERM to the old image produced the exact observed signature: exit code 2, no
+stack trace, and no terminal log line. At deployed commit `29e799c`, the only
+code-initiated terminal path was `logger.Fatalf` -> `os.Exit(1)`; there was no
+signal handling or self-signal call. The original container healthcheck had also
+returned 200 five seconds after startup. Therefore the evidence classifies the
+event as an **external termination signal**, not a startup/runtime panic. Docker
+event history for the window was no longer available, so the identity of the
+sender is unknown and must remain unknown.
+
+Before deployment, `go build ./...`, `go vet ./...`, tree-wide `gofmt -l`, and
+`go test ./... -race -count=1` all passed. The new image was smoke-tested with a
+config copy for 25 seconds, then SIGTERM-drained with exit 0 and the expected four
+shutdown log stages. Production was recreated with `--no-build`; its bind-mounted
+live config retained SHA-256
+`09a5963de101ad7a5273fa356235a4bddc375c3b97375073b679a51aed1e7e56` across the
+swap. No inference request was generated merely to prove deployment.
+
 ### Round 16 — the 402/overage path never parked the account (defect 78)
 
 `handleAccountFailure`'s overage branch called `disableAccountOverage` +
@@ -370,9 +399,11 @@ cannot distinguish "missing code" from "broken probe".
 `kiroProfilePageSize`, `modelsRefreshMinInterval`) will read ABSENT even when
 present. Grep for their **values** or their effects instead.
 
-**Rollback:** the pre-merge image is GONE (garbage-collected). Real rollback is
-`git checkout 99dda52 && docker compose up -d --build`, or the extracted binary at
-`/tmp/kirogo_rollback_binary` if it still exists.
+**Rollback:** the immediately-pre-deploy image is deliberately retained as
+`kiro-go-kiro-go:rollback-71f4e867` (full digest and extracted-binary SHA are in
+section 2). This tag was created **before** `docker compose build`, so moving
+`:latest` did not destroy it. Verify its image ID before using it; do not rebuild an
+old checkout when the exact deployed artifact is already available.
 
 ---
 
