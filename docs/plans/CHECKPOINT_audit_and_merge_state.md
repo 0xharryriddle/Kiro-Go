@@ -2254,19 +2254,24 @@ a recorder is not coverage of the fix.
 
 **81 → 82.**
 
-### 12g. A stale async result nearly became this round's evidence
+### 12g. Stale async results nearly became this round's evidence — TWICE
 
-A background `go test ./... -race` launched back in round 18e completed *after* 18g was
-already committed, and reported:
+Two background `go test ./... -race` jobs, launched in earlier rounds, both completed
+*after* 18g was already committed:
 
 ```
-Go test: 1369 passed in 6 packages
+Go test: 1369 passed in 6 packages     # launched round 18e
+Go test: 1374 passed in 6 packages     # launched round 18f
 ```
 
-That number is the **18e baseline**. It predates 18f's 5 tests and 18g's 7, and the run had
-executed against a tree that no longer exists. Quoting it as verification of 18g would have
-understated coverage by 12 tests and, worse, would have attributed a green race run to code
-it never compiled.
+Both are **baselines from tests that no longer describe the tree**: 1369 predates 18f's 5
+tests and 18g's 7; 1374 predates 18g's 7. Each had executed against a working tree that no
+longer exists. Quoting either as verification of 18g would have understated coverage and,
+worse, attributed a green race run to code it never compiled.
+
+Two arrivals is the point: this is not a one-off oddity but the normal behaviour of a
+long-running job in a repo that keeps moving. Expect more of them, and expect the number to
+look plausible — 1369 and 1374 are both *close enough* to 1381 to pass a glance.
 
 It also exposed a real gap rather than only a bookkeeping risk: the race run I had actually
 done at this HEAD covered `./proxy/ ./pool/` only (1174 tests). Re-running full-repo at

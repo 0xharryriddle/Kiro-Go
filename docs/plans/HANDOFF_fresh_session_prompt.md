@@ -542,12 +542,16 @@ only the intended edits; full suite **1381 passed**; full-repo `-race` **1381 pa
 packages** at HEAD `4be1377`. Defect count **81 → 82**. Remaining trace gap: **D1b**
 (websearch pair, multi-account attribution).
 
-**A stale async result nearly got reported as this round's evidence.** A background
-`go test ./... -race` launched during round 18e finished *after* 18g was committed and
-returned `1369 passed`. That number is the 18e baseline — it predates 18f's 5 tests and
-18g's 7 — and the run had executed against a tree that no longer exists. Re-run at the
-current HEAD before quoting any number a background job hands back, and print
-`git log --oneline -1` in the same command so the output carries the commit it measured.
+**Stale async results nearly got reported as this round's evidence — twice.** Two
+background `go test ./... -race` jobs launched in earlier rounds both finished *after* 18g
+was committed, returning `1369 passed` (the 18e baseline) and `1374 passed` (the 18f
+baseline). Each ran against a working tree that no longer exists, and both numbers are
+close enough to the real 1381 to survive a glance.
+
+Re-run at the current HEAD before quoting any number a background job hands back, and print
+`git log --oneline -1` in the same command so the output carries the commit it measured. An
+async figure with no commit attached is not evidence — and expect more of these, since any
+long-running job in a moving repo produces them.
 
 ### 2026-07-30 production recovery — external termination, then round 17 deploy
 
