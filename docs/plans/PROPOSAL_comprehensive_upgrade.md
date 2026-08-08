@@ -352,13 +352,57 @@ is undocumented — and combined with N-5, a misconfigured deployment ships a st
 admin password over cleartext HTTP. At minimum this belongs in the README as an
 explicit deployment requirement; optionally add `TLSCertFile`/`TLSKeyFile` config.
 
-### N-7. Container runs as root with no image-level healthcheck (CODE-VERIFIED)
+### N-7. Container ran as root with no image-level healthcheck — FIXED this pass (round 18c)
 
-`Dockerfile` has **no `USER`** directive → the process runs as root, and `VOLUME
-/app/data` means root-owned writes to the mounted config. It also has **no
-`HEALTHCHECK`**; `docker-compose.yml:53` supplies one, so anyone running the image
-directly (not via compose) gets no health signalling. Adding a non-root `USER` plus
-an image-level `HEALTHCHECK` is standard hardening.
+**Status: closed.** `Dockerfile` now creates a `kiro` user, copies with
+`--chown`, declares a `HEALTHCHECK`, and ends with `USER kiro`.
+
+**The UID is 1000 on purpose, and picking it by taste would have caused an
+outage.** `docker-compose.yml` bind-mounts the host's `./data` into `/app/data`,
+and a bind mount keeps the **host's** ownership — a build-time `chown` cannot
+change it. The app writes `config.json` (plus `.bak` rotations), `data/imports`,
+`data/traces` and the audit/request logs, so a mismatched UID means the process
+starts, serves `/healthz`, and then fails **every** persistence write. Measured
+before choosing: `./data` and every file under it is `uid=1000 gid=1000`, and
+`find data/ ! -user harry-riddle` returns nothing — the previously root-running
+container left no root-owned files behind. `ARG APP_UID/APP_GID` allow a build-time
+override for hosts that differ.
+
+Verified by actually building and running it, not by reading the Dockerfile:
+
+| Check | Result |
+|---|---|
+| `docker inspect .Config.User` | `kiro` (was `''`) |
+| `id` inside the container | `uid=1000(kiro) gid=1000(kiro)` |
+| `/healthz` through a bind mount | `{"status":"ok","time":…}` |
+| write to `/app/data` as that user | `WRITE_OK` |
+| `docker inspect .Config.Healthcheck` | present (was `<nil>`) |
+| real `data/config.json` sha before/after | **identical** |
+
+**Two traps hit while proving it**, both worth keeping:
+
+1. **`/tmp` is not a Docker-shared path on this host.** The first isolated-mount
+   run died with `mounts denied: /tmp/... is not shared from the host`, exit 125 —
+   which looked exactly like the non-root change breaking the container. It was
+   Docker Desktop file-sharing policy. Use a directory under `$HOME` (which is
+   shared, the same reason the compose mount on `./data` works).
+2. **`HOME` changes to `/app`.** `adduser -h /app` makes `os.UserHomeDir()` return
+   `/app`, not `/root`, which affects the IDE-cache *fallback* path
+   (`ide_cache_import.go:40`, `auth/local_cache.go:31`). Not a regression here:
+   `docker-compose.yml:53` sets `KIRO_IDE_CACHE=/host-aws-sso-cache/kiro-auth-token.json`
+   explicitly, so the compose path never consults `$HOME`. Confirmed the mounted
+   cache is still readable — the host files are `0600` owned by uid 1000, and uid
+   1000 in the container reads them (`READABLE /host-aws-sso-cache/….json`).
+   `PR_131_SUPPORT_DETAILS.md:72,201` describes the old root-based `/root/.aws/...`
+   behaviour and is now historical.
+
+`docker-compose.yml` sets no `user:`, so the image's `USER` applies to compose
+deployments too; its own `healthcheck:` block overrides the image-level one, which
+exists for plain `docker run`.
+
+The original finding, for the record: `Dockerfile` had **no `USER`** (process ran
+as root, root-owned writes into the mounted config) and **no `HEALTHCHECK`**, so
+anyone running the image directly got no health signalling.
 
 ### N-8. `proxy/handler.go` is an 8,198-line file routing 91 endpoints (MEASURED)
 
@@ -500,7 +544,13 @@ Bedrock code.
 ### Track E — Security posture
 
 - **E1. TLS documentation or support** (N-6).
-- **E2. Container hardening** (N-7): non-root `USER`, image `HEALTHCHECK`.
+- **E2. Container hardening** (N-7) — **DONE, round 18c.** `Dockerfile` creates a
+  `kiro` user (uid/gid 1000, matching the host owner of the bind-mounted `./data` —
+  see N-7 for why any other value breaks persistence), copies with `--chown`,
+  declares an image-level `HEALTHCHECK`, and ends with `USER kiro`. Proven by
+  building and running: `.Config.User=kiro`, `uid=1000(kiro)` in-container,
+  `/healthz` served through a bind mount, `WRITE_OK` on `/app/data`, real
+  `data/config.json` byte-identical. `ARG APP_UID/APP_GID` override for other hosts.
 - **E3. Secrets at rest** — CLAUDE.md's own known gap: Bedrock IAM secrets and OAuth
   tokens sit plaintext in `config.json`. Customer API keys are already hashed, so
   the pattern to follow exists. Repo-wide change; sequence it deliberately.
