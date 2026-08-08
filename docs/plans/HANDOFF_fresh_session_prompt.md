@@ -352,6 +352,53 @@ drain `pendingWrites` (config is persisted in a detached goroutine), or it passe
 alone and fails in the full suite with `TempDir RemoveAll cleanup: directory not
 empty`. Use `newTestPoolDrained`.
 
+### Round 18d — overage backoff sizing, and a proposal item that was WRONG (B2)
+
+`pool/overage_backoff.go` (new) + `MarkOverLimit` + a release valve in
+`syncUsageBaselines`. Full reasoning in
+`docs/plans/CHECKPOINT_audit_and_merge_state.md` §9.
+
+**Read this before you ever size anything from `NextResetDate`.** The proposal said
+"size the overage backoff from `NextResetDate` instead of a flat 1h". Measured on the
+41 live accounts, that literal instruction is **worse than the flat hour**:
+
+- **26/41 accounts carry a reset date 7 days in the PAST** (the field is only as fresh
+  as the last upstream refresh, and disabled accounts never get one). `time.Until` is
+  negative, `setCooldownIfLater` treats a past expiry as a no-op → the 402'd account
+  would be parked for **zero seconds**.
+- The other **15/41 sit 24 days out**, including the *only enabled* account
+  (`david_smith25452`, 10000/10000 — the one most likely to 402). That is a 24-day
+  pool-wide outage from one 402.
+- The field is **date-only**, truncated from a unix ts (`kiro_api.go:1530`), so even a
+  valid value is ±24h.
+- **Nothing else in the repo does arithmetic on it** — forecast/audit surfaces pass the
+  string through for display only. This was going to be its first use as a clock.
+
+**Shipped instead:** use the date only when parseable AND future, clamped to
+**[1h, 12h]**. Strictly dominates the old behaviour — never shorter than round 16's
+hour, never longer than the ceiling.
+
+**Why a long park is safe (do not "optimise" these away):**
+1. `fallbackEarliestCooldown` (`account.go:574`) already serves the soonest-expiring
+   account when nothing healthy is left, so a fully-parked pool answers instead of
+   going dark.
+2. `releaseOnPeriodRollover` drops the cooldown the moment `UsageCurrent` **drops**,
+   which is what a period reset looks like from here. Wired into `syncUsageBaselines`
+   (the B1 machinery), checked *before* the baseline is overwritten.
+
+**The asymmetry is load-bearing:** release on a **drop** only. Releasing on any change
+resurrects the defect B1 closed (rising usage un-parking a capped account). Two
+controls pin this and the `if true` mutant is killed by them.
+
+**Verified:** 17 tests, 6/6 mutants killed by distinct tests (ignore date, past-date
+guard, ceiling, floor, release-on-any-change, valve removed); full suite + `-race`
+1357, 0 races.
+
+**Lock-order note:** `MarkOverLimit` reads config *above* `p.mu` and uses
+`config.GetAccountByID`, not `p.accounts` — an over-limit account has usually already
+been filtered out of `p.accounts` by `Reload`'s quota gate, so it would not be found
+there.
+
 ### 2026-07-30 production recovery — external termination, then round 17 deploy
 
 The old production container was found stopped with exit code 2 about 20 seconds

@@ -94,6 +94,15 @@ func (p *AccountPool) syncUsageBaselines(accounts []config.Account) {
 			continue
 		}
 		if prev != acc.UsageCurrent {
+			// A DROP is what a billing-period reset looks like from here, and it
+			// is the release valve that makes B2's multi-hour overage backoff safe
+			// (see overage_backoff.go): without it an account whose quota genuinely
+			// reset would stay parked until the backoff expired, trading wasted
+			// dispatches for withheld capacity. Checked before the baseline is
+			// overwritten, since that is what makes the drop visible at all.
+			if acc.UsageCurrent < prev {
+				p.releaseOnPeriodRollover(acc.ID)
+			}
 			p.lastSeenUsage[acc.ID] = acc.UsageCurrent
 			delete(p.usageDelta, acc.ID)
 		}

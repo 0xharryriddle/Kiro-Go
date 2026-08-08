@@ -1828,3 +1828,113 @@ router demonstrably made wrong decisions from stale state and burned 134 real
 dispatches doing it. That is observable misbehaviour with live evidence, not an
 absence, so it is counted. Flagged explicitly so a later reader can disagree with the
 classification without having to re-derive the reasoning.
+
+## 9. Round 18d — B2 overage backoff sizing (and why the proposal's own spec was wrong)
+
+Finished the other half of round 16. **The item as written in
+`PROPOSAL_comprehensive_upgrade.md` would have made things worse**, so it shipped in a
+clamped form. Recording the refutation rather than quietly shipping something
+different from what the plan said.
+
+### 9a. What the proposal asked for
+
+> "B2. Cap-aware backoff sizing — finish round 16's other half: size the overage
+> backoff from `NextResetDate` instead of a flat 1h."
+
+Round 16 wired the 402/overage branch into `pool.MarkOverLimit`, which parks the
+account for a flat hour. Sizing that from the upstream reset date sounds strictly
+better: park until the quota actually resets.
+
+### 9b. Why the literal form is worse than the flat hour — measured, not argued
+
+Probed all 41 accounts in `data/config.json` (host clock 2026-08-08) **before**
+writing code:
+
+| finding | count | consequence of naive sizing |
+|---|---|---|
+| `nextResetDate` = 2026-08-01, i.e. **7 days in the PAST** | **26 / 41** | `time.Until` negative; `setCooldownIfLater` treats a past expiry as nothing to do → **parked for ZERO seconds**, strictly worse than 1h |
+| `nextResetDate` = 2026-09-01, **+24 days** | 15 / 41 | one 402 parks the account for 24 days |
+
+The past-dated majority is not a data bug: the field is only as fresh as the last
+upstream refresh, and those 26 accounts are disabled so they never receive one.
+
+Worse, the **only currently-enabled account** (`david_smith25452`, 10000/10000 — i.e.
+exactly at its cap, so the most likely to 402) is in the +24-day group. The naive form
+would have withheld the entire serving pool for 24 days on a single 402.
+
+Two further reasons the field is a poor clock:
+
+- It is **date-only** (`"2006-01-02"`), truncated from a unix timestamp in
+  `kiro_api.go:1530`, so even a valid value carries up to 24h of error.
+- **Nothing else in the repo does arithmetic on it.** `admin_fleet_forecast.go:76` and
+  `admin_usage_audit.go:83` pass the string straight through for display; the real
+  forecast math uses `UsageCurrent`/`UsageLimit`. This would have been the first
+  consumer to treat it as a clock, which is exactly why its staleness had never bitten.
+
+### 9c. What shipped instead
+
+`pool/overage_backoff.go`. Use the reset date when it is parseable **and** in the
+future, clamped into **[1h, 12h]**:
+
+- **floor = 1h** preserves round 16's contract, and turns the 26/41 stale-date case
+  into a no-op rather than a regression;
+- **ceiling = 12h** bounds the damage from a stale or wrong date to half a day, and
+  means a capped account is retried ~twice daily instead of 24 times.
+
+This **strictly dominates** the previous behaviour: never shorter than the flat hour,
+never longer than the ceiling.
+
+Interpreting the date as midnight UTC is the deliberately conservative reading — if
+the real reset is later that day we under-park and retry slightly early (cost: one
+402), whereas over-parking withholds a healthy account.
+
+### 9d. Why a multi-hour park is safe here
+
+Two mechanisms stop it becoming lost capacity:
+
+1. **`fallbackEarliestCooldown`** (`account.go:574`) already serves the account whose
+   cooldown expires soonest when nothing healthy remains, so a fully-parked pool still
+   answers instead of going dark. This predates B2 — it is why a longer backoff is
+   affordable at all.
+2. **A new release valve.** `releaseOnPeriodRollover` drops the cooldown (and the
+   consecutive-error count) the moment the upstream figure shows the period actually
+   reset — so a real reset frees the account immediately rather than after the ceiling.
+
+The valve is wired into `syncUsageBaselines` (the B1 machinery from §8), which is
+already the one place that observes `UsageCurrent` changing. A **drop** is what a
+billing-period reset looks like from here; the check sits before the baseline is
+overwritten, since that is what makes the drop visible.
+
+Direction of the risk was chosen deliberately: a drop could in principle be a bad
+upstream read rather than a real reset, but clearing a cooldown is the **recoverable**
+mistake — the next request either succeeds or 402s and re-parks the account.
+Withholding a healthy account for 12h is not equally recoverable. Only cooldowns and
+the error count are cleared, never the circuit breaker: a period reset says nothing
+about whether the upstream is answering.
+
+### 9e. The control that stops the valve becoming a bug
+
+Releasing on *any* usage change would resurrect the defect §8 just closed (rising
+usage un-parking a capped account). `TestUsageIncreaseDoesNotReleaseOverageBackoff`
+and `TestUnchangedUsageDoesNotReleaseOverageBackoff` pin the asymmetry, and mutating
+the drop check to `if true` is killed by the first of them.
+
+### 9f. Verification
+
+- 17 tests in `pool/overage_backoff_sizing_test.go`.
+- **6/6 mutants killed, each by a distinct test**: ignore the reset date entirely,
+  past-date guard removed, ceiling removed, floor removed, release-on-any-change,
+  valve removed. Both mutated files restored and sha256-verified byte-identical.
+- `MarkOverLimit` reads config **above** `p.mu` (config under the pool lock nests
+  `cfgLock` beneath it — the anti-pattern already fixed twice in this package), and
+  looks the account up via `config.GetAccountByID` rather than `p.accounts`, because
+  an over-limit account has usually already been filtered out of `p.accounts` by
+  `Reload`'s quota gate.
+- `scripts/verify.sh` green; full suite **1357 passed**; `-race` **1357 passed, 0
+  races**; `pool` at `-count=3` (369) for order-dependence.
+
+### 9g. Defect count
+
+Unchanged at **79**. B2 is a sizing improvement to a control that already worked, not
+a defect — same classification as §4's A3/A4 precedent. The refuted *proposal item* is
+recorded above as a plan error, not as a code defect.

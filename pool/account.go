@@ -1223,12 +1223,29 @@ func (p *AccountPool) MarkOverLimit(id string) {
 	// account back into rotation early — the opposite of what marking it
 	// over-limit is for.
 	now := time.Now()
+	// Size the backoff from the upstream reset date when that date is usable,
+	// clamped into [1h, 12h] — see overage_backoff.go for why the unclamped form
+	// the proposal described is worse than the flat hour on real data (26/41 live
+	// accounts carry a reset date already in the PAST, which would park for zero
+	// seconds; the only enabled one sits 24 days out, which would be an outage).
+	//
+	// Read config BEFORE taking p.mu: config.* must never be called under the
+	// pool lock, or a config Save() mid-write nests cfgLock beneath p.mu and
+	// stalls every other pool operation behind disk I/O. Same hoist as Reload and
+	// GetNextForModelExcluding. The account is looked up from config rather than
+	// p.accounts because an over-limit account has usually already been filtered
+	// out of p.accounts by Reload's quota gate, so it would not be found there.
+	backoff := minOverageBackoff
+	if acc, ok := config.GetAccountByID(id); ok {
+		backoff, _ = overageBackoffFor(acc, now)
+	}
+
 	p.mu.Lock()
-	setCooldownIfLater(p.cooldowns, id, now.Add(time.Hour))
+	setCooldownIfLater(p.cooldowns, id, now.Add(backoff))
 	p.mu.Unlock()
 	p.Reload()
 	p.mu.Lock()
-	setCooldownIfLater(p.cooldowns, id, now.Add(time.Hour))
+	setCooldownIfLater(p.cooldowns, id, now.Add(backoff))
 	p.mu.Unlock()
 }
 

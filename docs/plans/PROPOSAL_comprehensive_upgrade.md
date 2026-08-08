@@ -544,8 +544,37 @@ Bedrock code.
 
   Verified: 12 tests, 5/5 mutants killed by distinct tests (gate, reset hook, sign
   guard, prune, overage precedence), full suite + `-race` clean.
-- **B2. Cap-aware backoff sizing** — finish round 16's other half: size the overage
-  backoff from `NextResetDate` instead of a flat 1h.
+- ~~**B2. Cap-aware backoff sizing**~~ — **DONE, round 18d, but NOT as written here.**
+  `pool/overage_backoff.go`. The item said "size the overage backoff from
+  `NextResetDate` instead of a flat 1h". Measured against the 41 live accounts, the
+  literal form is **worse than the flat hour**, so it shipped clamped:
+
+  - **26/41 accounts carry `nextResetDate` = 2026-08-01 while the clock reads
+    2026-08-08 — seven days in the PAST.** The field is only as fresh as the last
+    upstream refresh, and these accounts are disabled so they never get one.
+    `time.Until` on that is negative and `setCooldownIfLater` treats a past expiry as
+    nothing to do, so a 402 would have parked the account for **zero seconds**.
+  - The other **15/41 sit 24 days out**, and the only currently-**enabled** account
+    (`david_smith25452`, 10000/10000) is one of them. One 402 would have withheld the
+    entire serving pool for 24 days.
+  - The field is **date-only** (`2006-01-02`, truncated from a unix ts in
+    `kiro_api.go`), so even a valid value carries up to 24h of error.
+  - Nothing else in the repo does arithmetic on it — `admin_fleet_forecast.go:76` and
+    `admin_usage_audit.go` pass the string through for display, and the real forecast
+    math uses `UsageCurrent`/`UsageLimit`. This would have been its first use as a
+    clock, which is why the staleness had never bitten.
+
+  Shipped: use the date when parseable **and** in the future, clamped to
+  **[1h, 12h]** — strictly dominates the old behaviour (never shorter than round 16's
+  hour, never longer than the ceiling). A longer park is safe because
+  `fallbackEarliestCooldown` already serves the soonest-expiring account rather than
+  going dark, and because a **release valve** was added: a *drop* in `UsageCurrent` is
+  a period reset, so `syncUsageBaselines` clears the cooldown immediately instead of
+  holding it to expiry. Rising/unchanged usage must NOT release (controls pin this) or
+  it would resurrect the defect B1 closed.
+
+  Verified: 17 tests, 6/6 mutants killed by distinct tests (ignore date, past-date
+  guard, ceiling, floor, release-on-any-change, valve removed).
 - **B3. Filter → score → pick routing** — roadmap P1-2. 1.42x within-band TTFB
   spread, choice available 68% of the time.
 - **B4. Prefix-affinity routing** — roadmap P1-3. 95.2% prefix repetition. Sell as
@@ -707,8 +736,14 @@ Ordered by (impact × evidence) ÷ risk, with cheap-and-safe pulled forward:
    efficiency waste: the router decided on a quota figure up to ~30 minutes stale,
    which sent 134 dispatches into an account already answering 402. Unblocks B3 and
    B5 (both wanted this counter).
-6. **B2 cap backoff sizing** — finishes round 16 honestly. **Next up.**
+6. ~~**B2 cap backoff sizing**~~ — **DONE, round 18d.** Finished round 16's other
+   half, but *not* as this document originally specified it: sizing straight from
+   `NextResetDate` measured out **worse** than the flat hour (26/41 live accounts
+   carry a past date → zero-second park; the only enabled account sits 24 days out →
+   pool-wide outage). Shipped clamped to [1h, 12h] plus a period-rollover release
+   valve. See the B2 entry in Track B for the data.
 7. **F1 handler split** — unblocks every later round; safe once CI guards it.
+   **Next up.**
 8. **A5 ctx propagation**, then B3/B4, then Track C/D/E by need.
 
 Items 1-4 are individually small and mutually independent — they can land as four
