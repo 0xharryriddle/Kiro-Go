@@ -2,7 +2,10 @@ package proxy
 
 import (
 	"errors"
+	"net/http"
+	"net/http/httptest"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -239,6 +242,212 @@ func TestFailedPassthroughAttemptIgnoresNilError(t *testing.T) {
 	entry := tr.finish(outcomeSuccess, 200)
 	if entry.AttemptCount != 0 {
 		t.Fatalf("a nil error must not close an attempt, got AttemptCount=%d", entry.AttemptCount)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Partial failure: the stream broke AFTER the client got bytes (D1d)
+// ---------------------------------------------------------------------------
+
+// A traced partial failure must produce ONE rich row: the client already holds a
+// partial body, so the request is over and exactly one terminal row is owed.
+func TestPassthroughPartialFailureEmitsRichRow(t *testing.T) {
+	h := passthroughHandler(t)
+	acc := &config.Account{ID: "acct-1", AuthMethod: "bedrock", Email: "a@example.com"}
+	tr := newTraceRecorder("claude", "claude-sonnet-4.5", true, "key-1")
+	att := tr.beginAttempt(acc)
+
+	h.recordPassthroughPartialFailure(tracedParams(tr, att, acc), "claude",
+		errors.New("bedrock stream: ThrottlingException: slow down"))
+
+	logs := h.getRequestLogs()
+	if len(logs) != 1 {
+		t.Fatalf("expected exactly 1 terminal row for a partial failure, got %d", len(logs))
+	}
+	got := logs[0]
+	if got.RequestID == "" {
+		t.Fatal("partial-failure row has no RequestID, so it cannot be joined")
+	}
+	if got.Outcome != outcomeError {
+		t.Fatalf("Outcome = %q, want %q", got.Outcome, outcomeError)
+	}
+	if got.Status != "error" {
+		t.Fatalf("Status = %q, want error", got.Status)
+	}
+	// The attempt must carry the cause, or the row cannot say WHICH account broke.
+	if got.AttemptCount != 1 {
+		t.Fatalf("AttemptCount = %d, want 1", got.AttemptCount)
+	}
+	if got.Attempts[0].Outcome != outcomeError || got.Attempts[0].Error == "" {
+		t.Fatalf("attempt lost its failure cause: %+v", got.Attempts[0])
+	}
+	if got.AccountID != "acct-1" {
+		t.Fatalf("AccountID = %q, want acct-1", got.AccountID)
+	}
+}
+
+// THE D1d counter invariant, and the reason this fix needed the same helper split
+// as defect 81: emitTrace(outcomeError) counts, so pairing it with the COUNTING
+// failure recorder would advance the counters by two for one failed request.
+func TestPassthroughPartialFailureCountsExactlyOnce(t *testing.T) {
+	h := passthroughHandler(t)
+	acc := &config.Account{ID: "acct-1", AuthMethod: "bedrock"}
+	tr := newTraceRecorder("claude", "m", true, "key-1")
+	att := tr.beginAttempt(acc)
+
+	h.recordPassthroughPartialFailure(tracedParams(tr, att, acc), "claude", errors.New("boom"))
+
+	if got := atomic.LoadInt64(&h.failedRequests); got != 1 {
+		t.Fatalf("failedRequests = %d, want exactly 1 — emitTrace and the failure "+
+			"recorder must not both count the same failed request", got)
+	}
+	if got := atomic.LoadInt64(&h.totalRequests); got != 1 {
+		t.Fatalf("totalRequests = %d, want exactly 1", got)
+	}
+}
+
+// Control: the untraced path must keep its pre-D1d behaviour — one legacy row AND
+// one counter bump. Without this, moving the count into emitTrace would silently
+// stop counting partial failures on untraced callers.
+func TestPassthroughPartialFailureWithoutTraceStillCountsAndLogs(t *testing.T) {
+	h := passthroughHandler(t)
+
+	h.recordPassthroughPartialFailure(forwardParams{
+		account: &config.Account{ID: "acct-1"}, model: "m", endpoint: "anthropic",
+	}, "claude", errors.New("boom"))
+
+	if got := atomic.LoadInt64(&h.failedRequests); got != 1 {
+		t.Fatalf("failedRequests = %d, want 1 for an untraced partial failure", got)
+	}
+	logs := h.getRequestLogs()
+	if len(logs) != 1 {
+		t.Fatalf("expected the legacy row, got %d", len(logs))
+	}
+	if logs[0].Status != "error" {
+		t.Fatalf("Status = %q, want error", logs[0].Status)
+	}
+}
+
+// The status reported must be 200: the headers were already written and flushed
+// with 200 before the stream broke, so 200 is what the client actually received.
+// Reporting 502 would describe a response nobody was sent.
+func TestPassthroughPartialFailureReportsCommittedStatus(t *testing.T) {
+	h := passthroughHandler(t)
+	acc := &config.Account{ID: "acct-1"}
+	tr := newTraceRecorder("claude", "m", true, "key-1")
+	att := tr.beginAttempt(acc)
+
+	h.recordPassthroughPartialFailure(tracedParams(tr, att, acc), "claude", errors.New("boom"))
+
+	if got := h.getRequestLogs()[0].HTTPStatus; got != 200 {
+		t.Fatalf("HTTPStatus = %d, want 200 (headers were committed before the break)", got)
+	}
+}
+
+// A nil error must not fabricate a failure row or move the counters.
+func TestPassthroughPartialFailureIgnoresNilError(t *testing.T) {
+	h := passthroughHandler(t)
+	acc := &config.Account{ID: "acct-1"}
+	tr := newTraceRecorder("claude", "m", true, "key-1")
+	att := tr.beginAttempt(acc)
+
+	h.recordPassthroughPartialFailure(tracedParams(tr, att, acc), "claude", nil)
+
+	if logs := h.getRequestLogs(); len(logs) != 0 {
+		t.Fatalf("a nil error must not emit a row, got %d", len(logs))
+	}
+	if got := atomic.LoadInt64(&h.failedRequests); got != 0 {
+		t.Fatalf("failedRequests = %d, want 0", got)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// D1d at the CALL SITES, not the choke point
+// ---------------------------------------------------------------------------
+//
+// The five tests above drive recordPassthroughPartialFailure directly, and a
+// mutation battery proved that is NOT enough: reverting either call site to
+// recordFailureWithDetails survived the whole suite. Same false green as defect 81
+// (see CHECKPOINT §11c) — a helper-level test proves the helper works, not that it
+// is wired in. These two drive the real callers.
+
+// midStreamBreakBody yields one SSE chunk, then fails with a non-EOF error, which
+// is the shape streamUpstream treats as "client already has bytes, cannot fail
+// over".
+type midStreamBreakBody struct{ sent bool }
+
+func (b *midStreamBreakBody) Read(p []byte) (int, error) {
+	if !b.sent {
+		b.sent = true
+		return copy(p, []byte("data: {\"type\":\"content_block_delta\"}\n\n")), nil
+	}
+	return 0, errors.New("upstream connection reset by peer")
+}
+
+func (b *midStreamBreakBody) Close() error { return nil }
+
+// Kills the mutant "bedrock call site reverted to the legacy writer".
+func TestBedrockPartialFailureCallSiteEmitsRichRow(t *testing.T) {
+	h := passthroughHandler(t)
+	acc := &config.Account{ID: "acct-1", AuthMethod: "bedrock"}
+	tr := newTraceRecorder("claude", "claude-sonnet-4.5", true, "key-1")
+	att := tr.beginAttempt(acc)
+
+	h.recordBedrockPartialFailure(tracedParams(tr, att, acc),
+		errors.New("bedrock stream: ThrottlingException: slow down"))
+
+	logs := h.getRequestLogs()
+	if len(logs) != 1 {
+		t.Fatalf("expected exactly 1 row, got %d", len(logs))
+	}
+	if logs[0].RequestID == "" {
+		t.Fatal("row has no RequestID: recordBedrockPartialFailure is still calling " +
+			"the legacy flat writer instead of recordPassthroughPartialFailure")
+	}
+	if logs[0].AttemptCount != 1 {
+		t.Fatalf("AttemptCount = %d, want 1: the open attempt was discarded", logs[0].AttemptCount)
+	}
+	if got := atomic.LoadInt64(&h.failedRequests); got != 1 {
+		t.Fatalf("failedRequests = %d, want exactly 1", got)
+	}
+}
+
+// Kills the mutant "custom_api call site reverted to the legacy writer", driving
+// the real streamUpstream loop through a stream that breaks after first byte.
+func TestCustomApiPartialFailureCallSiteEmitsRichRow(t *testing.T) {
+	h := passthroughHandler(t)
+	acc := &config.Account{ID: "acct-1", AuthMethod: "custom_api"}
+	tr := newTraceRecorder("claude", "claude-sonnet-4.5", true, "key-1")
+	att := tr.beginAttempt(acc)
+
+	rec := httptest.NewRecorder()
+	err := h.streamUpstream(rec, rec,
+		&http.Response{StatusCode: 200, Body: &midStreamBreakBody{}},
+		tracedParams(tr, att, acc), time.Now())
+
+	// nil is required: returning an error here would make the caller try to fail
+	// over onto a response whose headers are already committed.
+	if err != nil {
+		t.Fatalf("streamUpstream returned %v, want nil for a post-first-byte break", err)
+	}
+	// Confirm we really exercised the partial branch rather than a no-output path.
+	if rec.Body.Len() == 0 {
+		t.Fatal("client received no bytes; this is not the partial-failure branch")
+	}
+
+	logs := h.getRequestLogs()
+	if len(logs) != 1 {
+		t.Fatalf("expected exactly 1 row, got %d", len(logs))
+	}
+	if logs[0].RequestID == "" {
+		t.Fatal("row has no RequestID: the custom_api partial-stream branch is still " +
+			"calling the legacy flat writer")
+	}
+	if logs[0].Status != "error" {
+		t.Fatalf("Status = %q, want error", logs[0].Status)
+	}
+	if got := atomic.LoadInt64(&h.failedRequests); got != 1 {
+		t.Fatalf("failedRequests = %d, want exactly 1", got)
 	}
 }
 

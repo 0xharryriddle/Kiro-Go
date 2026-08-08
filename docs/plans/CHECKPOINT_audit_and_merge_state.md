@@ -2139,3 +2139,117 @@ incident plus the `recordFailureAttribution` remedy.
 ### 11f. Defect count
 
 **80 → 81.**
+
+## 12. Round 18g — D1d: the other half of D1 (passthrough *partial-failure* rows)
+
+Found while fixing a caller inventory in the skill that my own D1 had made stale.
+Updating that table forced me to enumerate the remaining `recordSuccessLog` /
+`recordFailureWithDetails` callers, and the enumeration showed D1 had only fixed the
+**success** path.
+
+### 12a. The defect
+
+D1 (round 18e) routed passthrough *successes* through `recordPassthroughTrace`. The
+mid-stream *failure* path was left calling the flat helper:
+
+- `bedrock.go` → `recordBedrockPartialFailure` → `recordFailureWithDetails`
+- `custom_api_forward.go` (partial-stream branch) → `recordFailureWithDetails`
+
+So a passthrough stream that died **after** the client already received bytes produced
+the legacy thin row: no `RequestID`, no `Attempts`, no outcome/status/region — even
+though `forwardParams` had been carrying the recorder since D1. The recorder was
+allocated, an attempt was opened against the serving account, and then discarded — the
+exact waste D1 was written to remove, surviving in the sibling branch.
+
+Worth being precise about what was **not** wrong: this was *not* a double-count. Those
+two paths never called `emitTrace`, so the counters moved exactly once. The bug was row
+*shape* and lost attempt history, not arithmetic.
+
+### 12b. Fix
+
+One new choke point, `recordPassthroughPartialFailure` (`passthrough_trace.go`), and both
+call sites now use it. It closes the attempt **with its cause** (so the row says which
+account broke and why) and emits one terminal row; when no recorder was threaded it falls
+back to `recordFailureWithDetails`, preserving pre-D1d behaviour for untraced callers.
+
+`http.StatusOK` is reported deliberately: the response headers were written and flushed
+with 200 before the stream broke, so 200 is what the client actually received. Deriving
+502 from the error would describe a response nobody was sent.
+
+Free coverage worth noting: `bedrock_converse.go` already routes its partial failures
+through `recordBedrockPartialFailure`, so the Converse path was fixed by the same edit
+without touching it.
+
+### 12c. The design mistake, and what caught it
+
+My first implementation paired `emitTrace(outcomeError)` with a **new** non-counting row
+helper (`recordFailureDetailsRow`), reasoning by analogy with round 18f's
+`recordFailureAttribution` split — keep the trace row, keep the flat row, count once.
+
+That was wrong, and wrong in this file's own documented way: `emitTrace` **already**
+appends a row *and* counts (`request_trace_recorder.go:349-365`). Pairing it with any row
+writer produces **two rows per failure** — the row-inflation the header comment of
+`passthrough_trace.go` says `emitTrace` exists to remove. I had re-created the D1 defect
+while fixing its sibling.
+
+`TestPassthroughPartialFailureEmitsRichRow` failed immediately on `got 2` rows, before
+any of this reached a commit. The fix was to **delete**, not add: `emitTrace` alone, and
+the speculative helper split reverted out of `handler.go` entirely.
+
+**Class-level lesson (recorded in the skill):** 18f's remedy was a *split* because two
+counting helpers collided; 18g's remedy is a *deletion* because one helper already does
+both jobs. Reaching for the previous round's shape without re-reading what the target
+helper does is how a fix re-introduces the defect it is fixing. Read the emitter, then
+choose.
+
+### 12d. The false green REPEATED — the 18f lesson was written down and still missed
+
+This is the part of the round worth keeping. §11c ends with a class-level lesson, and it
+is recorded in the skill: *when the fix is a call-site change, mutate the call site.*
+
+I then wrote five tests that all drive `recordPassthroughPartialFailure` **directly**, and
+ran a battery of 8 mutants. Six died. The two that mattered:
+
+```
+[SURVIVED] M1 bedrock CALL SITE reverted to legacy row
+[SURVIVED] M2 custom_api CALL SITE reverted to legacy row
+```
+
+Reverting **either** call site to `recordFailureWithDetails` — i.e. undoing the entire
+D1d fix — passed all 1379 tests. Exactly the defect-81 false green, one round later,
+against a written-down rule.
+
+Why the helper tests could not see it: the counter total is identical on both branches (1
+either way, by design — see 12b), and the tests that *do* touch these call sites
+(`bedrock_partial_failure_test.go`) construct `forwardParams` **without** a recorder, so
+they take the untraced fallback and cannot distinguish the fix from the legacy call.
+
+Fixed by two tests that drive the real callers:
+- `TestBedrockPartialFailureCallSiteEmitsRichRow` — calls `recordBedrockPartialFailure`
+  with a *traced* `forwardParams` and asserts `RequestID != ""` + `AttemptCount == 1`.
+- `TestCustomApiPartialFailureCallSiteEmitsRichRow` — drives the real `streamUpstream`
+  loop with a body that yields one SSE chunk then errors (non-EOF), asserts it returns
+  `nil` (headers committed, no failover), that the client actually got bytes (so the test
+  cannot vacuously pass on a no-output path), and that the row is rich.
+
+**Sharpened lesson for the skill:** knowing the rule is not applying it. The operational
+form is a *procedure*, not a maxim — after writing tests for a call-site fix, run the
+mutant that reverts the call site and confirm it dies. And when an existing test touches
+your call site, check which branch it takes: a test that passes `nil` where the fix reads
+a recorder is not coverage of the fix.
+
+### 12e. Verification
+
+- **7 new tests**: 5 at the choke point (single rich row, the one-counter-bump invariant,
+  untraced fallback still counting and logging, committed-200 status, nil-error guard) and
+  2 at the call sites (12d).
+- **Mutation battery 8/8 killed**, each by a distinct named test: both call-site reverts,
+  double-row, attempt-not-closed, status-derived-from-error, untraced-fallback-dropped,
+  nil-guard-dropped, outcome-success. Battery restored the tree and the post-run diff
+  shows only the intended D1d edits.
+- `go build` / `go vet` / `gofmt` clean; full suite **1381 passed**; `-race` clean
+  (`proxy` + `pool`, 1174).
+
+### 12f. Defect count
+
+**81 → 82.**

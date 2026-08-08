@@ -652,6 +652,28 @@ Bedrock code.
   `recordFailureAttribution` (attributes, does **not** count) for paths where `emitTrace`
   already counted. See CHECKPOINT §11 — including the false green: helper-level tests left
   the call-site mutant alive across all 1374 tests until a test drove the real handler.
+- **D1d. Passthrough *partial-failure* rows were still the legacy thin shape** —
+  **DONE (round 18g).** The remaining half of D1, found while updating the caller
+  inventory. D1 fixed the SUCCESS path; the mid-stream-failure path still called
+  `recordFailureWithDetails` (`bedrock.go` via `recordBedrockPartialFailure`,
+  `custom_api_forward.go`), so a stream that died **after** the client got bytes produced
+  a row with no `RequestID` and no attempt history — even though `forwardParams` had
+  carried the recorder since D1.
+
+  Not a double-count: those paths never called `emitTrace`, so the counters moved exactly
+  once. The bug was row *shape* and lost attempt history.
+
+  Shipped as `recordPassthroughPartialFailure` (`passthrough_trace.go`): closes the
+  attempt **with its cause**, emits one row via `emitTrace(outcomeError, 200)`, falls back
+  to the flat helper when untraced. `bedrock_converse.go` was fixed for free (it already
+  routes through `recordBedrockPartialFailure`). Status is 200 deliberately — headers were
+  committed before the break.
+
+  **The predicted split turned out to be wrong.** This entry originally called for
+  splitting `recordFailureWithDetails` the way 18f split `recordFailureForApiKey`. That
+  reasoning was backwards: `emitTrace` already appends the row AND counts, so pairing it
+  with any row writer produces TWO rows. The remedy was a **deletion**, not a split — see
+  CHECKPOINT §12c.
 - **D1b. The websearch pair still writes legacy thin rows** — found while closing D1,
   recorded rather than silently left. `websearch.go:700` and `websearch_loop.go:223`
   still call `recordSuccessLog` directly, so those rows carry no `RequestID` and none of

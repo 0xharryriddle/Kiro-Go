@@ -526,7 +526,9 @@ func (h *Handler) recordBedrockPartialFailure(p forwardParams, streamErr error) 
 	}
 	logger.Warnf("[Bedrock] stream ended with error after partial output (account %s): %v", p.account.ID, streamErr)
 	h.pool.RecordError(p.account.ID, false)
-	h.recordFailureWithDetails(endpoint, p.model, p.account.ID, p.apiKeyID, streamErr)
+	// Rich trace row when the dispatch loop threaded a recorder, else the legacy
+	// flat row — and exactly one counter bump either way (PROPOSAL D1d).
+	h.recordPassthroughPartialFailure(p, endpoint, streamErr)
 }
 
 // recordBedrockSuccess bills the customer API key by tokens and updates account +

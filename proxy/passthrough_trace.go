@@ -98,6 +98,43 @@ func (h *Handler) recordPassthroughTrace(p forwardParams, endpoint string, u pas
 	h.emitTrace(p.trace, outcomeSuccess, http.StatusOK)
 }
 
+// recordPassthroughPartialFailure emits the terminal row for a passthrough stream
+// that broke AFTER the client already received bytes (PROPOSAL D1d).
+//
+// This is a different situation from notePassthroughFailedAttempt below: there is
+// no failover left (the client holds committed headers and a partial body), so the
+// request IS over and exactly one terminal row is owed. Before this, both
+// passthroughs called recordFailureWithDetails here, which produced the legacy thin
+// row — no RequestID, no attempt history — even though forwardParams already
+// carried the recorder.
+//
+// Exactly one row and exactly one counter bump on either branch:
+//   - untraced: recordFailureWithDetails appends the flat row and counts;
+//   - traced: emitTrace(outcomeError) appends the rich row and counts.
+//
+// emitTrace does BOTH by itself (request_trace_recorder.go:349-365), so it must be
+// called ALONE. An earlier draft of this function paired it with a non-counting
+// row helper "to keep the flat row too", which wrote two rows per failure — the
+// row-inflation this file's header says emitTrace exists to remove. The test that
+// asserts a single row is what caught it; keep that test.
+//
+// httpStatus is 200, not a status derived from the error: the response headers were
+// already written and flushed with 200 before the stream broke, so 200 is what the
+// client actually received. Reporting 502 here would describe a response nobody was
+// sent.
+func (h *Handler) recordPassthroughPartialFailure(p forwardParams, endpoint string, streamErr error) {
+	if h == nil || streamErr == nil {
+		return
+	}
+	if p.trace == nil {
+		h.recordFailureWithDetails(endpoint, p.model, accountIDOf(p), p.apiKeyID, streamErr)
+		return
+	}
+	// Close the attempt with its cause so the row says WHICH account broke and why.
+	p.trace.endAttempt(p.attempt, streamErr)
+	h.emitTrace(p.trace, outcomeError, http.StatusOK)
+}
+
 // notePassthroughFailedAttempt closes an attempt that failed before the client
 // received anything, so the account that just failed stays in the trace even
 // though this request will be retried elsewhere.

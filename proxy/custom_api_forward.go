@@ -497,7 +497,10 @@ func (h *Handler) streamUpstream(w http.ResponseWriter, flusher http.Flusher, re
 			endpoint = "openai"
 		}
 		h.pool.RecordError(p.account.ID, false)
-		h.recordFailureWithDetails(endpoint, p.model, p.account.ID, p.apiKeyID, streamErr)
+		// Same swap as the Bedrock partial-failure path (PROPOSAL D1d): rich trace
+		// row when a recorder was threaded, else the legacy flat row, and exactly
+		// one counter bump either way.
+		h.recordPassthroughPartialFailure(p, endpoint, streamErr)
 		return nil
 	}
 

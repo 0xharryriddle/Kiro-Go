@@ -486,6 +486,61 @@ true, and points at D1b for the websearch pair that genuinely still lacks it.
 **Verified:** 5 tests, 4/4 mutants killed by distinct tests; full suite 1374 + `-race`
 clean.
 
+### Round 18g — D1d: the passthrough *partial-failure* row (and the SAME false green, again)
+
+`proxy/passthrough_trace.go` (+`recordPassthroughPartialFailure`), `proxy/bedrock.go`,
+`proxy/custom_api_forward.go`. Full reasoning in the checkpoint §12.
+
+D1 (18e) only fixed the passthrough **success** path. A Bedrock or custom_api stream that
+broke **after** the client already had bytes still went through `recordFailureWithDetails`
+— the legacy thin row, no `RequestID`, no attempt history — while `forwardParams` had been
+carrying a recorder since 18e. Not a double-count (those paths never called `emitTrace`);
+the bug was row shape and discarded attempt history. `bedrock_converse.go` was fixed for
+free, since it already routes through `recordBedrockPartialFailure`.
+
+Status is reported as **200 deliberately**: headers were written and flushed with 200
+before the break, so 200 is what the client received. Deriving 502 would describe a
+response nobody was sent.
+
+**Design mistake worth knowing about.** My first attempt copied 18f's shape — pair
+`emitTrace` with a new *non-counting* row helper. Wrong: `emitTrace` already appends the
+row **and** counts, so that wrote **two rows per failure**, re-creating the very D1 defect
+being extended. The remedy was a **deletion**, not a split. 18f's collision was two
+*counting* helpers; 18g's was one helper already doing both jobs. Read the emitter before
+pairing anything with it.
+
+**THE LESSON, REPEATED — and this is the part to actually change behaviour on.** The
+"mutate the call site" rule from 18f was already written in this file *and* in the skill. I
+still wrote five tests that drove the new choke point directly, and the battery said:
+
+```
+[SURVIVED] M1 bedrock CALL SITE reverted to legacy row
+[SURVIVED] M2 custom_api CALL SITE reverted to legacy row
+```
+
+Reverting either call site — undoing the entire fix — passed all 1379 tests. Two
+compounding causes, both worth checking by hand next time:
+
+- the fix is **side-effect-neutral by design** (one counter bump either way), so no
+  counter assertion can separate fixed from broken — the discriminator is row *shape*
+  (`RequestID != ""`, `AttemptCount`);
+- an existing test *did* touch the call site and proved nothing:
+  `bedrock_partial_failure_test.go` builds `forwardParams` with **no** recorder, so it
+  takes the untraced fallback. Covering a line is not covering the branch the fix is in.
+
+Killed by two tests driving the real callers:
+`TestBedrockPartialFailureCallSiteEmitsRichRow` and
+`TestCustomApiPartialFailureCallSiteEmitsRichRow` (the latter runs the real
+`streamUpstream` loop against a body that yields one SSE chunk then errors, and asserts
+the client actually received bytes so it cannot pass vacuously).
+
+**Run it as a procedure, not a maxim:** write the test → mechanically revert the *call
+site* → confirm the suite goes red → restore. Recorded in the skill in that form.
+
+**Verified:** 7 tests, **8/8 mutants killed** by distinct tests, post-battery diff shows
+only the intended edits; full suite **1381 passed**; `-race` clean. Defect count **81 →
+82**. Remaining trace gap: **D1b** (websearch pair, multi-account attribution).
+
 ### 2026-07-30 production recovery — external termination, then round 17 deploy
 
 The old production container was found stopped with exit code 2 about 20 seconds

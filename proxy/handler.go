@@ -2786,6 +2786,9 @@ func requestLogAccountEmail(accountID string) string {
 // recordFailureWithDetails records a failure and stores it in the request logs.
 // apiKeyID attributes the failed request to the API key entry that issued it so
 // customer-facing log endpoints can show per-key failures; empty on legacy paths.
+// Do NOT pair this with emitTrace on the same path: emitTrace already appends a
+// row and counts failures, so pairing them writes two rows and counts one failure
+// twice. A traced path wants emitTrace ALONE (see recordPassthroughPartialFailure).
 func (h *Handler) recordFailureWithDetails(endpoint, model, accountID, apiKeyID string, err error) {
 	atomic.AddInt64(&h.totalRequests, 1)
 	atomic.AddInt64(&h.failedRequests, 1)
