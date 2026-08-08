@@ -316,6 +316,18 @@ type forwardParams struct {
 	model     string
 	apiKeyID  string
 	forwarded bool // incoming request already carried forwardHeader
+
+	// trace/attempt carry the caller's request trace into the passthrough so it
+	// can emit the SAME rich RequestLog shape the Kiro path does (PROPOSAL D1).
+	//
+	// Both are optional: beginAttempt/endAttempt/emitTrace are all nil-safe, so a
+	// caller that does not trace (bedrockTestReply, tests) simply leaves these
+	// unset. Threading them through forwardParams rather than adding parameters
+	// keeps all nine construction sites compiling and makes the omission visible
+	// at the call site — a new passthrough that forgets them logs a thin row
+	// instead of silently losing the trace id.
+	trace   *traceRecorder
+	attempt *traceAttempt
 }
 
 // upstreamPath maps the incoming API surface to the upstream pool's path.
@@ -537,7 +549,19 @@ func (h *Handler) recordCustomApiSuccess(p forwardParams, inputTokens, outputTok
 	h.pool.RecordSuccess(p.account.ID)
 	h.pool.RecordLatency(p.account.ID, float64(time.Since(reqStart).Milliseconds()))
 	h.pool.UpdateStats(p.account.ID, inputTokens+outputTokens, credits)
-	h.recordSuccessLog(endpoint, p.model, p.account.ID, p.apiKeyID, inputTokens+outputTokens, credits, time.Since(reqStart).Milliseconds())
+	// Same swap as the Bedrock path (PROPOSAL D1): emit ONE row, rich when the
+	// caller threaded a trace recorder, else the legacy thin row. This path shares
+	// the defect — it funnelled into recordSuccessLog too — so fixing only Bedrock
+	// would have left the sibling passthrough broken identically.
+	//
+	// Cache tokens are left unset: the upstream here is another Kiro-Go pool and
+	// parseUpstreamUsage reads only prompt/completion totals from its SSE, so there
+	// is no cache breakdown to report rather than a measured zero.
+	h.recordPassthroughTrace(p, endpoint, passthroughUsage{
+		inputTokens:  inputTokens,
+		outputTokens: outputTokens,
+		credits:      credits,
+	}, reqStart)
 }
 
 // customApiRateTTL bounds how long a cached upstream price is reused before the next

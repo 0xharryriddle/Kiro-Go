@@ -598,7 +598,50 @@ Bedrock code.
 
 ### Track D — Observability & operations
 
-- **D1. Bedrock paths emit no structured trace row** — roadmap F-E / P1-4.
+- ~~**D1. Bedrock paths emit no structured trace row**~~ — **DONE, round 18e, and the
+  claim above was WRONG as written.** roadmap F-E / P1-4.
+  `proxy/passthrough_trace.go` + 9 dispatch sites + both passthrough success recorders.
+
+  **The claim is false as stated.** A Bedrock request *does* produce a row:
+  `recordBedrockSuccess` → `recordSuccessLog` → `appendRequestLog`. What is wrong is
+  narrower and, in one respect, worse:
+
+  1. The row is the **legacy minimal shape** — only
+     `{Time, Endpoint, Model, AccountID, ApiKeyID, Status, Tokens, Credits, Duration}`.
+     Everything the trace UI and CSV export read is missing: `RequestID`, `Outcome`,
+     `API`, `Stream`, `HTTPStatus`, `Attempts`, the input/output split, cache tokens,
+     `TTFBMs`, `StopReason`, `ResponseModel`, `ToolCallCount`, `Region`, `ProfileArn`,
+     `UpstreamHost`, `AccountEmail`, `BodyRef`.
+  2. **A recorder was already allocated and an attempt already opened**, then thrown
+     away. `tr` is created at `handler.go:2020/3001/3370/3847` and
+     `att := tr.beginAttempt(account)` at `:2054/3008/3377/3854` — *before* the
+     passthrough branch, which then `return`s (`:2104/3051/3402/3878`) without
+     `endAttempt` or `emitTrace`. So the row carries **no `RequestID`** (unjoinable),
+     and a failover chain that ENDS on a passthrough account **discards the attempt
+     history of every account that failed before it** — precisely the evidence an
+     operator needs.
+  3. **Not Bedrock-specific.** `recordCustomApiSuccess` funnels into the same
+     `recordSuccessLog`, so every transparent passthrough shares the defect. Fixed as
+     a class (user chose this scope), not just at the Bedrock site.
+
+  **This had to be a SWAP, not an addition.** `emitTrace` also ends in
+  `appendRequestLog` (`request_trace_recorder.go:384`), so calling both writes **two
+  rows per request** — the row-inflation `emitTrace`'s own doc comment says it exists
+  to prevent. Counters are unaffected, which is what makes the swap safe:
+  `recordSuccessLog` only appends, and `emitTrace` bumps counters only on
+  `outcomeError`; success counters still come from `recordSuccessForApiKey`.
+
+  **Cache tokens are reported only where they are measured.** Native invoke parses
+  `cache_read_input_tokens` / `cache_creation_input_tokens`
+  (`bedrockUsageTokens`), so those paths now report the breakdown — a *subset* of
+  `inputTokens`, never added to it (`totalInput()` already sums all three, so adding
+  again would double-bill). Converse reports only `{inputTokens, outputTokens}`
+  (`converseResponse.Usage`) and custom_api only prompt/completion totals, so those
+  leave the fields unset rather than asserting a measured zero.
+
+  Verified: 12 tests, 7/7 mutants killed by distinct tests (double row, always-legacy,
+  no `endAttempt`, row-per-failed-attempt, cache dropped, extractor swap, no legacy
+  fallback), full suite 1369 + `-race` clean.
 - **D2. Metrics coverage audit** — `/metrics` exists, is Prometheus-shaped, and is
   gated behind `MetricsEnabled` (default off, 404 when disabled, no auth — the
   standard scrape model, documented at `metrics_prometheus.go:158`). Audit *which*

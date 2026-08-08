@@ -314,6 +314,7 @@ func (h *Handler) invokeBedrockStream(w http.ResponseWriter, flusher http.Flushe
 	}
 
 	var inputTokens, outputTokens int
+	var cacheReadTokens, cacheWriteTokens int
 	var streamedAny bool
 
 	streamErr := readBedrockEventStream(resp.Body, func(eventType string, anthropicJSON []byte) error {
@@ -323,6 +324,12 @@ func (h *Handler) invokeBedrockStream(w http.ResponseWriter, flusher http.Flushe
 			if it := extractInputTokens(anthropicJSON); it > 0 {
 				inputTokens = it
 			}
+			// Cache breakdown for the trace row (PROPOSAL D1). Assigned
+			// unconditionally, not behind a >0 guard: an explicit zero states
+			// "caching was measured and did not fire", which is a different fact
+			// from "never measured" and the one the RequestLog comment on
+			// CacheReadTokens says must be distinguishable.
+			cacheReadTokens, cacheWriteTokens = extractInputCacheTokens(anthropicJSON)
 		case bytes.Contains(anthropicJSON, []byte(`"message_delta"`)):
 			if ot := extractOutputTokens(anthropicJSON); ot > 0 {
 				outputTokens = ot
@@ -343,6 +350,11 @@ func (h *Handler) invokeBedrockStream(w http.ResponseWriter, flusher http.Flushe
 			return werr // stop reading; disposition decided by the classifier
 		}
 		streamedAny = true
+		// TTFB is recorded only after the first write actually SUCCEEDS, so the
+		// figure means "time until the client had bytes" rather than "time until
+		// we tried". markFirstByte ignores every call after the first and is
+		// nil-safe, so this is cheap in the hot loop.
+		p.trace.markFirstByte()
 		return nil
 	})
 
@@ -366,7 +378,7 @@ func (h *Handler) invokeBedrockStream(w http.ResponseWriter, flusher http.Flushe
 		return nil
 	}
 
-	h.recordBedrockSuccess(p, inputTokens, outputTokens, reqStart)
+	h.recordBedrockSuccessWithCache(p, inputTokens, outputTokens, cacheReadTokens, cacheWriteTokens, reqStart)
 	return nil
 }
 
@@ -397,12 +409,18 @@ func (h *Handler) invokeBedrockNonStream(w http.ResponseWriter, p forwardParams)
 	}
 
 	inputTokens, outputTokens := extractNonStreamUsage(respBody)
+	// Cache breakdown for the trace row; a subset of inputTokens, never added to
+	// it (see extractInputCacheTokens).
+	cacheReadTokens, cacheWriteTokens := extractNonStreamCacheTokens(respBody)
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write(respBody)
+	// Non-streaming still has a meaningful first byte: the moment the single JSON
+	// response reached the client.
+	p.trace.markFirstByte()
 
-	h.recordBedrockSuccess(p, inputTokens, outputTokens, reqStart)
+	h.recordBedrockSuccessWithCache(p, inputTokens, outputTokens, cacheReadTokens, cacheWriteTokens, reqStart)
 	return nil
 }
 
@@ -516,6 +534,22 @@ func (h *Handler) recordBedrockPartialFailure(p forwardParams, streamErr error) 
 // configurable per-1k-token rate purely for operator accounting/analytics; the
 // customer key's TokenLimit is the real quota gate (RecordApiKeyUsage enforces it).
 func (h *Handler) recordBedrockSuccess(p forwardParams, inputTokens, outputTokens int, reqStart time.Time) {
+	// Cache figures default to zero for callers that cannot measure them. Only
+	// the NATIVE invoke path parses cache_read_input_tokens /
+	// cache_creation_input_tokens (bedrockUsageTokens); the Converse API reports
+	// just {inputTokens, outputTokens} (converseResponse.Usage), so a Converse
+	// account genuinely has nothing to report here rather than a measured zero.
+	h.recordBedrockSuccessWithCache(p, inputTokens, outputTokens, 0, 0, reqStart)
+}
+
+// recordBedrockSuccessWithCache is recordBedrockSuccess plus the prompt-cache
+// breakdown, for the paths that actually receive it from the upstream.
+//
+// cacheRead/cacheWrite are a BREAKDOWN of inputTokens, never an addition:
+// extractInputTokens already sums fresh + cache-read + cache-write into the
+// input figure (see its comment), so billing must not count them twice. They are
+// reported separately only so the trace row can say WHY an input count was large.
+func (h *Handler) recordBedrockSuccessWithCache(p forwardParams, inputTokens, outputTokens, cacheRead, cacheWrite int, reqStart time.Time) {
 	endpoint := "claude"
 	if p.endpoint == "openai" || p.endpoint == "responses" {
 		endpoint = "openai"
@@ -525,7 +559,16 @@ func (h *Handler) recordBedrockSuccess(p forwardParams, inputTokens, outputToken
 	h.pool.RecordSuccess(p.account.ID)
 	h.pool.RecordLatency(p.account.ID, float64(time.Since(reqStart).Milliseconds()))
 	h.pool.UpdateStats(p.account.ID, inputTokens+outputTokens, credits)
-	h.recordSuccessLog(endpoint, p.model, p.account.ID, p.apiKeyID, inputTokens+outputTokens, credits, time.Since(reqStart).Milliseconds())
+	// Emits exactly ONE row: the rich trace row when the caller threaded a
+	// recorder, else the legacy thin row. Never both — emitTrace and
+	// recordSuccessLog both append to the same store (PROPOSAL D1).
+	h.recordPassthroughTrace(p, endpoint, passthroughUsage{
+		inputTokens:      inputTokens,
+		outputTokens:     outputTokens,
+		cacheReadTokens:  cacheRead,
+		cacheWriteTokens: cacheWrite,
+		credits:          credits,
+	}, reqStart)
 }
 
 // bedrockCreditsForTokens converts a token count to operator credits using
@@ -596,6 +639,43 @@ type bedrockUsageTokens struct {
 // totalInput returns every input token the upstream will charge for.
 func (u bedrockUsageTokens) totalInput() int {
 	return u.InputTokens + u.CacheCreationInputTokens + u.CacheReadInputTokens
+}
+
+// extractInputCacheTokens reads the prompt-cache BREAKDOWN of the input tokens
+// from a message_start event: (cacheRead, cacheWrite).
+//
+// These are a subset of what extractInputTokens already returned, never an
+// addition to it — totalInput() sums fresh + cache-read + cache-write, so adding
+// them again would double-bill. They exist so a trace row can explain WHY an
+// input count was large, which is the difference between "context intact, served
+// from cache" and "context went missing" — two facts with opposite remedies.
+//
+// This path is the only Bedrock surface that can report them: the Converse API's
+// usage object carries just {inputTokens, outputTokens}
+// (converseResponse.Usage), so a Converse account has nothing to report rather
+// than a measured zero.
+func extractInputCacheTokens(eventJSON []byte) (int, int) {
+	var e struct {
+		Message struct {
+			Usage bedrockUsageTokens `json:"usage"`
+		} `json:"message"`
+	}
+	if json.Unmarshal(eventJSON, &e) != nil {
+		return 0, 0
+	}
+	return e.Message.Usage.CacheReadInputTokens, e.Message.Usage.CacheCreationInputTokens
+}
+
+// extractNonStreamCacheTokens is extractInputCacheTokens for a full
+// (non-streaming) response body.
+func extractNonStreamCacheTokens(respJSON []byte) (int, int) {
+	var r struct {
+		Usage bedrockUsageTokens `json:"usage"`
+	}
+	if json.Unmarshal(respJSON, &r) != nil {
+		return 0, 0
+	}
+	return r.Usage.CacheReadInputTokens, r.Usage.CacheCreationInputTokens
 }
 
 // extractOutputTokens reads usage.output_tokens from a message_delta event.

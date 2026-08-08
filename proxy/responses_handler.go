@@ -205,9 +205,11 @@ func (h *Handler) handleResponsesNonStream(
 			if fwdErr := h.forwardToUpstream(w, nil, forwardParams{
 				account: account, body: rawBody, endpoint: "responses", streaming: false,
 				model: model, apiKeyID: apiKeyID, forwarded: forwarded,
+				trace: tr, attempt: att,
 			}); fwdErr != nil {
 				lastErr = fwdErr
 				excluded[account.ID] = true
+				h.notePassthroughFailedAttempt(forwardParams{trace: tr, attempt: att}, fwdErr)
 				h.handleAccountFailure(account, fwdErr)
 				continue
 			}

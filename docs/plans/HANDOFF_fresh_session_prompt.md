@@ -399,6 +399,51 @@ guard, ceiling, floor, release-on-any-change, valve removed); full suite + `-rac
 been filtered out of `p.accounts` by `Reload`'s quota gate, so it would not be found
 there.
 
+### Round 18e — passthrough trace rows (D1), and the claim that was false
+
+`proxy/passthrough_trace.go` (new) + 9 dispatch sites + both passthrough success
+recorders. Full reasoning in `docs/plans/CHECKPOINT_audit_and_merge_state.md` §10.
+
+**The proposal said "Bedrock paths emit no structured trace row". That is FALSE** — a
+row was always written (`recordBedrockSuccess` → `recordSuccessLog` →
+`appendRequestLog`). Read the call chain before re-deriving this. The real defects:
+
+1. The row was the **legacy minimal shape** (9 fields). Missing everything the trace UI
+   reads: `RequestID`, `Outcome`, `API`, `Stream`, `HTTPStatus`, `Attempts`, token
+   split, cache tokens, `TTFBMs`, `StopReason`, `Region`, `ProfileArn`, `BodyRef`, …
+2. **A recorder was already allocated and thrown away** — the part the proposal missed.
+   `tr` at `handler.go:2020/3001/3370/3847`, `beginAttempt` at `:2054/3008/3377/3854`,
+   then the passthrough branch `return`s at `:2104/3051/3402/3878` with no `endAttempt`
+   and no `emitTrace`. So rows had **no `RequestID`** (unjoinable) and a failover chain
+   ending on a passthrough **destroyed the attempt history of the accounts that failed
+   first**.
+3. **Class defect**: `recordCustomApiSuccess` shared it. Fixed for both passthroughs.
+
+**THE TRAP if you touch this: it is a SWAP, not an addition.** `emitTrace` also ends in
+`appendRequestLog` (`request_trace_recorder.go:384`). Calling both writes **two rows per
+request**. `TestPassthroughEmitsExactlyOneRow` and `TestPassthroughWithoutTraceStillLogs`
+pin the count from both sides (not two, not zero) — keep both or a refactor that drops
+the emit entirely will look correct.
+
+Counters are untouched by the swap: `recordSuccessLog` only appends, `emitTrace` bumps
+counters **only** on `outcomeError`, and success counters still come from
+`recordSuccessForApiKey`. This changes row SHAPE only.
+
+**Cache tokens: only emit where measured.** Native invoke parses
+`cache_read_input_tokens`/`cache_creation_input_tokens`. Converse carries only
+`{inputTokens, outputTokens}` (`converseResponse.Usage:339`) and custom_api only
+prompt/completion totals — those leave the fields **unset**, because `RequestLog`'s own
+comment says an explicit `0` asserts "caching was measured and did not fire", i.e.
+emitting 0 there would write a false statement. Cache figures are a **subset** of
+`inputTokens` (`totalInput()` already sums all three) — never add them on top.
+
+New callers: thread `trace: tr, attempt: att` into `forwardParams` and call
+`h.notePassthroughFailedAttempt(...)` on the failure branch. Both are nil-safe, so an
+untraced caller (`bedrockTestReply`, tests) falls back to the legacy row.
+
+**Verified:** 12 tests, 7/7 mutants killed by distinct tests; full suite 1369 + `-race`
+clean.
+
 ### 2026-07-30 production recovery — external termination, then round 17 deploy
 
 The old production container was found stopped with exit code 2 about 20 seconds

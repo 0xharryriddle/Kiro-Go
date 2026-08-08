@@ -2075,9 +2075,11 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 			if fwdErr := h.forwardToUpstream(w, flusher, forwardParams{
 				account: account, body: rawBody, endpoint: "anthropic", streaming: true,
 				model: model, apiKeyID: apiKeyID, forwarded: forwarded,
+				trace: tr, attempt: att,
 			}); fwdErr != nil {
 				lastErr = fwdErr
 				excluded[account.ID] = true
+				h.notePassthroughFailedAttempt(forwardParams{trace: tr, attempt: att}, fwdErr)
 				h.handleAccountFailure(account, fwdErr)
 				continue
 			}
@@ -2091,9 +2093,11 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 			if bErr := h.invokeBedrockStream(w, flusher, forwardParams{
 				account: account, body: rawBody, endpoint: "anthropic", streaming: true,
 				model: model, apiKeyID: apiKeyID, forwarded: forwarded,
+				trace: tr, attempt: att,
 			}); bErr != nil {
 				lastErr = bErr
 				excluded[account.ID] = true
+				h.notePassthroughFailedAttempt(forwardParams{trace: tr, attempt: att}, bErr)
 				// A throttle-cooldown skip is advisory (per-model, short); don't
 				// escalate it into an account-wide failure/cooldown.
 				if !errors.Is(bErr, errBedrockThrottled) {
@@ -3027,9 +3031,11 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayl
 			if fwdErr := h.forwardToUpstream(w, nil, forwardParams{
 				account: account, body: rawBody, endpoint: "anthropic", streaming: false,
 				model: model, apiKeyID: apiKeyID, forwarded: forwarded,
+				trace: tr, attempt: att,
 			}); fwdErr != nil {
 				lastErr = fwdErr
 				excluded[account.ID] = true
+				h.notePassthroughFailedAttempt(forwardParams{trace: tr, attempt: att}, fwdErr)
 				h.handleAccountFailure(account, fwdErr)
 				continue
 			}
@@ -3040,9 +3046,11 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayl
 			if bErr := h.invokeBedrockNonStream(w, forwardParams{
 				account: account, body: rawBody, endpoint: "anthropic", streaming: false,
 				model: model, apiKeyID: apiKeyID, forwarded: forwarded,
+				trace: tr, attempt: att,
 			}); bErr != nil {
 				lastErr = bErr
 				excluded[account.ID] = true
+				h.notePassthroughFailedAttempt(forwardParams{trace: tr, attempt: att}, bErr)
 				if !errors.Is(bErr, errBedrockThrottled) {
 					h.handleAccountFailure(account, bErr)
 				}
@@ -3391,9 +3399,11 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 			if bErr := h.invokeBedrockOpenAIStream(w, flusher, forwardParams{
 				account: account, body: rawBody, endpoint: "openai", streaming: true,
 				model: model, apiKeyID: apiKeyID, forwarded: forwarded,
+				trace: tr, attempt: att,
 			}); bErr != nil {
 				lastErr = bErr
 				excluded[account.ID] = true
+				h.notePassthroughFailedAttempt(forwardParams{trace: tr, attempt: att}, bErr)
 				if !errors.Is(bErr, errBedrockThrottled) {
 					h.handleAccountFailure(account, bErr)
 				}
@@ -3415,9 +3425,11 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 			if fwdErr := h.forwardToUpstream(w, flusher, forwardParams{
 				account: account, body: rawBody, endpoint: "openai", streaming: true,
 				model: model, apiKeyID: apiKeyID, forwarded: forwarded,
+				trace: tr, attempt: att,
 			}); fwdErr != nil {
 				lastErr = fwdErr
 				excluded[account.ID] = true
+				h.notePassthroughFailedAttempt(forwardParams{trace: tr, attempt: att}, fwdErr)
 				h.handleAccountFailure(account, fwdErr)
 				continue
 			}
@@ -3867,9 +3879,11 @@ func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, payload *KiroPayl
 			if bErr := h.invokeBedrockOpenAINonStream(w, forwardParams{
 				account: account, body: rawBody, endpoint: "openai", streaming: false,
 				model: model, apiKeyID: apiKeyID, forwarded: forwarded,
+				trace: tr, attempt: att,
 			}); bErr != nil {
 				lastErr = bErr
 				excluded[account.ID] = true
+				h.notePassthroughFailedAttempt(forwardParams{trace: tr, attempt: att}, bErr)
 				if !errors.Is(bErr, errBedrockThrottled) {
 					h.handleAccountFailure(account, bErr)
 				}
@@ -3891,9 +3905,11 @@ func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, payload *KiroPayl
 			if fwdErr := h.forwardToUpstream(w, nil, forwardParams{
 				account: account, body: rawBody, endpoint: "openai", streaming: false,
 				model: model, apiKeyID: apiKeyID, forwarded: forwarded,
+				trace: tr, attempt: att,
 			}); fwdErr != nil {
 				lastErr = fwdErr
 				excluded[account.ID] = true
+				h.notePassthroughFailedAttempt(forwardParams{trace: tr, attempt: att}, fwdErr)
 				h.handleAccountFailure(account, fwdErr)
 				continue
 			}

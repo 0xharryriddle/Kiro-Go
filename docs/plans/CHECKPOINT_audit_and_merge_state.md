@@ -1938,3 +1938,113 @@ the drop check to `if true` is killed by the first of them.
 Unchanged at **79**. B2 is a sizing improvement to a control that already worked, not
 a defect — same classification as §4's A3/A4 precedent. The refuted *proposal item* is
 recorded above as a plan error, not as a code defect.
+
+## 10. Round 18e — D1 passthrough trace rows (and the third proposal claim to be wrong)
+
+Closed PROPOSAL D1. Like B2, **the item as written was wrong** — and this time the
+error was in the opposite direction: it understated one half of the problem while
+asserting something false about the other. Recorded rather than quietly shipping
+something different from the plan.
+
+### 10a. What the proposal claimed
+
+> "D1. Bedrock paths emit no structured trace row — roadmap F-E / P1-4."
+
+### 10b. That is false, and the truth is worse in one respect
+
+A Bedrock request **does** produce a request-log row:
+`recordBedrockSuccess` (`bedrock.go:528`) → `recordSuccessLog` (`handler.go:2771`) →
+`appendRequestLog` (`:2784`). Verified by reading the call chain, not inferred.
+
+The actual defects:
+
+1. **The row is the legacy minimal shape.** `recordSuccessLog` fills only
+   `{Time, Endpoint, Model, AccountID, ApiKeyID, Status, Tokens, Credits, Duration}`.
+   Absent: `RequestID`, `Outcome`, `API`, `Stream`, `HTTPStatus`, `Attempts`,
+   `AttemptCount`, the input/output token split, `CacheReadTokens`,
+   `CacheWriteTokens`, `TTFBMs`, `StopReason`, `ResponseModel`, `ToolCallCount`,
+   `Region`, `ProfileArn`, `UpstreamHost`, `AccountEmail`, `BodyRef` — i.e. every
+   field the trace UI and CSV export were built to read.
+
+2. **A recorder was allocated and then thrown away.** This is the part the proposal
+   missed entirely. `tr := newTraceRecorder(...)` runs at `handler.go:2020/3001/3370/
+   3847` and `att := tr.beginAttempt(account)` at `:2054/3008/3377/3854` — both
+   BEFORE the passthrough branch, which then `return`s at `:2104/3051/3402/3878`
+   without calling `endAttempt` or `emitTrace`.
+
+   Two consequences, both operator-visible:
+   - the row carries **no `RequestID`**, so it cannot be joined to anything;
+   - a failover chain that **ends** on a passthrough account **discards the attempt
+     history of every account that failed before it**. An operator debugging "why did
+     this request take three hops" gets a row that claims one clean success.
+
+3. **It is a class defect, not a Bedrock one.** `recordCustomApiSuccess`
+   (`custom_api_forward.go:540`) funnelled into the same `recordSuccessLog`. The user
+   was offered Bedrock-only vs the whole class and **chose the class**, so both
+   passthroughs are fixed.
+
+### 10c. Why this had to be a swap, not an addition
+
+`emitTrace` also ends in `appendRequestLog` (`request_trace_recorder.go:384`). Adding
+the rich emit while leaving `recordSuccessLog` in place would write **two rows per
+request** — exactly the row-inflation `emitTrace`'s own doc comment says it exists to
+remove ("a failover chain produced multiple rows for one request").
+
+The swap is safe on counters, which is the part worth checking before believing it:
+`recordSuccessLog` only appends a row, and `emitTrace` bumps counters **only** on
+`outcomeError`. Success counters keep coming from `recordSuccessForApiKey` on the
+serving path, so this changes row SHAPE and nothing else.
+
+### 10d. Design: thread the recorder through `forwardParams`
+
+`forwardParams` (`custom_api_forward.go:311`) gained `trace *traceRecorder` and
+`attempt *traceAttempt`. Chosen over adding parameters because all nine construction
+sites keep compiling, and the omission is visible at the call site — a future
+passthrough that forgets them logs a thin row instead of silently losing the trace id.
+
+New choke point `proxy/passthrough_trace.go`:
+- `recordPassthroughTrace` — closes the attempt, notes usage, emits **one** row; falls
+  back to the legacy thin row when no recorder was threaded (`bedrockTestReply`, admin
+  probes, ~170 test literals), which is what made this safe to drop into eight call
+  sites at once.
+- `notePassthroughFailedAttempt` — closes a failed attempt **without** emitting, since
+  the request is not over. Emitting there would produce one row per attempt.
+
+### 10e. Cache tokens: reported only where they are measured
+
+Native invoke parses `cache_read_input_tokens` / `cache_creation_input_tokens`
+(`bedrockUsageTokens`), so `extractInputCacheTokens` / `extractNonStreamCacheTokens`
+now feed the row, and `markFirstByte` supplies TTFB (recorded only after the write
+**succeeds**, so it means "client had bytes", not "we tried").
+
+Deliberately NOT emitted elsewhere: Converse's usage object carries only
+`{inputTokens, outputTokens}` (`converseResponse.Usage:339-342`), and custom_api's
+`parseUpstreamUsage` reads only prompt/completion totals. `RequestLog`'s own comment
+says an explicit `cacheReadTokens: 0` asserts "caching was measured and did not fire" —
+so emitting 0 there would have written a **false statement** into the log. Left unset.
+
+Cache figures are a **subset** of `inputTokens`, never added: `totalInput()` already
+sums fresh + cache-read + cache-write, so adding them again would double-bill. A test
+pins this (`Tokens == 370` for a 350/20 request with 200 read + 100 write).
+
+### 10f. Verification
+
+- `proxy/passthrough_trace.go` (new), `proxy/passthrough_trace_test.go` (12 tests),
+  `bedrock.go` (+2 extractors, cache-aware recorder, TTFB), `custom_api_forward.go`
+  (+2 struct fields, swapped recorder), `handler.go` (8 sites),
+  `responses_handler.go` (1 site).
+- **7/7 mutants killed, each by a distinct test**: double row, always-legacy row, no
+  `endAttempt` on success, row-per-failed-attempt, cache dropped, extractor swaps
+  read/write, no legacy fallback. Both mutated files restored and sha256-verified.
+- The row-count invariant is pinned from BOTH sides — `TestPassthroughEmitsExactlyOneRow`
+  (not two) and `TestPassthroughWithoutTraceStillLogs` (not zero). Without the second,
+  a refactor that dropped the emit entirely would have looked correct.
+- `go build`/`go vet`/`gofmt` clean; `scripts/verify.sh` green; full suite **1369
+  passed**; `-race` clean.
+
+### 10g. Defect count
+
+**79 → 80.** Unlike B2 (a sizing improvement to a working control), this is observable
+wrong behaviour: rows that cannot be joined, and destroyed failover evidence on a
+path the trace subsystem was explicitly built to cover. The *proposal claim* being
+false is recorded above as a plan error, not counted as a code defect.
