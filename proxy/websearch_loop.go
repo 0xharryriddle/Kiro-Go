@@ -84,6 +84,20 @@ func (h *Handler) runWebSearchLoop(w http.ResponseWriter, req *ClaudeRequest, th
 		usage.rounds++
 	}
 	reqStart := time.Now()
+	// ONE recorder for the whole loop (PROPOSAL D1b). This is the decision that
+	// shapes the rest: a web-search request spans several upstream rounds, each
+	// picking its own account, so a recorder per round would emit a row per round
+	// and break the one-request-one-row invariant D1/D1d exist to hold. Instead
+	// every round's attempts accumulate here and a single row carries the whole
+	// multi-account history.
+	//
+	// Created rather than threaded, because runWebSearchLoop is dispatched from
+	// handler.go:1909-1913 — before that function's first newTraceRecorder (:1953).
+	//
+	// The per-account token/credit split stays with pool.UpdateStats in the settle
+	// loop below; the trace records WHO was tried and in what order, not the
+	// billing split, so the two are complementary rather than redundant.
+	tr := newTraceRecorder("claude", req.Model, req.Stream, apiKeyID)
 	fallbackInput := estimatedInputTokens
 	// Respect native max_uses (capped by maxWebSearchRounds).
 	maxUses := resolveWebSearchMaxUses(req.Tools)
@@ -92,18 +106,18 @@ func (h *Handler) runWebSearchLoop(w http.ResponseWriter, req *ClaudeRequest, th
 	// Allow one extra iteration so a terminal flush can run after the last
 	// search-only round (same pattern as 0..=MAX_WEB_SEARCH_ROUNDS in kiro-rs).
 	for roundIdx := 0; roundIdx <= maxUses; roundIdx++ {
-		round, account, err := h.callUpstreamForWebSearch(&working, thinking, fallbackInput)
+		round, account, err := h.callUpstreamForWebSearch(&working, thinking, fallbackInput, tr)
 		if err != nil {
 			logger.Warnf("[WebSearchLoop] upstream round %d failed: %v", roundIdx, err)
-			accountID := ""
-			if account != nil {
-				accountID = account.ID
-			}
-			h.recordFailureWithDetails("claude", req.Model, accountID, apiKeyID, err)
 			// Shared classifier: this site already did the right thing inline,
 			// while the two MCP-search sites below hardcoded 502. Folding all
 			// three onto one helper is what keeps them from drifting again.
 			status, errType := webSearchErrorStatus(err)
+			// Swap of recordFailureWithDetails, not an addition: both append a row
+			// and both count the failure, so pairing them would log twice and
+			// double-count (defect 81). The row's AccountID now comes from the last
+			// attempt, so it names the account that actually failed last.
+			h.emitTrace(tr, outcomeError, status)
 			h.sendClaudeError(w, status, errType, err.Error())
 			return
 		}
@@ -127,15 +141,16 @@ func (h *Handler) runWebSearchLoop(w http.ResponseWriter, req *ClaudeRequest, th
 		// this round's searches fit under max_uses.
 		roundSearchN := countWebSearchToolUses(round.toolUses)
 		if shouldSearchRound(roundIdx, round.toolUses, maxUses) && searchCount+roundSearchN <= maxUses {
-			searched, searchErr := h.searchAllWebUses(req.Model, round.toolUses)
+			searched, searchErr := h.searchAllWebUses(req.Model, round.toolUses, tr)
 			if searchErr != nil {
 				logger.Warnf("[WebSearchLoop] MCP search failed: %v", searchErr)
-				h.recordFailureWithDetails("claude", req.Model, lastAccountID, apiKeyID, searchErr)
 				// Classify rather than hardcoding 502: the pure web-search path
 				// already reports an MCP 429 as rate_limit_error and a 401 as
 				// authentication_error, and a client's retry policy keys off that
 				// value. See webSearchErrorStatus (websearch.go).
 				searchStatus, searchErrType := webSearchErrorStatus(searchErr)
+				// Swap, not an addition — see the round-failure site above.
+				h.emitTrace(tr, outcomeError, searchStatus)
 				h.sendClaudeError(w, searchStatus, searchErrType, "Web search failed: "+searchErr.Error())
 				return
 			}
@@ -171,12 +186,13 @@ func (h *Handler) runWebSearchLoop(w http.ResponseWriter, req *ClaudeRequest, th
 				}
 				break
 			}
-			results, _, _, sErr := h.performWebSearch(req.Model, toolUseQuery(tu.Input))
+			results, _, _, sErr := h.performWebSearch(req.Model, toolUseQuery(tu.Input), tr)
 			if sErr != nil {
 				logger.Warnf("[WebSearchLoop] final-round MCP search failed: %v", sErr)
-				h.recordFailureWithDetails("claude", req.Model, lastAccountID, apiKeyID, sErr)
 				// Same classification as the intermediate-round site above.
 				sStatus, sErrType := webSearchErrorStatus(sErr)
+				// Swap, not an addition — see the round-failure site above.
+				h.emitTrace(tr, outcomeError, sStatus)
 				h.sendClaudeError(w, sStatus, sErrType, "Web search failed: "+sErr.Error())
 				return
 			}
@@ -220,7 +236,15 @@ func (h *Handler) runWebSearchLoop(w http.ResponseWriter, req *ClaudeRequest, th
 		// terminal round's account is carried by recordSuccessLog below, and the
 		// authoritative per-account split is already recorded via pool.UpdateStats.
 		h.recordSuccessForApiKey(apiKeyID, inputTokens, outputTokens, totalCredits, req.Model, nil, "claude", reqStart)
-		h.recordSuccessLog("claude", req.Model, lastAccountID, apiKeyID, inputTokens+outputTokens, totalCredits, time.Since(reqStart).Milliseconds())
+		// Swap of recordSuccessLog (D1b): emitTrace appends the row itself, so
+		// keeping both would write two rows for one request. lastAccountID is no
+		// longer passed — emitTrace derives the request-level AccountID from the
+		// final attempt, which IS the terminal round's account, so the row still
+		// names who produced the rendered output while Attempts[] carries every
+		// account tried across every round.
+		tr.noteUsage(inputTokens, outputTokens, 0, 0, totalCredits)
+		tr.noteResponseShape(stopReason, "", countWebSearchToolUses(round.toolUses))
+		h.emitTrace(tr, outcomeSuccess, http.StatusOK)
 
 		if req.Stream {
 			h.renderWebSearchLoopSSE(w, req.Model, content, stopReason, inputTokens, outputTokens)
@@ -234,7 +258,14 @@ func (h *Handler) runWebSearchLoop(w http.ResponseWriter, req *ClaudeRequest, th
 }
 
 // callUpstreamForWebSearch converts the Claude request and buffers one Kiro stream.
-func (h *Handler) callUpstreamForWebSearch(req *ClaudeRequest, thinking bool, estimatedInputTokens int) (*webSearchRoundOutcome, *config.Account, error) {
+//
+// tr records one attempt per account tried, opened INSIDE this loop for the same
+// reason as performWebSearch: selection happens here and only the serving account
+// is returned, so a caller could not time the attempts or see the ones that
+// failed. This is called once per ROUND, and every round's attempts accumulate on
+// the one recorder — that is what makes the loop emit a single row carrying the
+// whole multi-account history. Nil-safe.
+func (h *Handler) callUpstreamForWebSearch(req *ClaudeRequest, thinking bool, estimatedInputTokens int, tr *traceRecorder) (*webSearchRoundOutcome, *config.Account, error) {
 	payload := ClaudeToKiro(req, thinking)
 	excluded := make(map[string]bool)
 	var lastErr error
@@ -262,9 +293,14 @@ func (h *Handler) callUpstreamForWebSearch(req *ClaudeRequest, thinking bool, es
 			excluded[account.ID] = true
 			continue
 		}
+		// Opened AFTER the eligibility skip above: a Bedrock/custom_api account is
+		// ineligible rather than broken and no dispatch happens against it, so
+		// recording an attempt for it would invent a failure that never occurred.
+		att := tr.beginAttempt(account)
 		if err := h.ensureValidToken(account); err != nil {
 			lastErr = err
 			excluded[account.ID] = true
+			tr.endAttempt(att, err)
 			h.handleAccountFailure(account, err)
 			continue
 		}
@@ -310,6 +346,7 @@ func (h *Handler) callUpstreamForWebSearch(req *ClaudeRequest, thinking bool, es
 		if err != nil {
 			lastErr = err
 			excluded[account.ID] = true
+			tr.endAttempt(att, err)
 			h.handleAccountFailure(account, err)
 			continue
 		}
@@ -319,6 +356,11 @@ func (h *Handler) callUpstreamForWebSearch(req *ClaudeRequest, thinking bool, es
 		} else if inputTokens <= 0 {
 			inputTokens = estimatedInputTokens
 		}
+
+		// This round succeeded. The attempt closes here rather than in the caller
+		// so its duration covers the actual upstream call, and so a round that
+		// failed over across several accounts keeps every hop on the record.
+		tr.endAttempt(att, nil)
 
 		return &webSearchRoundOutcome{
 			text:               text,
@@ -363,10 +405,12 @@ func countWebSearchToolUses(toolUses []KiroToolUse) int {
 }
 
 // searchAllWebUses runs MCP for each tool_use in order (all are web_search).
-func (h *Handler) searchAllWebUses(model string, toolUses []KiroToolUse) ([]*WebSearchResults, error) {
+// tr is passed through so each search's account attempts land on the request's
+// single trace rather than being lost (D1b).
+func (h *Handler) searchAllWebUses(model string, toolUses []KiroToolUse, tr *traceRecorder) ([]*WebSearchResults, error) {
 	out := make([]*WebSearchResults, 0, len(toolUses))
 	for _, tu := range toolUses {
-		results, _, _, err := h.performWebSearch(model, toolUseQuery(tu.Input))
+		results, _, _, err := h.performWebSearch(model, toolUseQuery(tu.Input), tr)
 		if err != nil {
 			return nil, err
 		}

@@ -674,15 +674,31 @@ Bedrock code.
   reasoning was backwards: `emitTrace` already appends the row AND counts, so pairing it
   with any row writer produces TWO rows. The remedy was a **deletion**, not a split — see
   CHECKPOINT §12c.
-- **D1b. The websearch pair still writes legacy thin rows** — found while closing D1,
-  recorded rather than silently left. `websearch.go:700` and `websearch_loop.go:223`
-  still call `recordSuccessLog` directly, so those rows carry no `RequestID` and none of
-  the trace block. They are **not** `forwardParams` passthroughs — they are Kiro-path
-  multi-round searches, and `websearch_loop.go` bills *several accounts per request*
-  (round 9, `6911dcd`) — so D1's threading does not apply. The trace model already fits
-  though: `Attempts[]` exists precisely to put several upstream dispatches on one row,
-  so the shape is one recorder per client request with `beginAttempt`/`endAttempt` per
-  round. Smaller than D1 was, and the last two legacy-row writers in the tree.
+- **D1b. The websearch pair wrote legacy thin rows** — **DONE (round 18h).** The last
+  trace gap in the tree. `websearch.go:700` and `websearch_loop.go:223` called
+  `recordSuccessLog` directly, plus four failure sites on `recordFailureWithDetails`, so
+  both web-search surfaces produced rows with no `RequestID` and none of the trace block.
+  Not `forwardParams` passthroughs — Kiro-path multi-round searches, and
+  `websearch_loop.go` bills *several accounts per request* (round 9, `6911dcd`).
+
+  **This entry's prediction was right** (unlike D1d's): one recorder per client request
+  with `beginAttempt`/`endAttempt` per round is exactly what shipped, and `Attempts[]` did
+  hold the multi-account history without a schema change. The user chose one-row/request
+  over one-row/round; request-level `AccountID` falls out of `emitTrace`'s existing
+  last-attempt rule, which for this loop is the terminal round's account.
+
+  **Two things the entry did not anticipate**, both structural:
+  1. The recorder must be **created**, not threaded — both entrypoints dispatch from
+     `handler.go:1902-1913`, *before* that function's first `newTraceRecorder` (`:1953`).
+  2. Attempts must open **inside** `performWebSearch` / `callUpstreamForWebSearch`. They
+     are callees that select their own account and return only the one that served, so a
+     caller-opened attempt records ~0ms and loses every account that failed first.
+
+  Also corrected: the skill claimed **six** `maxAccountRetryAttempts` loops; there are
+  **eight**, and the two it omitted are precisely these. "Smaller than D1" was wrong too —
+  4 signatures and 7 call sites across 2 files, comparable to D1's 9.
+
+  See CHECKPOINT §13.
 - **D2. Metrics coverage audit** — `/metrics` exists, is Prometheus-shaped, and is
   gated behind `MetricsEnabled` (default off, 404 when disabled, no auth — the
   standard scrape model, documented at `metrics_prometheus.go:158`). Audit *which*

@@ -470,7 +470,13 @@ func parseSearchResults(mcpResp *McpResponse) *WebSearchResults {
 // A 200 JSON-RPC envelope whose search payload cannot be parsed is also treated
 // as failure (retry next account) — only a well-formed results object (including
 // an empty results array) counts as success.
-func (h *Handler) performWebSearch(model, query string) (*WebSearchResults, string, *config.Account, error) {
+// tr records one attempt per account tried (PROPOSAL D1b). It is opened INSIDE
+// this loop rather than by the caller because account selection happens here:
+// this function returns only the account that finally served, so a caller could
+// only stamp an attempt after the fact — with a ~0ms duration and no record of
+// the accounts that failed first, which is exactly the failover evidence the
+// trace exists to carry. tr may be nil (beginAttempt/endAttempt are nil-safe).
+func (h *Handler) performWebSearch(model, query string, tr *traceRecorder) (*WebSearchResults, string, *config.Account, error) {
 	excluded := make(map[string]bool)
 	var lastErr error
 	for attempt := 0; attempt < maxAccountRetryAttempts; attempt++ {
@@ -478,9 +484,11 @@ func (h *Handler) performWebSearch(model, query string) (*WebSearchResults, stri
 		if account == nil {
 			break
 		}
+		att := tr.beginAttempt(account)
 		if err := h.ensureValidToken(account); err != nil {
 			lastErr = err
 			excluded[account.ID] = true
+			tr.endAttempt(att, err)
 			h.handleAccountFailure(account, err)
 			continue
 		}
@@ -491,6 +499,7 @@ func (h *Handler) performWebSearch(model, query string) (*WebSearchResults, stri
 			logger.Warnf("[WebSearch] MCP call failed on account %s: %v", account.Email, err)
 			lastErr = err
 			excluded[account.ID] = true
+			tr.endAttempt(att, err)
 			h.handleAccountFailure(account, err)
 			continue
 		}
@@ -501,9 +510,11 @@ func (h *Handler) performWebSearch(model, query string) (*WebSearchResults, stri
 			lastErr = fmt.Errorf("MCP web_search returned unparseable or error search payload")
 			logger.Warnf("[WebSearch] %v on account %s", lastErr, account.Email)
 			excluded[account.ID] = true
+			tr.endAttempt(att, lastErr)
 			h.handleAccountFailure(account, lastErr)
 			continue
 		}
+		tr.endAttempt(att, nil)
 		h.pool.RecordSuccess(account.ID)
 		return results, toolUseID, account, nil
 	}
@@ -667,16 +678,22 @@ func (h *Handler) handleWebSearchRequest(w http.ResponseWriter, req *ClaudeReque
 	logger.Infof("[WebSearch] Processing query: %s (stream=%v)", query, req.Stream)
 	reqStart := time.Now()
 
-	results, toolUseID, account, err := h.performWebSearch(req.Model, query)
+	// The recorder is CREATED here, not threaded in (PROPOSAL D1b). Unlike the
+	// passthrough paths of D1/D1d, this handler is dispatched from
+	// handler.go:1902-1905 — BEFORE the first newTraceRecorder in that function
+	// (:1953) — so there is no upstream recorder to inherit. performWebSearch
+	// opens one attempt per account it tries.
+	tr := newTraceRecorder("claude", req.Model, req.Stream, apiKeyID)
+
+	results, toolUseID, account, err := h.performWebSearch(req.Model, query, tr)
 	if err != nil {
 		logger.Warnf("[WebSearch] All MCP attempts failed: %v", err)
-		accountID := ""
-		if account != nil {
-			accountID = account.ID
-		}
-		h.recordFailureWithDetails("claude", req.Model, accountID, apiKeyID, err)
 		// Prefer a real error over a silent empty body (issue #120 symptom).
 		status, errType := webSearchErrorStatus(err)
+		// emitTrace REPLACES recordFailureWithDetails rather than joining it:
+		// both append a row and both bump totalRequests/failedRequests, so
+		// calling both would log twice and count one failure twice (defect 81).
+		h.emitTrace(tr, outcomeError, status)
 		h.sendClaudeError(w, status, errType, "Web search failed: "+err.Error())
 		return
 	}
@@ -691,13 +708,16 @@ func (h *Handler) handleWebSearchRequest(w http.ResponseWriter, req *ClaudeReque
 		inputTokens = 0
 	}
 
-	accountID := ""
 	if account != nil {
-		accountID = account.ID
 		h.pool.UpdateStats(account.ID, inputTokens+outputTokens, 0)
 	}
 	h.recordSuccessForApiKey(apiKeyID, inputTokens, outputTokens, 0, req.Model, account, "claude", reqStart)
-	h.recordSuccessLog("claude", req.Model, accountID, apiKeyID, inputTokens+outputTokens, 0, time.Since(reqStart).Milliseconds())
+	// Swap of recordSuccessLog, not an addition (D1b): emitTrace also appends a
+	// row, so keeping both would write two rows for one request. The request-level
+	// AccountID is no longer passed here — emitTrace takes it from the last
+	// attempt performWebSearch closed, which is the account that actually served.
+	tr.noteUsage(inputTokens, outputTokens, 0, 0, 0)
+	h.emitTrace(tr, outcomeSuccess, http.StatusOK)
 
 	if req.Stream {
 		h.streamWebSearchSSE(w, req.Model, query, toolUseID, results, inputTokens, outputTokens)

@@ -80,7 +80,9 @@ func TestWebSearchLoopDoesNotSendNonKiroAccountsToKiro(t *testing.T) {
 		Messages: []ClaudeMessage{{Role: "user", Content: "search for something"}},
 	}
 
-	_, account, _ := h.callUpstreamForWebSearch(req, false, 10)
+	// nil recorder on purpose: this test is about the provider guard, and it also
+	// pins that the trace threading added in D1b is nil-safe.
+	_, account, _ := h.callUpstreamForWebSearch(req, false, 10, nil)
 
 	if got := atomic.LoadInt64(&kiroHits); got != 0 {
 		t.Fatalf("the web-search loop made %d Kiro HTTP request(s) using a non-Kiro "+
@@ -141,7 +143,7 @@ func TestWebSearchLoopStillUsesKiroAccounts(t *testing.T) {
 		Messages: []ClaudeMessage{{Role: "user", Content: "search for something"}},
 	}
 
-	outcome, account, err := h.callUpstreamForWebSearch(req, false, 10)
+	outcome, account, err := h.callUpstreamForWebSearch(req, false, 10, nil)
 	if err != nil {
 		t.Fatalf("a healthy Kiro account must still serve the web-search loop: %v", err)
 	}

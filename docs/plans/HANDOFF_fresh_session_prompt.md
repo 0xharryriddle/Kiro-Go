@@ -553,6 +553,62 @@ Re-run at the current HEAD before quoting any number a background job hands back
 async figure with no commit attached is not evidence — and expect more of these, since any
 long-running job in a moving repo produces them.
 
+### Round 18h — D1b: the websearch pair, and the LAST trace gap
+
+`proxy/websearch.go`, `proxy/websearch_loop.go`. Full reasoning in the checkpoint §13.
+
+The final direct callers of the legacy row writers. `websearch.go:700` and
+`websearch_loop.go:223` called `recordSuccessLog`, plus four failure sites on
+`recordFailureWithDetails`, so both web-search surfaces produced thin rows with no
+`RequestID` and no `Attempts`. The loop was the worst case in the repo: one request spans
+up to `maxWebSearchRounds` upstream rounds and the pool's LRU deliberately sends
+consecutive rounds to **different** accounts, so a single request routinely touched several
+accounts and none of that history was recorded anywhere.
+
+**Shape (user chose):** ONE row per request, every round's attempts accumulated on one
+recorder. Request-level `AccountID` falls out of `emitTrace`'s existing last-attempt rule,
+which here is the terminal round's account; `Attempts[]` carries every account tried.
+
+**Two structural facts that made this NOT a copy of D1/D1d** — assume either away and the
+fix is broken:
+
+1. **The recorder is CREATED, not threaded.** Both entrypoints dispatch from
+   `handler.go:1902-1913`, *before* that function's first `newTraceRecorder` (`:1953`).
+   There is nothing upstream to inherit.
+2. **Attempts open INSIDE the callee loops.** `performWebSearch` (`websearch.go:482`) and
+   `callUpstreamForWebSearch` (`websearch_loop.go:273`) select their own account and return
+   only the one that served, so a caller-opened attempt records ~0ms and loses every
+   account that failed first. In `callUpstreamForWebSearch` the attempt opens *after* the
+   Bedrock/custom_api eligibility skip — those accounts are ineligible, not broken, and no
+   dispatch happens, so an attempt there would invent a failure.
+
+**The skill said SIX retry loops. There are EIGHT** (`handler.go` 2049/3047/3420/3901,
+`responses_handler.go` 180/529, `websearch.go` 482, `websearch_loop.go` 273) — and the two
+it omitted are exactly the two this round had to instrument, so the stale count pointed
+*away* from the work. Corrected in the skill with the `search_files` command to re-derive
+it instead of a number to trust.
+
+**My implementation was wrong and a test caught it pre-commit.** First version added the
+`tr` parameter to `callUpstreamForWebSearch` and a doc comment describing per-round
+attempts, but never added the `beginAttempt`/`endAttempt` calls inside the loop —
+signature threaded, behaviour absent, doc comment a lie the compiler cannot catch.
+`TestWebSearchLoopEmitsOneRichRowAcrossRounds` failed with `AttemptCount = 1 but the
+request made 2 upstream rounds` (the lone attempt came from the MCP search between rounds).
+That assertion exists because of the §12d procedure: assert the row shape a caller
+observes, not that a helper was called.
+
+**Then the battery caught the tests.** First run killed 8/10; **M9** (`beginAttempt(nil)`
+— attempts lose account identity) and **M10** (`endAttempt(att, nil)` on the failure branch
+— a failed round recorded as success) both SURVIVED, because every loop assertion I had
+written checked attempt *count*, and both mutants leave the count correct. Closed with
+`TestWebSearchLoopRecordsFailedRoundAttemptWithItsCause`, which drives a real failover
+(first upstream call 500, retry succeeds) and asserts per-attempt `AccountID` and
+`Outcome`/`Error` rather than the count.
+
+**Lesson, third variant of the same class:** count assertions do not constrain content.
+18f/18g were "mutate the call site"; this one is "mutate the *field*" — for anything that
+accumulates records, assert identity and outcome per record, not just how many there are.
+
 ### 2026-07-30 production recovery — external termination, then round 17 deploy
 
 The old production container was found stopped with exit code 2 about 20 seconds

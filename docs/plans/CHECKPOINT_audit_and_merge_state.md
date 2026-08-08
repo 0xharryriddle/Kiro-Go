@@ -2254,6 +2254,10 @@ a recorder is not coverage of the fix.
 
 **81 → 82.**
 
+### 12h. Forward pointer
+
+D1b — the last trace gap, the websearch pair — is round 18h, §13 below.
+
 ### 12g. Stale async results nearly became this round's evidence — TWICE
 
 Two background `go test ./... -race` jobs, launched in earlier rounds, both completed
@@ -2281,3 +2285,167 @@ now closed, but it was open while the docs claimed `-race` clean.
 **Procedure:** re-run at the current HEAD before quoting any figure a background job hands
 back, and put `git log --oneline -1` in the *same* command so the output carries the commit
 it measured. An async number with no commit attached is not evidence.
+
+## 13. Round 18h — D1b: the websearch pair, and the LAST trace gap
+
+`proxy/websearch.go`, `proxy/websearch_loop.go`. Closes the gap D1 (18e) opened and D1d
+(18g) narrowed: these two were the final direct callers of the legacy row writers.
+
+### 13a. The defect
+
+`websearch.go:700` and `websearch_loop.go:223` called `recordSuccessLog` directly, and
+four failure sites called `recordFailureWithDetails`. So both web-search surfaces produced
+the **legacy thin row** — no `RequestID` (unjoinable), no `Outcome`, no `Attempts`.
+
+The loop case was the worst instance in the repo, and for a reason the other paths do not
+have: one mixed web-search request spans up to `maxWebSearchRounds` upstream rounds, and
+the pool's LRU deliberately hands consecutive rounds to **different** accounts. So a
+single request routinely touches several accounts, and *none* of that history was recorded
+anywhere. The per-account token/credit split was already correct (`pool.UpdateStats` in the
+settle loop, fixed in an earlier round) — what was missing was who was tried, in what
+order, and why any of them failed.
+
+### 13b. Shape decision: ONE row per request (user's call)
+
+Two options were put to the user:
+
+| option | keeps one-request-one-row? | cost |
+|---|---|---|
+| one row/request, `Attempts[]` per round | **yes** | request-level `AccountID` must pick one account |
+| one row per round | no | easier billing read, breaks the invariant 4 rounds were spent building |
+
+User chose one-row/request. Request-level `AccountID` therefore comes from `emitTrace`'s
+existing rule — the **last** attempt — which for this loop is the terminal round's account,
+i.e. the one that produced the rendered output. `Attempts[]` carries every account tried
+across every round, so nothing is lost by that choice.
+
+### 13c. Two structural facts that made this NOT a copy of D1/D1d
+
+Both were measured, and either one would have produced a broken fix if assumed away.
+
+**1. The recorder must be CREATED, not threaded.** D1/D1d threaded an existing recorder
+through `forwardParams`. That is impossible here: both web-search entrypoints are
+dispatched from `handler.go:1902-1913`, which is **before** the first `newTraceRecorder` in
+that function (`:1953`, the response-cache-hit path). There is no upstream recorder to
+inherit, so `handleWebSearchRequest` and `runWebSearchLoop` each construct one.
+
+**2. Attempts must be opened INSIDE the callee loops.** `performWebSearch`
+(`websearch.go:482`) and `callUpstreamForWebSearch` (`websearch_loop.go:273`) are **callees
+that select their own account** and return only the one that finally served. An attempt
+opened by the caller would therefore have a ~0ms duration and would omit every account
+that failed first — precisely the failover evidence the trace exists to carry. Both
+functions took a `tr *traceRecorder` parameter (nil-safe) and open one attempt per account
+they try.
+
+A corollary worth stating because it is easy to get backwards: in
+`callUpstreamForWebSearch` the attempt is opened **after** the Bedrock/custom_api
+eligibility skip. Those accounts are *ineligible*, not broken, and no dispatch happens
+against them, so recording an attempt would invent a failure that never occurred.
+
+### 13d. EIGHT retry loops, not six — the skill was wrong and it pointed away from the work
+
+The skill's trace reference has carried a heading "**SIX** retry loops, not one" since the
+subsystem was built, listing `handler.go` ×4 and `responses_handler.go` ×2, with the rule
+that every trace feature must be threaded through all of them.
+
+Measured:
+
+```
+proxy/handler.go          2049, 3047, 3420, 3901
+proxy/responses_handler.go 180, 529
+proxy/websearch.go         482   <- performWebSearch
+proxy/websearch_loop.go    273   <- callUpstreamForWebSearch
+```
+
+**Eight.** And the two missing ones are exactly the two D1b had to instrument, so the stale
+count pointed *away* from the work. Corrected in the skill, with the `search_files` command
+to re-derive it rather than a number to trust.
+
+### 13e. My implementation was wrong, and a test caught it before commit
+
+First implementation added the `tr` parameter to `callUpstreamForWebSearch` and a doc
+comment describing per-round attempts — but never added the `beginAttempt`/`endAttempt`
+calls inside its loop. Signature threaded, behaviour absent. The doc comment was a lie the
+compiler could not catch.
+
+`TestWebSearchLoopEmitsOneRichRowAcrossRounds` failed with `AttemptCount = 1 but the
+request made 2 upstream rounds` — the single attempt came from the MCP search between
+rounds, while both *upstream* rounds recorded nothing.
+
+That assertion exists because of the §12d procedure: the test asserts the row shape a
+caller would actually observe (`AttemptCount >= rounds`), not that a helper was invoked.
+A test that only checked "row has a RequestID" would have passed with both upstream rounds
+untraced.
+
+### 13f. Then the battery caught the TESTS — a COUNT assertion does not constrain CONTENT
+
+First battery run killed 8/10 and left two alive:
+
+```
+[SURVIVED] M9  beginAttempt(nil)     -> attempts lose account identity
+[SURVIVED] M10 endAttempt(att, nil)  -> a FAILED round recorded as a success
+```
+
+Both survived for one reason: every loop assertion I had written checked `AttemptCount`,
+and **both mutants leave the count exactly right**. M9 produces attempts that name no
+account — so the row cannot say which credential misbehaved, and the request-level
+`AccountID` that `emitTrace` derives from the last attempt goes empty. M10 reports a
+reroute as a clean success, erasing the very failover evidence this subsystem exists for.
+
+This is the third variant of the same class in three rounds, and it needed a *different*
+remedy than the previous two:
+
+| round | false green | remedy |
+|---|---|---|
+| 18f | helper tested, call site unwired | mutate the **call site** |
+| 18g | same, plus a side-effect-neutral fix | assert row **shape**, not counters |
+| 18h | records counted but not inspected | assert **per-record** identity + outcome |
+
+Closed with `TestWebSearchLoopRecordsFailedRoundAttemptWithItsCause`, which drives a REAL
+failover through `runWebSearchLoop` (first upstream call returns 500, the retry inside
+`callUpstreamForWebSearch` succeeds) and asserts, per attempt, a non-empty `AccountID` and
+at least one `Outcome == outcomeError` carrying a non-empty `Error` — while the
+request-level `Outcome` stays `success`, because the retry did serve the request.
+
+It also guards against vacuity: `if upstreamCalls < 2 { t.Fatalf(...) }`. Without that, the
+test would pass on a single-attempt path and constrain nothing — the same trap as the
+`t.Skipf` rule from §11c.
+
+**Rule recorded in the skill:** for anything that accumulates records, assert per-record
+identity and outcome, never the length of the slice.
+
+### 13g. Verification
+
+- **5 new tests** in `proxy/websearch_trace_test.go`, all driving the REAL entrypoints
+  (`runWebSearchLoop`, `handleWebSearchRequest`): one rich row across a multi-round
+  multi-account loop, the failover-attempt content test (§13f), round-failure counted once,
+  pure-search rich row, pure-search failure counted once. Plus the two existing
+  `callUpstreamForWebSearch` callers updated to pass `nil`, which also pins nil-safety.
+- **Mutation battery 10/10 killed**, each by a distinct named test: 4 call-site reverts
+  (both surfaces × success/failure), row inflation, per-round attempt not closed,
+  MCP attempt not closed, round failure reported as success, attempt identity lost, failed
+  attempt recorded as success. Battery restored the tree; post-run `git diff` shows only the
+  intended D1b edits.
+- `go build` / `go vet` / `gofmt` clean; full suite **1386 passed**; full-repo `-race`
+  **1386 passed in 6 packages**; `scripts/verify.sh` **12/12 green**.
+
+### 13h. Defect count
+
+**82 → 83.**
+
+### 13i. The trace subsystem is now complete
+
+`recordSuccessLog` and `recordFailureWithDetails` have **no remaining production callers on
+a traced path**. What is left is deliberate:
+
+| writer | remaining callers | why |
+|---|---|---|
+| `recordSuccessLog` | `passthrough_trace.go:85` | the untraced fallback for callers with no recorder (admin probes, tests) |
+| `recordFailureWithDetails` | `passthrough_trace.go` untraced branch | same |
+
+Every client-facing surface — Claude stream/non-stream, OpenAI stream/non-stream,
+`/v1/responses` stream/non-stream, Bedrock and custom_api passthroughs (success **and**
+mid-stream failure), and both web-search surfaces — now emits exactly one rich row per
+request through `emitTrace`. Defect #1 of the trace design doc (`RequestID` never assigned
+⇒ unjoinable rows) and defect #2 (failover chain collapsed to one row, losing the cause of
+the reroute) are closed everywhere, not just on the paths the original build covered.
