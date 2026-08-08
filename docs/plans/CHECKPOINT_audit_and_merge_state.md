@@ -2671,3 +2671,114 @@ to. Two goldens are arguably wrong on their merits and are pinned anyway — not
 the static-file arm and 404s, where a 405 would be more honest. Fixing that is a behaviour
 change and belongs in its own round; mixing it into the mechanical conversion is exactly
 how a refactor becomes unreviewable.
+
+## 16. Round 18k — the first real deploy of this whole programme, and what it exposed
+
+Commit `5688ee0`. **Everything from rounds 18a–18j was unreachable until this round.**
+
+### 16a. The deploy failed, and the failure was the most valuable output
+
+Pushed 3 commits, built the image, swapped the container. The new container **crash-looped
+10 times** and `:8080` went down:
+
+```
+Refusing to start: admin password is still the default on a non-loopback host (0.0.0.0).
+```
+
+`main.go:104` refuses to boot when `config.GetPassword() == "changeme"` **and** the bind
+host is non-loopback. `docker-compose.yml` sets `HOST=0.0.0.0`, and `data/config.json`
+still held `changeme`. So **no build newer than 2026-07-30 could ever have started** in
+this configuration.
+
+**The serving image was from 2026-07-30 — nine days old — and predated the guard.** That is
+why nothing had complained. Two consequences, and the second is the serious one:
+
+1. Every round in this programme (B1, B2, D1, D1d, D1b, F1, N-7, N-8, the merge to v1.2.8)
+   had been committed, pushed, gated, and **never once executed**. The audit was measuring
+   source, not behaviour.
+2. The publicly-published admin panel (`0.0.0.0:8080`) had been running on the **default
+   password `changeme`** for those nine days. `/admin/api/config/export` returns raw
+   `config.json` — 41 accounts' refresh tokens. The guard existing and *working as designed*
+   is what surfaced it.
+
+### 16b. Why the error message's own escape hatch does not apply here
+
+The message offers "or bind to `127.0.0.1`". Not usable in Docker: `isLoopbackHost`
+(`main.go:198`) accepts only `localhost` / loopback IPs, and a **container**-loopback
+listener is unreachable through the published port mapping — the app would boot and then
+answer nothing. `ADMIN_PASSWORD` is the only viable fix. Read both the guard *and* its
+helper before choosing between the remedies an error message suggests.
+
+### 16c. The fix, and why the secret does not land on disk
+
+`.env` (gitignored, `0600`, 40 random chars) → `docker-compose.yml` passes
+`ADMIN_PASSWORD=${ADMIN_PASSWORD:-}` → `main.go:75` calls `config.SetPassword`, which
+writes **`passwordOverride`**, not `cfg.Password` (`config.go:1290`). `GetPassword` prefers
+the override (`:1337`). `Save()` never persists it (L9).
+
+Confirmed after a successful boot: the password on disk is **still `changeme`**, while the
+live gate accepts only the new secret. The secret stays out of `config.json` and out of
+`/admin/api/config/export`.
+
+`.gitignore` covers `.env` + `.env.*` while keeping `.env.example`, which documents the
+variable, the exact crash it prevents, and the Docker/loopback caveat.
+
+### 16d. `:-` not `:?`, deliberately — keep enforcement in ONE place
+
+The fail-loud `${ADMIN_PASSWORD:?}` is tempting and wrong here: it breaks
+`docker compose config`, which `scripts/verify.sh` runs as a gate, in **any checkout
+without a `.env`** — including CI and a fresh clone. Enforcement already exists in the app's
+guard. Duplicating it in the manifest converts a clear runtime refusal into a confusing
+interpolation error at gate time. Verified both ways: `docker compose config` resolves with
+`.env` present *and* with `ADMIN_PASSWORD` unset.
+
+### 16e. Rollback secured BEFORE the swap — and the skill's warning was correct
+
+`docker compose build` reuses the `:latest` tag, so "the old image ID is the rollback" is
+false. Copied the serving binary out first
+(`docker cp … /tmp/kirogo_rollback_binary_20260808`, 11.6M real ELF) and **proved it was
+the old build** with paired controls:
+
+- negative: `noteUsageDelta`, `overageBackoffFor`, `recordPassthroughTrace`,
+  `recordFailureAttribution` → **0** occurrences;
+- positive: `isAuthErrorMessage` 2, `parseEventStream` 2, `handleClaudeStream` 23,
+  `ensureValidToken` 3 → the probe works.
+
+An absent-only result is indistinguishable from a broken probe. This tree happens to keep
+`rollback-*` tags too, but that was luck, not design.
+
+### 16f. Verification of the deployed artifact (not of the source)
+
+- healthy on the **first** poll, `restarts=0`, **zero** "Refusing to start" lines.
+- `/health` → `{"status":"ok","version":"1.2.8"}`. The old image served **1.1.2**, so this
+  is the first evidence the merge is actually running.
+- All five round symbols present in the **running container's** binary
+  (`docker exec … strings /app/kiro-go`), with positive controls — the image was probed
+  before the swap and the container after.
+- 41 accounts intact across the recreate (`data/` is a bind mount, confirmed pre-swap).
+- Admin gate flipped: `changeme` → **401**, no password → **401**, real password → **200**.
+- Gate **12/12**.
+
+### 16g. Two of my own probes were wrong; both were caught by cross-checking
+
+- **`hasPassword: True` is not a security check.** `"changeme"` is truthy, so my pre-flight
+  passed a config that could not boot. The right assertion is `password == "changeme"`.
+- **`/healthz` carries no version field** — it returns `{status,time}`; `/health` carries
+  `version`. My first "live version" probe printed `(none)` and would have read as "the
+  deploy did not take" had I not checked the other endpoint.
+
+Also: `enabled: 0` for all 41 accounts while `/v1/models` still returned a full list. Not a
+contradiction — that list is `fallbackAnthropicModels`. **A populated `/v1/models` is not
+evidence of a working pool.**
+
+### 16h. Standing state after this round
+
+**26 of 41 accounts are `BANNED`** (18 "Authentication failed", 8 "AWS temporarily
+suspended"), 13 `ACTIVE`, and **all 41 are `enabled: false`** — so the pool can serve
+nothing upstream. 15 of those bans landed in the preceding 48h, one ~12s after the previous
+container started. Zero new bans since the new binary came up.
+
+This is now the top open item: the deployed code is finally current, and B1/B2 (the
+quota/backoff work) cannot demonstrate anything against a fleet with no enabled accounts.
+Re-enabling is an operator decision (a bare refresh leaves `enabled=false`; recovery needs
+an explicit re-enable), so it is **not** something to do unprompted.
