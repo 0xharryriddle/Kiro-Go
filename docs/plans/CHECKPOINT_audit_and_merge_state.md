@@ -5,9 +5,10 @@ session (or a reviewer) can pick it up without re-deriving anything. Every
 claim below is verified against the live tree by real command output; items I
 could not verify are labelled as such rather than asserted.
 
-Last verified: repo `harry` branch, working tree mid-merge — see §1 (SECOND merge,
-`hian699` v1.2.8). The §1 table below was rewritten on that date; the v1.1.5 numbers
-it used to carry are preserved in §1a so the older record is not lost.
+Last verified: repo `harry` branch, **merge COMMITTED** at `e902ed3`, 49 ahead of
+`origin/harry` — see §1 (SECOND merge, `hian699` v1.2.8). The §1 table below was
+rewritten on that date; the v1.1.5 numbers it used to carry are preserved in §1a so
+the older record is not lost.
 
 ---
 
@@ -15,23 +16,22 @@ it used to carry are preserved in §1a so the older record is not lost.
 
 **This is a SECOND, DIFFERENT merge from the one the rest of this document
 describes.** §2-§3 and R1 concern upstream `v1.1.5` (`ec4ba56`), which is long since
-committed and pushed. The tree is now mid-merge again, against a different fork.
+committed and pushed. This second merge is now committed too, but **not pushed**.
 
 | Fact | Value | How verified |
 |---|---|---|
 | Branch | `harry` | `git rev-parse --abbrev-ref HEAD` |
-| HEAD | `9f0b943` (`docs: record round 17 production deployment`) | `git rev-parse HEAD` |
-| Merge in progress | **YES** — `.git/MERGE_HEAD` present | `git rev-parse MERGE_HEAD` |
-| `MERGE_HEAD` | `8a2dfc4` — *"Merge pull request #1 from itbosser/pr-to-hian699"* | `git rev-parse MERGE_HEAD`, `git log -1 --format=%s MERGE_HEAD` |
+| HEAD | `e902ed3` (`merge: resolve hian699 v1.2.8 into harry (48 commits)`) | `git rev-parse HEAD` |
+| Merge in progress | **NO** — `MERGE_HEAD` gone, merge concluded | `git status` |
+| Merge parents | `9f0b943` (ours) + `8a2dfc4` (theirs) | `git log -1 --format=%p` |
 | Incoming remote | `hian699` → `https://github.com/hian699/Kiro-Go` | `git remote -v` |
-| Merge base | `a2e3971` | `git merge-base HEAD MERGE_HEAD` |
-| Incoming commits | **48** (`HEAD..MERGE_HEAD`) | `git rev-list --count HEAD..MERGE_HEAD` |
+| Merge base | `a2e3971` | `git merge-base 9f0b943 8a2dfc4` |
+| Incoming commits | **48** | `git rev-list --count 9f0b943..8a2dfc4` |
 | Version in tree | `1.2.8` (`config/config.go:783`), `version.json` agrees | `grep`, `cat version.json` |
 | Unmerged paths | **0** | `git diff --name-only --diff-filter=U` (empty) |
-| Conflict markers remaining | **0** across all tracked files | `search_files` for `^(<{7}\|={7}\|>{7})` → 0 hits |
-| Working tree vs HEAD | 97 files changed, +18462/-1658 | `git diff HEAD --shortstat` |
-| Committed | **NO** — resolution sits in the working tree, `MERGE_HEAD` still set | `git status` |
-| Pushed to `origin/harry` | n/a — 0 ahead / 0 behind at HEAD `9f0b943` | `git rev-list --left-right --count origin/harry...HEAD` |
+| Conflict markers remaining | **0** across all tracked files | `git grep -nE '^(<{7}\|={7}\|>{7})'` → 0 hits |
+| Committed | **YES** — `e902ed3` | `git log -1` |
+| Pushed to `origin/harry` | **NO — 49 ahead / 0 behind.** `origin/harry` still at `9f0b943`. Push needs user authorization. | `git rev-list --left-right --count HEAD...origin/harry` → `49  0` |
 | Build | clean | `go build ./...` |
 | Vet | clean | `go vet ./...` |
 | `gofmt -l` | clean (empty) | `gofmt -l .` |
@@ -1436,18 +1436,182 @@ upstream surfaces.
 
 ## 6. Validation gate (run all of these before claiming done)
 
+**This gate is now a script.** `scripts/verify.sh` runs every check below, prints a
+pass/fail table, and exits non-zero if any fails:
+
 ```bash
-gofmt -l ./config ./proxy ./pool ./auth   # expect only the 2 pre-existing flags
+./scripts/verify.sh            # 10 checks, ~1 min
+./scripts/verify.sh --race     # add the race detector (minutes)
+./scripts/verify.sh --list     # print the checks without running them
+```
+
+The checks it runs, and the manual equivalents:
+
+```bash
 go build ./...
 go vet ./...
-go test ./config/ ./pool/ ./auth/ ./proxy/
-go test -race ./config/ ./pool/ ./auth/ ./proxy/ -count=1
-node --check web/app.js
-# locale symmetry: en.json vs zh.json leaf-key sets must match exactly
+gofmt -l .                                # must print NOTHING
+go test ./... -count=1
+go test ./... -race -count=1              # --race only
+node --check web/*.js                     # every JS file, not just app.js
+# every web/locales/*.json must parse
+# en.json vs zh.json leaf-key sets must match exactly (vi is coverage-only)
+python3 -c 'import yaml,sys; yaml.safe_load(open("docker-compose.yml"))'
+docker compose config >/dev/null           # Compose schema, not just YAML
 git diff --check
 ```
 
-gofmt is now clean across the whole tree — both formerly-flagged files
+gofmt is clean across the whole tree — both formerly-flagged files
 (`proxy/usage_anomaly_test.go`, `proxy/customer_admin_api_test.go`) were
 whitespace-only alignment and were fixed in passing, so `gofmt -l` should return
 NOTHING. A non-empty result now means the current change introduced it.
+
+**Every check in that script was mutation-proven**: a defect of the class it claims
+to catch was introduced, the check was confirmed RED, then the file was restored and
+verified byte-identical by SHA-256. A check that has never been seen to fail is not
+evidence. Details in §7.
+
+**Why the non-Go checks exist.** The `hian699` v1.2.8 merge produced a tree where
+`go build`, `go vet` and `go test` were all green while `web/app.js` did not parse
+(7 splices → the whole admin bundle dead in the browser) and `docker-compose.yml`
+was invalid YAML (deploy path dead). `.github/workflows/ci.yml` runs Go steps only
+(`ci.yml:47-85`), so **CI would have passed that tree too**. `go test` is not the
+gate; `scripts/verify.sh` is.
+
+---
+
+## 7. Round 18 — tooling, tutorials, and the doc-vs-code audit
+
+Round 18 is not a defect round. It closed the merge, built the three scripts §6
+refers to, and then — while writing tutorials from measured output — found that four
+doc surfaces instructed operators to do things this tree cannot do.
+
+### 7a. The merge is committed
+
+`e902ed3`, parents `9f0b943` + `8a2dfc4`. **49 ahead / 0 behind `origin/harry`;
+nothing pushed.** Gate green at that commit: 1328 tests, `-race` clean,
+build/vet/gofmt clean, 0 conflict markers.
+
+### 7b. `docker-compose.yml` was invalid YAML (deploy path was dead)
+
+Found by the new Compose check, not by any Go tool. A sequence item had landed inside
+the `healthcheck:` mapping, so `docker compose config` failed outright — meaning the
+entire deploy path was broken on a tree whose Go gate was green. Fixed; both the YAML
+parse and `docker compose config` now pass.
+
+### 7c. The three scripts, and how each was proven
+
+| Script | What proves it works |
+|---|---|
+| `scripts/verify.sh` | all 10 checks mutation-proven RED (table below) |
+| `scripts/dev.sh` | ran `--smoke` and `--seed --smoke`; real `data/config.json` SHA-256 **identical** before/after; of 98 non-empty secret values in the real config, **0** appear in the seeded copy; **0** seeded accounts enabled; account count preserved 41 → 41 |
+| `scripts/deploy.sh` | preflight run green end-to-end; extracted the binary from the image by tag, positive control present, version value `1.2.8` found |
+
+Mutation proof for the gate — defect introduced, check confirmed RED, file restored
+and verified byte-identical by SHA-256:
+
+| Check | Mutation | Result |
+|---|---|---|
+| build | undefined symbol | RED |
+| vet | `fmt.Printf("%s", 42)` | RED |
+| gofmt | valid but misformatted Go | RED |
+| test | `t.Fatal` probe | RED |
+| js-parse | duplicate `const` in `web/toast.js` | RED |
+| locale-json | malformed `vi.json` | RED |
+| locale-symmetry | removed one key from `zh.json` | RED |
+| compose yaml | sequence item inside `healthcheck:` (the real merge bug, reproduced) | RED |
+| compose config | `ports:` as a scalar | RED |
+| whitespace | trailing whitespace in a tracked file | RED |
+
+### 7d. A defect in my own probe, caught by its positive control
+
+`scripts/deploy.sh` first reported `positive control MISSING
+(listKiroProfilesInRegion)`. The symbol was in fact present — 3 string occurrences,
+1 in `go tool nm`. The bug was the probe:
+
+```
+strings BIN | grep -q PAT     # under `set -o pipefail`: exits 141, not 0
+```
+
+`grep -q` stops at the first match, closing the pipe, which kills `strings` with
+SIGPIPE; `pipefail` then fails the pipeline. Measured: `with pipefail rc=141`,
+`without pipefail rc=0`, `grep -c rc=0 count=3`. Fixed by materializing `strings`
+output to a file once and grepping the file.
+
+Without the positive control this would have read as "the image is missing my code"
+and sent the next session debugging the merge. **This is the argument for positive
+controls, recorded because it actually happened rather than as advice.**
+
+### 7e. Docs instructed operators to do impossible things
+
+Found by auditing every documented env var against `os.Getenv` in source, then
+checking the SSO port mechanism the docs describe.
+
+**`LOOPBACK_HOST` is dead.** Theirs read it (`HEAD^2:auth/kiro_sso.go:153,302`); the
+merge kept ours' `KIRO_SSO_CALLBACK_BIND` (`auth/kiro_sso.go:299`) and dropped
+theirs' reader. `git grep LOOPBACK_HOST -- '*.go'` matches nothing. Yet
+`DEPLOYMENT.md` called it **BẮT BUỘC** (mandatory) in Docker, and its Lỗi #1
+troubleshooting entry told operators to `printenv LOOPBACK_HOST`. An operator
+following that doc would set a variable with no effect, get a loopback-only callback,
+fail Enterprise SSO login, and be sent to debug the wrong knob.
+
+**The documented SSO port scan does not exist.** `DEPLOYMENT.md` §4 described binding
+"the first free port" from a 10-port list via `kiroLoopbackPorts` / `bindKiroLoopback`.
+Measured: `kiroLoopbackPorts` → **0 hits**; `bindKiroLoopback` → only a stale comment
+in `auth/reuseaddr_windows.go:21`. Reality is a fixed constant
+`kiroRedirectPort = "3128"` (`auth/kiro_sso.go:62`) and `startListener` binding
+`addrs[0]` with no fallback. Compose publishes exactly two ports
+(`${KIRO_PORT:-8080}:8080`, `127.0.0.1:3128:3128`), not the six the doc showed.
+The error string the doc quoted ("tất cả port loopback đều bận") does not exist in Go
+code; the real one is `cannot bind %s for the SSO callback`
+(`auth/kiro_sso.go:314`).
+
+**Two README headings had been glued onto the wrong bodies** by the merge:
+`## Thinking Mode` sat above auth prose + the endpoints table, and
+`## Environment Variables` sat above the thinking-mode/outbound-proxy sections —
+leaving a duplicate `## Environment variables` further down. Renamed to match their
+actual content; heading set is now unique (verified: 14 `##` headings, 0 duplicates).
+
+**The env table was wrong in both directions.** Fixed after measuring each reader and
+default in source: dropped the dead `LOOPBACK_HOST` row, removed a duplicate
+`ADMIN_PASSWORD` row, and added 7 variables the code reads but the table omitted —
+`KIRO_SSO_CALLBACK_BIND`, `KIRO_IDE_PROFILE`, `BEDROCK_MODEL_MAP`,
+`CUSTOM_API_CREDITS_PER_1K_TOKENS`, `TRACE_CAPTURE_MODE`, `TRACE_CAPTURE_ACK_RISK`,
+`KIRO_TRUSTED_PROXY_HOPS`.
+
+Fixed in `README.md`, `DEPLOYMENT.md`, `README_VI.md`, `README_CN.md`. Gate green
+after. `.kiro/specs/kiro-sso-external-idp-hardening/*` still describes the 10-port
+design — deliberately left alone: those are historical design records of the incoming
+feature's intent, not operator instructions.
+
+### 7f. A correction to my own count, recorded rather than quietly fixed
+
+I first reported **7 phantom env vars** (documented but never read). That was wrong,
+and a control probe caught it: 5 of the 7 *are* read, through `envInt` / `envInt64` /
+`envBool` helpers in `proxy/dos_guard.go:101-105`. My regex only matched
+`os.Getenv("LITERAL")` and was blind to helper-wrapped reads. Only 2 were truly
+unreferenced in Go, and one of those (`KIRO_AWS_SSO_CACHE_DIR`) is a legitimate
+Compose-level variable (`docker-compose.yml:50`). The real count of dead documented
+variables is **1**: `LOOPBACK_HOST`.
+
+Lesson worth keeping: a grep for one call shape is not an audit of a behaviour. Add a
+positive control (names known to be read) before trusting an absence.
+
+### 7g. Known-and-not-fixed
+
+- **9 duplicated element ids in `web/index.html`** — `apiKeyForm_rpmLimit`,
+  `apiKeyForm_tpmLimit`, `logsAutoRefresh`, `logsClearBtn`, `logsExportCsvBtn`,
+  `logsExportJsonBtn`, `logsFilterSelect`, `metricsSummary`, `saveProxyBtn`.
+  `getElementById` resolves to whichever appears first, so the later control is
+  unreachable. Parses clean; no check in the gate can see it. Re-measure:
+  `grep -oE 'id="[^"]+"' web/index.html | sort | uniq -d`.
+- **`vi.json` covers 705/1152 keys.** Not gated (it would have been red from day
+  one); reported as coverage. The 447-key gap is this fork's own features.
+- **Nothing merged is deployed.** Container `kiro-go-kiro-go-1` is `Exited (0)`; the
+  running image predates the merge. Rollback tags preserved and verified reachable:
+  `rollback-8197e45d`, `rollback-2958ed77` (9 days), `rollback-71f4e867` (11 days).
+  Never `docker image prune` here without reading that list.
+- **`out/` holds 5 untracked scratch files** from this session (`auth_gate.txt`,
+  `auth_state.txt`, `lc_check.txt`, `lc_fix.txt`, `stage_auth.txt`) and is **not**
+  gitignored, so `git add -A` would sweep them in. Left in place rather than deleted
+  (shared repo, and they are not mine to remove); stage explicit paths instead.

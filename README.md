@@ -140,7 +140,8 @@ API Key accounts call the Kiro CLI runtime (`https://runtime.{region}.kiro.dev/`
 
 See [docs/operator-runbook.md](docs/operator-runbook.md) for production health checks, config backup/restore, credential recovery, account/model diagnostics, request replay dry-runs, logs, metrics, and deployment verification steps. For external IdP import preview, conflict decisions, diagnostics, and audit behavior, see [docs/external-idp-import.md](docs/external-idp-import.md). For upstream Kiro-issued API keys, automatic/manual profile and region selection, hosted-SSO profile choice, model detection/routing, admin endpoints, migrations, and secret-bearing exports, see [docs/kiro-api-key-and-profiles.md](docs/kiro-api-key-and-profiles.md). For per-request tracing — failover attempt detail, capture modes, what is scrubbed, retention, the query API, and a 60-second debugging walkthrough — see [docs/request-tracing.md](docs/request-tracing.md).
 
-## Thinking Mode
+## API access & endpoints
+
 When any API key is enabled, requests must carry a valid key (`Authorization: Bearer sk-...`).
 
 ### Endpoints
@@ -210,7 +211,8 @@ credential file (`auth_method: external_idp`). There are three ways to load that
 > password (ROPC) grant is not a reliable auth path. Use the interactive helper to mint
 > the credential, then import the JSON.
 
-## Environment Variables
+## Thinking mode & outbound proxy
+
 ### Thinking mode
 
 Append a suffix (default `-thinking`) to the model name, e.g. `claude-sonnet-4.5-thinking`. Claude requests with a top-level `thinking` config (`{"type":"enabled","budget_tokens":2048}` or `{"type":"adaptive"}`) also enable it. Output format is configurable in Settings → Thinking Mode.
@@ -232,24 +234,36 @@ Configure in Settings → Outbound Proxy. Supports SOCKS5 and HTTP. This fork ad
 | `KIRO_IDE_CACHE` | Path to the Kiro IDE credential cache for `import-ide-cache` | `~/.aws/sso/cache/kiro-auth-token.json` (Docker: `/host-aws-sso-cache/kiro-auth-token.json`) |
 | `KIRO_AWS_SSO_CACHE_DIR` | Host AWS SSO cache directory mounted by Docker Compose for IDE-cache import | `$HOME/.aws/sso/cache` |
 | `KIRO_PROFILE_REGIONS` | Comma-separated fallback regions for profile discovery and Kiro API-key probing | `us-east-1,eu-central-1` |
-| `ADMIN_PASSWORD` | Admin panel password (overrides config at startup) | - |
 | `LOG_LEVEL` | `debug` / `info` / `warn` / `error` | `info` |
-| `LOOPBACK_HOST` | Host to bind the SSO loopback server. **Set to `0.0.0.0` in Docker.** | `127.0.0.1` |
+| `KIRO_SSO_CALLBACK_BIND` | Bind host for the Enterprise-SSO callback listener. **Set to `0.0.0.0` in Docker**, otherwise the published port cannot reach the loopback-only listener. | `127.0.0.1` + `[::1]` |
+| `KIRO_IDE_PROFILE` | Path to a JSON file holding a `profileArn` for IDE-cache import | `~/.aws/sso/cache/kiro-auth-token.json` sibling lookup |
+| `BEDROCK_MODEL_MAP` | JSON object of model alias → Bedrock model id. Checked after the per-account map, before auto-discovery. | built-in alias map |
+| `CUSTOM_API_CREDITS_PER_1K_TOKENS` | Credit price per 1000 tokens billed for `custom_api` (pool-linked) traffic; used as the fallback when no upstream rate is cached | `1.0` |
+| `TRACE_CAPTURE_MODE` | Overrides the stored trace capture mode (`off` / `meta` / `redacted` / `full`) | config value, else `meta` |
+| `TRACE_CAPTURE_ACK_RISK` | Acknowledge the risk required to enable body-capturing modes | `false` |
 | `KIRO_MAX_BODY_BYTES` | Max request body size (`0` = disable) | `10485760` (10 MiB) |
 | `KIRO_MAX_CONCURRENT` | Global concurrent-request cap | `256` |
 | `KIRO_IP_RPM` | Requests/minute/IP before reject | `120` |
 | `KIRO_PER_KEY_INFLIGHT` | Concurrent RPM-delayed requests per key before 429 | `8` |
 | `KIRO_TRUST_PROXY` | Read the real client IP from `X-Forwarded-For` / `X-Real-IP`. Only enable behind a trusted reverse proxy. | `false` |
+| `KIRO_TRUSTED_PROXY_HOPS` | How many trailing `X-Forwarded-For` hops to trust when `KIRO_TRUST_PROXY` is on | `1` |
+
+> `LOOPBACK_HOST` is **not** read by this tree. The upstream v1.2.8 side used it to
+> bind the SSO callback, but its Go reader did not survive the merge — only
+> `KIRO_SSO_CALLBACK_BIND` is read (`auth/kiro_sso.go:299`). Setting `LOOPBACK_HOST`
+> looks like configuration and changes nothing. `KIRO_AWS_SSO_CACHE_DIR` is a
+> Compose-level variable used by `docker-compose.yml` for the host mount path; the
+> Go process never reads it.
 
 ## Troubleshooting
 
 **`Refusing to start: admin password is still the default on a non-loopback host`.** This is a deliberate safety guard: the app won't boot when the admin password is still `changeme` **and** the host is not loopback (e.g. `0.0.0.0`). Two fixes: for local use, set `"host": "127.0.0.1"` in `data/config.json` (you can keep `changeme`); for a public/Docker deploy, set a strong `ADMIN_PASSWORD` env var instead. Never expose `0.0.0.0` with the default password.
 
-**"All loopback ports busy" / Start Login returns HTTP 500.** Usually a bad `LOOPBACK_HOST` (e.g. `0.0.0` missing an octet). In Docker, it must be exactly `0.0.0.0`. Check with `docker compose exec kiro-go printenv LOOPBACK_HOST`, fix the compose file, then `docker compose up -d --force-recreate` (env is baked at container creation). Starting a new login also cancels pending sessions to free leaked loopback ports.
+**Start Login returns HTTP 500 / `cannot bind ... for the SSO callback`.** The callback port is the fixed constant `3128` (`auth/kiro_sso.go:62`) with no fallback scan, so either something already holds `3128` (`ss -ltnp | grep :3128`) or `KIRO_SSO_CALLBACK_BIND` is set to an address that cannot bind (e.g. `0.0.0` missing an octet). In Docker it must be exactly `0.0.0.0`. Check with `docker compose exec kiro-go printenv KIRO_SSO_CALLBACK_BIND`, fix the compose file, then `docker compose up -d --force-recreate` (env is baked at container creation). Starting a new login also cancels pending sessions to free a leaked listener. Do **not** check `LOOPBACK_HOST` — this tree never reads it.
 
 **App runs an old version after a code change.** `docker compose up` won't rebuild a cached image. Run `docker compose up -d --build`.
 
-**Compose fails on port `49153`/`5015x` ("address already in use") on macOS.** Those ports are in the OS ephemeral range. They're unnecessary — only the low SSO ports (3128–9091) are needed. Remove the `49153`–`53153` mappings.
+**Compose fails on port `49153`/`5015x` ("address already in use") on macOS.** Those ports are in the OS ephemeral range, and this tree never uses them: the SSO callback binds the fixed port `3128` only. If your `docker-compose.yml` still maps `49153`–`53153` (or `4649`/`6588`/`8008`/`9091`), delete those lines — the shipped compose file publishes just `${KIRO_PORT:-8080}:8080` and `127.0.0.1:3128:3128`.
 
 **Getting 503 on a specific model.** The client is likely requesting a model that doesn't exist upstream. Use Force Model or per-key Model to remap it to a real one.
 
@@ -261,12 +275,33 @@ For production DoS/DDoS hardening (Cloudflare + Nginx + fail2ban), see [deploy/H
 
 ## Development
 
+Three scripts cover the everyday loop. Each takes `--help`, and none of them writes `data/config.json`:
+
+```bash
+./scripts/dev.sh --smoke       # run locally against a THROWAWAY config, probe endpoints
+./scripts/verify.sh            # the full local gate (10 checks); --race adds the detector
+./scripts/deploy.sh            # build + verify the image (preflight only; --deploy swaps)
+```
+
+Or the raw Go commands:
+
 ```bash
 go build -o kiro-go .          # build
 go test ./...                  # run all tests
 go test ./proxy/               # test one package
 go vet ./...                   # vet
 ```
+
+**Run `scripts/verify.sh`, not just `go test`.** The v1.2.8 merge left `web/app.js`
+unparseable and `docker-compose.yml` invalid while build, vet and test all passed —
+neither is Go code, and `.github/workflows/ci.yml` is Go-only, so CI would have gone
+green too. The gate adds JS parsing, locale JSON + key symmetry, and Compose validity.
+
+Task-oriented walkthroughs live in [docs/tutorials/](docs/tutorials/README.md):
+
+- [01 — Local development](docs/tutorials/01-local-development.md): build and run without touching the 41 real accounts in `data/`
+- [02 — The verification gate](docs/tutorials/02-verification-gate.md): what must be green before you commit, and how each check was mutation-proven
+- [03 — Deploy and rollback](docs/tutorials/03-deploy-and-rollback.md): ship it, prove the image contains your change, undo it
 
 ## Disclaimer
 

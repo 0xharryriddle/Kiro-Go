@@ -216,7 +216,7 @@ Claude 请求里带顶层 `thinking` 配置（如 `{"type":"enabled","budget_tok
 | `KIRO_AWS_SSO_CACHE_DIR` | Docker 挂载的宿主机 AWS SSO 缓存目录 | `$HOME/.aws/sso/cache` |
 | `KIRO_PROFILE_REGIONS` | 配置文件发现及 Kiro API 密钥探测的逗号分隔后备区域 | `us-east-1,eu-central-1` |
 | `ADMIN_PASSWORD` | 管理密码（覆盖配置文件） | - |
-| `LOOPBACK_HOST` | SSO loopback 绑定地址，**Docker 内必须设为 `0.0.0.0`** | `127.0.0.1` |
+| `KIRO_SSO_CALLBACK_BIND` | SSO 回调监听绑定地址，**Docker 内必须设为 `0.0.0.0`** | `127.0.0.1` + `[::1]` |
 | `LOG_LEVEL` | 日志级别 `debug`/`info`/`warn`/`error` | `info` |
 | `KIRO_MAX_BODY_BYTES` | 单请求最大 body | `10485760`（10 MiB） |
 | `KIRO_MAX_CONCURRENT` | 全服务器并发请求上限 | `256` |
@@ -253,12 +253,16 @@ go vet ./...             # 静态检查
 
 ### 登录 SSO 报错
 
-- **Start Login 返回 500 / "所有 loopback 端口都被占用"**：Docker 里 `LOOPBACK_HOST`
-  设错了（比如少写一段成了 `0.0.0`）。用
-  `docker compose exec kiro-go printenv LOOPBACK_HOST` 确认是 `0.0.0.0`，
-  改完要 `docker compose up -d --force-recreate`（env 是构建时烤进容器的）。
+- **Start Login 返回 500 / `cannot bind ... for the SSO callback`**：回调固定绑定端口
+  `3128`（`auth/kiro_sso.go:62`），没有换端口的后备逻辑。要么 `3128` 已被占用
+  （`ss -ltnp | grep :3128`），要么 `KIRO_SSO_CALLBACK_BIND` 设错了（比如少写一段成了
+  `0.0.0`）。用 `docker compose exec kiro-go printenv KIRO_SSO_CALLBACK_BIND` 确认是
+  `0.0.0.0`，改完要 `docker compose up -d --force-recreate`（env 是创建容器时烤进去的）。
+  **不要**去查 `LOOPBACK_HOST` —— 本仓库不读这个变量。
 - **端口冲突 `49153: address already in use`**（macOS）：那几个高位端口在 ephemeral
-  范围内，已从 compose 移除，只需映射 5 个低位端口（3128–9091）。
+  范围内，而且本仓库**根本不用**它们。compose 只发布
+  `${KIRO_PORT:-8080}:8080` 和 `127.0.0.1:3128:3128`；如果你的文件里还有
+  `49153`–`53153` 或 `4649/6588/8008/9091`，删掉。
 
 ### 请求报错
 

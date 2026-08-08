@@ -7,16 +7,36 @@ Where something is unverified or unknown, it says so — do not upgrade those to
 facts without checking.
 
 > **STATE CHANGED SINCE THAT HANDOFF — read this first (round 18).**
-> The tree is **mid-merge again**, against a *different* fork this time:
-> `MERGE_HEAD` = `8a2dfc4` from remote `hian699`
-> (`https://github.com/hian699/Kiro-Go`), 48 incoming commits over merge base
-> `a2e3971`, version now `1.2.8`. HEAD is `9f0b943`.
-> All conflicts are resolved in the working tree, 0 conflict markers, 0 unmerged
-> paths, and the gate is green from a cold cache (**1328 tests**), but the merge is
-> **NOT COMMITTED** — `MERGE_HEAD` is still set.
-> Two statements below are now stale and are corrected in place: the container is
-> **not running** (§2), and failure-frame handling is **no longer observation-only**
-> (§6b). Section 6b is the one to read before touching `proxy/kiro.go`.
+>
+> **The `hian699` v1.2.8 merge is now COMMITTED.** `MERGE_HEAD` is gone.
+> - HEAD = `e902ed3` "merge: resolve hian699 v1.2.8 into harry (48 commits)",
+>   parents `9f0b943` (ours) + `8a2dfc4` (theirs, from
+>   `https://github.com/hian699/Kiro-Go`), merge base `a2e3971`, version now `1.2.8`.
+> - **49 ahead / 0 behind `origin/harry`** — the merge and everything after it is
+>   local only. `origin/harry` is still at `9f0b943`. Nothing has been pushed;
+>   pushing needs the user's authorization.
+> - Gate green: 1328 tests, `-race` clean, build/vet/gofmt clean, 0 conflict markers.
+>
+> **Three scripts now exist and are the entry point for routine work** (each
+> mutation- or run-proven, none writes `data/config.json`):
+> `scripts/verify.sh` (10-check gate), `scripts/dev.sh` (throwaway-config local run),
+> `scripts/deploy.sh` (build + verify image + rollback tag). Walkthroughs in
+> `docs/tutorials/`. Read `docs/tutorials/02-verification-gate.md` before trusting
+> `go test` alone — see the next paragraph for why.
+>
+> **`go test` is not the gate, and CI does not close the hole.** The merge left
+> `web/app.js` unparseable (7 splices → whole admin bundle dead) and
+> `docker-compose.yml` invalid YAML (deploy path dead) while `go build`, `go vet`
+> and `go test` were all green. `.github/workflows/ci.yml` runs Go steps only, so CI
+> would have passed that tree too. Both are fixed; `scripts/verify.sh` now gates JS
+> parse, locale JSON, en/zh key symmetry, and Compose validity.
+>
+> **The container is NOT running** (§2 below is stale on this point):
+> `kiro-go-kiro-go-1` is `Exited (0)`, and the last-built image predates the merge.
+> Nothing merged has been deployed. `scripts/deploy.sh` (no flags) is preflight only.
+>
+> Also stale below: failure-frame handling is **no longer observation-only** (§6b) —
+> read 6b before touching `proxy/kiro.go`.
 
 ---
 

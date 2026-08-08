@@ -170,7 +170,7 @@ Thứ tự ưu tiên: Force Model toàn cục > Model theo Key > model client g�
 |------|-------|----------|
 | `CONFIG_PATH` | Đường dẫn file config | `data/config.json` |
 | `ADMIN_PASSWORD` | Mật khẩu admin (ghi đè config) | - |
-| `LOOPBACK_HOST` | Địa chỉ bind loopback SSO, **trong Docker phải đặt `0.0.0.0`** | `127.0.0.1` |
+| `KIRO_SSO_CALLBACK_BIND` | Địa chỉ bind listener callback SSO, **trong Docker phải đặt `0.0.0.0`** | `127.0.0.1` + `[::1]` |
 | `LOG_LEVEL` | Mức log `debug`/`info`/`warn`/`error` | `info` |
 | `KIRO_MAX_BODY_BYTES` | Body request tối đa | `10485760` (10 MiB) |
 | `KIRO_MAX_CONCURRENT` | Tổng số request đồng thời toàn server | `256` |
@@ -208,12 +208,17 @@ go vet ./...             # kiểm tra tĩnh
 
 ### Lỗi đăng nhập SSO
 
-- **Start Login trả 500 / "tất cả port loopback đều bận"**: `LOOPBACK_HOST` trong Docker
-  bị đặt sai (vd thiếu octet thành `0.0.0`). Kiểm tra bằng
-  `docker compose exec kiro-go printenv LOOPBACK_HOST` phải ra `0.0.0.0`, sửa xong phải
-  `docker compose up -d --force-recreate` (env được bake vào container lúc tạo).
+- **Start Login trả 500 / `cannot bind ... for the SSO callback`**: callback bind cố định
+  port `3128` (`auth/kiro_sso.go:62`), không có fallback sang port khác. Hoặc `3128` đã bị
+  chiếm (`ss -ltnp | grep :3128`), hoặc `KIRO_SSO_CALLBACK_BIND` bị đặt sai (vd thiếu octet
+  thành `0.0.0`). Kiểm tra bằng
+  `docker compose exec kiro-go printenv KIRO_SSO_CALLBACK_BIND` phải ra `0.0.0.0`, sửa xong
+  phải `docker compose up -d --force-recreate` (env được bake vào container lúc tạo).
+  **Đừng** kiểm tra `LOOPBACK_HOST` — tree này không đọc biến đó.
 - **Xung đột port `49153: address already in use`** (macOS): các port cao đó nằm trong dải
-  ephemeral, đã loại khỏi compose, chỉ cần map 5 port thấp (3128–9091).
+  ephemeral và tree này **không dùng** chúng. Compose chỉ publish
+  `${KIRO_PORT:-8080}:8080` và `127.0.0.1:3128:3128`; nếu file của bạn còn
+  `49153`–`53153` hay `4649/6588/8008/9091` thì xoá đi.
 
 ### Lỗi khi gọi request
 

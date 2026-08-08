@@ -1,6 +1,30 @@
 services:
   kiro-go:
     build: .
+    # MERGE POLICY NOTE (fork ↔ hian699 v1.2.8): the merge appended the incoming
+    # side's whole ports list after ours instead of reconciling the two, and dropped
+    # its `- LOOPBACK_HOST=0.0.0.0` env entry INSIDE the healthcheck mapping below.
+    # That last one made this file invalid YAML — `docker compose config` failed with
+    # "did not find expected key", so the entire deploy path was broken while
+    # `go build`/`go test` stayed green. Both parent revisions parse cleanly, so the
+    # breakage was introduced by the merge, not inherited.
+    #
+    # The incoming port entries are dropped rather than kept, each for a measured
+    # reason:
+    #
+    #   - `8080:8080` duplicated the `${KIRO_PORT:-8080}:8080` line below, which
+    #     silently defeats the override: `KIRO_PORT=9090 docker compose up -d` would
+    #     publish 9090 AND still bind 8080, so a second stack could not start.
+    #   - a bare `3128:3128` re-publishes the Enterprise-SSO callback on EVERY host
+    #     interface, undoing the deliberate `127.0.0.1:` pin below. That pin is the
+    #     control keeping a transient, anti-CSRF-state-matched callback off the host's
+    #     external interfaces, so this was a security regression, not a duplicate.
+    #   - `4649`, `6588`, `8008`, `9091` publish nothing in this tree. They come from
+    #     the ten fixed Kiro loopback ports described in
+    #     .kiro/specs/kiro-sso-external-idp-hardening/, which is a DESIGN doc: no
+    #     `kiroLoopbackPorts` symbol exists in any .go file and
+    #     auth/kiro_sso.go:62 still pins `kiroRedirectPort = "3128"`. If a later round
+    #     implements the multi-port fallback, re-add them together with that code.
     ports:
       # Host port is overridable: `KIRO_PORT=9090 docker compose up -d` publishes
       # 9090 on the host. The container always listens on 8080 internally.
@@ -11,12 +35,6 @@ services:
       # the callback off the host's external interfaces while still letting the
       # host browser's localhost:3128 reach the container listener below.
       - "127.0.0.1:3128:3128"
-      - "8080:8080"
-      - "3128:3128"
-      - "4649:4649"
-      - "6588:6588"
-      - "8008:8008"
-      - "9091:9091"
     volumes:
       - ./data:/app/data
       # Zero-touch credential drop folder. Any CLIProxyAPI_*.json minted by
@@ -51,6 +69,13 @@ services:
       # host. Note 0.0.0.0 does expose 3128 to peer containers on the same Docker
       # network during that window; on a shared/untrusted Docker network, pin
       # KIRO_SSO_CALLBACK_BIND to a specific interface or isolate the network.
+      #
+      # This is the ONLY callback-bind knob this tree reads. The incoming side used
+      # LOOPBACK_HOST for the same job, but its Go reader did not survive the merge:
+      # `grep -rn LOOPBACK_HOST --include='*.go'` matches nothing here, while
+      # auth/kiro_sso.go:299 reads KIRO_SSO_CALLBACK_BIND. Setting LOOPBACK_HOST
+      # would therefore look like configuration and change nothing, so it is dropped
+      # rather than relocated into this block.
       - KIRO_SSO_CALLBACK_BIND=0.0.0.0
     dns:
       # Avoid transient Docker embedded-DNS failures during Microsoft token refresh.
@@ -62,5 +87,4 @@ services:
       timeout: 5s
       retries: 3
       start_period: 10s
-      - LOOPBACK_HOST=0.0.0.0
     restart: unless-stopped
