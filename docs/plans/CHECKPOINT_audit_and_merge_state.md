@@ -2552,3 +2552,122 @@ N-8's heading claimed **8,198** lines and the handoff said **8.2k**. Measured at
 drift called out rather than silently overwritten, because the same staleness pattern has
 now produced wrong plans three times this programme (the SIX-vs-EIGHT retry loops in §13d,
 the `NextResetDate` sizing in §9, and this).
+
+## 15. Round 18j — F1 step 2: the route-equivalence harness (no routing change)
+
+Commit `4abd3a8`. PROPOSAL F1 / N-8. **Two test files, zero production lines.**
+
+F1's remaining half swaps the 91-arm `switch { case ... }` at `handler.go:682` for a route
+table. §14a argued that half is a different risk class; this round builds the instrument
+that makes it checkable, and deliberately stops before touching the switch.
+
+### 15a. Why a table conversion is dangerous here at all
+
+The switch is **first-match**, and several arms are correct *only* because of their
+position:
+
+- the nine `/admin/*` admin-key routes sit before `strings.HasPrefix(path, "/admin/")`.
+  Lose that and they resolve to `serveStaticFile` — every bot integration (Telegram key
+  provisioning, recharge, pool stats) starts 404ing while the server looks healthy.
+- `/admin/api/login` and `/admin/api/logout` sit before
+  `strings.HasPrefix(path, "/admin/api/")`. Lose that and the password gate shadows the
+  route that *mints the session needed to pass that gate* — the panel is unloggable-into,
+  and a status-only test still sees a 4xx and shrugs.
+
+A table keyed by exact path plus a prefix list does not preserve "first arm wins" for free.
+The failure mode is silent: the process starts, serves, and answers from the wrong handler.
+
+### 15b. Three layers, because each catches what the others cannot
+
+1. **`routeGolden`** — 64 `(method, path)` probes, each pinned to a fingerprint of
+   `status | content-type | normalized-body-prefix` (digit runs → `N`, so uptimes do not
+   float). Broad net over every arm plus near-misses (`/adminx`) and wrong-verb
+   fallthroughs. Regenerable via `KIROGO_ROUTE_CAPTURE=1`.
+2. **`TestRoutePrecedenceHazardsStayDistinct`** — the same hazards asserted
+   *relationally*, naming the wrong-handler status explicitly ("a 404 here means the
+   static-file arm won"). This exists because layer 1 is regenerable, and a regeneration
+   done to make a red test green would silently re-bless a broken precedence. This layer
+   cannot be fixed by pasting new goldens.
+3. **`TestRouteAliasesStayUnified`** — the complement: paths documented as aliases must
+   keep dispatching *identically*. A status-only check misses an alias split because both
+   halves answer 4xx unauthenticated, so these compare full fingerprints.
+
+Plus `TestAdminPreflightWithholdsWildcardCORS`, which pins the one dispatch property that
+lives in a header: the public surface is cross-origin callable, `/admin` deliberately is not.
+
+### 15c. The harness was nearly worthless, and the audit is what showed it
+
+First capture: seven arms — `/admin`, `/admin/`, `/admin/app.js`, `/check`, `/check/`,
+`GET /usage`, `GET /usage/` — produced **one identical fingerprint**, `404 page not found`.
+The file-serving arms resolve relative paths (`web/index.html`, `web/portal.html`,
+`web/usage.html`, `"web/"+path`) against the process cwd, which during `go test` is the
+package dir, where no `web/` exists. So a conversion pointing `/check` at `serveAdminPage`
+would have passed cleanly.
+
+Fixed with `sentinelWebRoot`: chdir into a throwaway root holding `web/` files with
+per-file unique bodies (`SENTINEL-ADMIN-INDEX`, `SENTINEL-CHECK-PORTAL`, …). Seven
+ambiguous arms → four distinguishable groups. Sentinels rather than the repo's real assets
+on purpose: chdir'ing to the repo root would couple routing goldens to frontend HTML, so an
+unrelated `index.html` edit would fail a *routing* test.
+
+`os.Chdir` + `t.Cleanup`, not `t.Chdir`: the latter landed in Go 1.24 and `go.mod` declares
+`go 1.21`, so vet's stdversion analyzer rejects it. Safe here because no test in the
+package calls `t.Parallel()` — checked, not assumed.
+
+### 15d. What this harness does NOT prove (stated because the alternative is a false sense of cover)
+
+An ambiguity audit over the 64 captured fingerprints: **19 distinct values**. The nine
+admin-key routes are mutually indistinguishable (all `401 {"error":"Unauthorized"}`); so
+are the nine Claude/OpenAI surface routes (all the same fail-closed 401) and the
+customer-API routes (all `401 Missing API key`).
+
+So the harness proves **precedence and alias structure**, not **handler identity**. It
+cannot catch a swap between two arms that answer identically — e.g. `/admin/delete_api_key`
+wired to `handleAdminRechargeApiKey`. Closing that needs handler-identity instrumentation
+(record which function ran); it is the natural next step *if* the conversion needs it.
+PROPOSAL F1's wording was corrected in the same pass, because it had promised the harness
+would "prove identical dispatch for every path" — an overstatement.
+
+### 15e. RED-proof: 7/7 mutants killed
+
+Each mutant breaks routing the way a table conversion plausibly would. Run via
+`/tmp/kgr_mut.py`, which mutates `proxy/handler.go`, runs the four tests, restores, and
+verifies the restore by sha256.
+
+| # | mutation | killed by |
+|---|---|---|
+| M1 | admin-key routes fall behind `HasPrefix("/admin/")` | golden + precedence |
+| M2 | login/logout fall behind `HasPrefix("/admin/api/")` | golden + precedence |
+| M3 | `/api/stats` loses its `GET\|POST` qualifier | golden + precedence |
+| M4 | `/models` alias dropped | golden + aliases |
+| M5 | admin surface gains wildcard CORS | CORS test |
+| M6 | `/check/` trailing-slash alias dropped | golden + aliases |
+| M7 | `/check` serves the **admin page** | **golden only** |
+
+**M7 is the one that earns §15c.** It matches the correct handler on *both* status (200)
+and content-type (`text/html`) — only the sentinel body prefix separates them. The
+relational layers did not see it. The pre-sentinel version of this harness would have
+passed it, which is precisely the "the check itself was broken" class from §14d and the
+false-green class from §12f.
+
+Baseline green before the battery (otherwise every "kill" is meaningless), `handler.go`
+restored **byte-exact** (sha256 `65af1834…` before and after), suite green post-restore.
+
+### 15f. Verification
+
+- `go build` / `go vet` / `gofmt -l` clean.
+- Full suite **1390 passed** (1386 + 4 new), full-repo `-race` **1390 passed in 6 packages**.
+- `scripts/verify.sh` **12/12 green**.
+- Commit contents verified by `git show --name-only`: exactly 2 files, 624 insertions. The
+  shell wrapper's `git diff --cached --name-only | wc -l` reported **5** for the same
+  staged set — it counted its own echoed output lines. `git show --name-only` on the
+  landed commit is the authoritative count; a pipe through the wrapper is not.
+
+### 15g. Characterization, not endorsement
+
+This is a characterization test: it pins what the code does **today**, not what it ought
+to. Two goldens are arguably wrong on their merits and are pinned anyway — notably
+`GET /admin/new_api_key` (wrong verb on a method-qualified admin route) falls through to
+the static-file arm and 404s, where a 405 would be more honest. Fixing that is a behaviour
+change and belongs in its own round; mixing it into the mechanical conversion is exactly
+how a refactor becomes unreviewable.

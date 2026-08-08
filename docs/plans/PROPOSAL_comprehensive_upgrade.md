@@ -758,8 +758,26 @@ Bedrock code.
   **The routing half is a different risk class and was deliberately not bundled.** A
   file split cannot change behaviour; replacing a specificity-ordered switch with a
   table changes route *precedence*, so it needs an equivalence harness that walks the
-  real route set and proves identical dispatch for every path before the switch is
-  touched. See §N-8 for the shadowing hazard that makes this worth doing carefully.
+  real route set and pins dispatch before the switch is touched. See §N-8 for the
+  shadowing hazard that makes this worth doing carefully.
+
+  **Harness DONE (round 18j, `4abd3a8`) — the switch itself is still untouched.**
+  `proxy/route_equivalence_test.go` + `proxy/route_equivalence_golden_test.go`, 3
+  layers, 64 probes, **7/7 mutants killed**, suite 1386 → 1390. No production code in
+  that commit. Details in CHECKPOINT §15.
+
+  > **Correction to this entry's own wording.** The line above used to promise a harness
+  > that "proves identical dispatch for every path". That is not achievable with
+  > observable HTTP results, and claiming it would have overstated the guarantee. An
+  > ambiguity audit over the captured fingerprints shows **64 probes collapse into 19
+  > distinct fingerprints**: the nine admin-key routes are mutually indistinguishable
+  > (all `401 {"error":"Unauthorized"}`), as are the nine Claude/OpenAI surface routes
+  > and the customer-API routes. The harness therefore proves *precedence and
+  > alias structure*, not handler identity, and it cannot catch a swap **between two
+  > arms that answer identically**. Closing that gap needs handler-identity
+  > instrumentation (record which function ran), which is the natural next step if the
+  > conversion turns out to need it. Stated plainly here because a harness trusted
+  > beyond its actual reach is worse than a known-partial one.
 - **F2. Shared retry coordinator** — roadmap P2; 6+ duplicated retry loops that have
   already diverged in trace handling and error mapping.
 - **F3. Continue the audit rounds** on still-unreviewed large files:

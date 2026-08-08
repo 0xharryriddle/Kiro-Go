@@ -306,7 +306,8 @@ with D2 rather than being bundled in unproven.
 accounting~~ **— DONE in round 18c, see the section below;** then B2 sizing the
 overage backoff from `NextResetDate` (finishes round 16 honestly), F1 splitting the
 `handler.go` (**split DONE round 18i**: was 9,458 lines — not the 8.2k this document
-used to claim — now 1,534 across 14 files; table-driven routing still open), B3
+used to claim — now 1,534 across 14 files; table-driven routing still open, but its
+equivalence harness is DONE in round 18j — read §6e before touching the switch), B3
 latency-aware
 routing (1.42x measured median spread, controlled for prompt size — and now
 unblocked, since it wanted B1's counter).
@@ -847,6 +848,47 @@ every request — an outage. Safe order only: mint a key → update clients → 
   "262 of 600 bodies contain cache markers". All false — the captures contain the
   agent session that was *investigating* caching, so the search matched its own
   shell commands. Require a JSON-key match and exclude your own tooling.
+
+### 6e. F1 table-driven routing — READ THIS BEFORE TOUCHING `ServeHTTP`
+
+The 91-arm switch at `proxy/handler.go:682` is the last open half of F1. The file split
+shipped in round 18i; the **equivalence harness shipped in round 18j** (`4abd3a8`) and the
+switch is still untouched. Do not start the conversion without reading CHECKPOINT §15.
+
+**What exists to protect you** — `proxy/route_equivalence_test.go` +
+`proxy/route_equivalence_golden_test.go`, 4 tests, 64 probes, 7/7 mutants killed:
+
+- `routeGolden` — fingerprint (`status | content-type | normalized body prefix`) per
+  `(method, path)`. Regenerate ONLY for an intentional route change:
+  `KIROGO_ROUTE_CAPTURE=1 go test ./proxy/ -run TestRouteDispatchMatchesGolden -v`.
+- `TestRoutePrecedenceHazardsStayDistinct` — the order-sensitive invariants, asserted
+  relationally so regenerating the goldens cannot silently re-bless a break.
+- `TestRouteAliasesStayUnified` — aliases must keep dispatching identically.
+- `TestAdminPreflightWithholdsWildcardCORS` — `/admin` must never gain wildcard CORS.
+
+**The two precedence traps the conversion will hit.** Both are silent — the server starts
+and serves, just from the wrong handler:
+
+1. the nine `/admin/*` admin-key routes MUST be matched before
+   `strings.HasPrefix(path, "/admin/")`, else they are served as static files (404) and
+   every bot integration dies;
+2. `/admin/api/login` + `/admin/api/logout` MUST be matched before
+   `strings.HasPrefix(path, "/admin/api/")`, else the password gate shadows the route that
+   mints the session needed to pass it, and the panel becomes unloggable-into.
+
+**What the harness does NOT cover — do not over-trust it.** The 64 probes collapse to only
+**19 distinct fingerprints**: the nine admin-key routes are mutually indistinguishable (all
+`401 {"error":"Unauthorized"}`), as are the Claude/OpenAI surface routes and the
+customer-API routes. So it pins **precedence and alias structure, not handler identity**,
+and it cannot catch a swap between two arms that answer identically (e.g.
+`/admin/delete_api_key` wired to `handleAdminRechargeApiKey`). If your conversion reshuffles
+handlers within one of those groups, add handler-identity instrumentation FIRST — record
+which function ran — rather than assuming green means equivalent.
+
+**Do not "tidy" behaviour during the conversion.** The goldens are characterization values,
+including ones that are arguably wrong (`GET /admin/new_api_key` falls through to the
+static-file arm and 404s where 405 would be more honest). Fix those in a separate round or
+the diff becomes unreviewable.
 
 ---
 
