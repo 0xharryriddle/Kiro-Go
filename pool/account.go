@@ -1320,12 +1320,16 @@ func (p *AccountPool) UpdateStats(id string, tokens int, credits float64) {
 		}
 	}
 	if updated {
-		// Both persistence calls run in ONE goroutine, sequentially. They each
-		// end in config.Save(), which rotates config.json.bak before writing; two
-		// concurrent goroutines can interleave that rotate-then-write and leave
-		// the backup set inconsistent. Serializing them keeps the stats write off
-		// the request path (the reason it is detached at all) while making the
-		// pair a single ordered writer.
+		// AddExternalPeriodOurCredit still ends in config.Save() (config.go:
+		// AddExternalPeriodOurCredit), which rotates config.json.bak before
+		// writing; two concurrent goroutines can interleave that rotate-then-write
+		// and leave the backup set inconsistent. Keeping this detached keeps the
+		// disk write off the request path, and running the pair sequentially in ONE
+		// goroutine makes them a single ordered writer.
+		//
+		// UpdateAccountStats itself is now cheap (it only marks the config dirty;
+		// the background stats saver coalesces the write via FlushDirty), so it is
+		// no longer the reason this is detached — the credit accumulation is.
 		periodCredits := credits
 		p.pendingWrites.Add(1)
 		go func() {
@@ -1884,4 +1888,38 @@ func (p *AccountPool) LatencyAggregate() LatencyAggregate {
 		agg.LatencyMsMean = sum / float64(agg.AccountsWithData)
 	}
 	return agg
+}
+
+// GetNextForModelBoundExcluding is like GetNextForModelExcluding but restricts the
+// selection to accounts whose ID is in allowed (the API key's bound-account set).
+// Returns nil when no bound account is currently usable, so the caller can decide
+// whether to fall back to the shared pool. An empty allowed set also returns nil:
+// a bound key with no live bound account is never silently widened to the pool.
+//
+// Rather than re-implementing selection, this narrows the candidate set and then
+// delegates, so bound keys go through exactly the same pipeline as unbound ones
+// (quota-aware routing, circuit breakers, LRU + health tie-break, cooldown
+// fallback, and the detached copy that keeps callers from racing pool writers).
+// A second, independent selection path would silently bypass all of it.
+func (p *AccountPool) GetNextForModelBoundExcluding(model string, allowed, excluded map[string]bool) *config.Account {
+	if len(allowed) == 0 {
+		return nil
+	}
+	// Convert the whitelist into the blacklist the shared selector speaks: keep
+	// the caller's exclusions and add every pooled account not in allowed.
+	merged := make(map[string]bool, len(excluded)+len(allowed))
+	for id := range excluded {
+		merged[id] = true
+	}
+	// Snapshot the pooled IDs under RLock and release it before delegating:
+	// GetNextForModelExcluding takes p.mu itself, so holding it here would
+	// self-deadlock.
+	p.mu.RLock()
+	for i := range p.accounts {
+		if id := p.accounts[i].ID; !allowed[id] {
+			merged[id] = true
+		}
+	}
+	p.mu.RUnlock()
+	return p.GetNextForModelExcluding(model, merged)
 }

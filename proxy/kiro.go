@@ -10,6 +10,7 @@ import (
 	"io"
 	"kiro-go/config"
 	"kiro-go/logger"
+	"net"
 	"net/http"
 	"net/url"
 	"regexp"
@@ -41,6 +42,12 @@ func isPlaceholderReasoning(s string) bool {
 	}
 	return true
 }
+
+// maxEventStreamFrameBytes caps the size of a single AWS Event Stream frame we are
+// willing to allocate. totalLength is read straight off the wire (4 bytes), so without
+// an upper bound a corrupt/hostile frame could make us allocate multiple GiB and OOM the
+// whole process from a single response. 32 MiB is far above any legitimate SSE frame.
+const maxEventStreamFrameBytes = 32 << 20
 
 // Endpoint configuration (auto-fallback on quota exhaustion).
 const directProxyOptOut = "direct"
@@ -165,6 +172,150 @@ func normalizeOutboundProxyURL(raw string) string {
 	return raw
 }
 
+// ResolveAccountProxyURLStrict is like ResolveAccountProxyURL but enforces the
+// global RequireProxy flag: when no proxy is configured for the account and
+// require-proxy is on, it returns an error instead of "" so the caller fails
+// the account (and rotates) rather than connecting directly and leaking the
+// real IP. The error message contains "require-proxy" for failover matching.
+func ResolveAccountProxyURLStrict(account *config.Account) (string, error) {
+	url := ResolveAccountProxyURL(account)
+	if url == "" && config.GetRequireProxy() {
+		return "", fmt.Errorf("require-proxy: no proxy configured for account")
+	}
+	return url, nil
+}
+
+// proxyRRCounter drives round-robin selection over eligible pooled proxies.
+var proxyRRCounter atomic.Uint64
+
+// proxyPoolEligible reports whether a pooled proxy can be picked now: Healthy ||
+// cooldown elapsed since LastFailAt; and never when DisabledPermanent. now is
+// unix seconds.
+func proxyPoolEligible(p config.PooledProxy, now int64) bool {
+	if p.DisabledPermanent {
+		return false
+	}
+	if p.Healthy {
+		return true
+	}
+	return now-p.LastFailAt >= int64(config.ProxyUnhealthyCooldown.Seconds())
+}
+
+// SelectProxyForAccount returns the proxy URL to use and a poolKey identifying
+// the chosen pool entry (empty when not from the pool), so the caller can report
+// health back. Order: account override → pool (round-robin over eligible) →
+// global proxy → require-proxy error / direct. It reads live pool state via
+// config.GetProxyPool() on every call.
+func SelectProxyForAccount(account *config.Account) (proxyURL string, poolKey string, err error) {
+	if account != nil && account.ProxyURL != "" {
+		return account.ProxyURL, "", nil
+	}
+
+	now := time.Now().Unix()
+	var eligible []config.PooledProxy
+	for _, p := range config.GetProxyPool() {
+		if proxyPoolEligible(p, now) {
+			eligible = append(eligible, p)
+		}
+	}
+	if len(eligible) > 0 {
+		idx := proxyRRCounter.Add(1)
+		pick := eligible[(idx-1)%uint64(len(eligible))]
+		return pick.URL, pick.URL, nil
+	}
+
+	if global := config.GetProxyURL(); global != "" {
+		return global, "", nil
+	}
+	if config.GetRequireProxy() {
+		return "", "", fmt.Errorf("require-proxy: no proxy configured for account")
+	}
+	return "", "", nil
+}
+
+// maxProxySwapAttempts caps how many times a single streaming request rotates to
+// another pool proxy after a proxy/dial transport failure before giving up and
+// letting account-level failover take over. maxRestProxySwapAttempts is the
+// smaller cap for the REST/background path.
+const (
+	maxProxySwapAttempts     = 3
+	maxRestProxySwapAttempts = 2
+)
+
+// shouldSwapProxy decides whether a streaming request should rotate to another
+// pool proxy after a transport failure. It is true only for a genuine
+// proxy/dial transport error (isProxyErrorMessage), when the failing proxy came
+// from the pool (poolKey != "" — account overrides and the global proxy are not
+// pool-managed), and while under the swap cap. A nil error (no transport
+// failure) or an HTTP-status error (e.g. "HTTP 401 ...") returns false so a
+// working proxy is never marked unhealthy for an upstream status.
+func shouldSwapProxy(transportErr error, poolKey string, attempts int) bool {
+	if transportErr == nil {
+		return false
+	}
+	return isProxyErrorMessage(transportErr.Error()) && poolKey != "" && attempts < maxProxySwapAttempts
+}
+
+// doRESTWithProxySwap runs a REST request through a pool-aware proxy with
+// bounded proxy-swap failover. It selects a proxy via SelectProxyForAccount
+// (honoring the require-proxy gate — a require-proxy error is returned as-is so
+// the caller aborts rather than leaking the real IP), issues the request, and
+// on a proxy/dial transport failure marks that pool proxy unhealthy and
+// re-selects another, up to maxRestProxySwapAttempts. When the request reaches
+// upstream through a pool proxy it marks that proxy healthy. HTTP status errors
+// (4xx/5xx) come back as a normal *http.Response and never mark a proxy
+// unhealthy — only transport failures do. buildReq must construct a FRESH
+// *http.Request each call so the body can be re-read across swaps.
+func doRESTWithProxySwap(account *config.Account, buildReq func() (*http.Request, error)) (*http.Response, error) {
+	attempts := 0
+	for {
+		proxyURL, poolKey, err := SelectProxyForAccount(account)
+		if err != nil {
+			return nil, err
+		}
+		req, err := buildReq()
+		if err != nil {
+			return nil, err
+		}
+		resp, err := GetRestClientForProxy(proxyURL).Do(req)
+		if err != nil {
+			if isProxyErrorMessage(err.Error()) && poolKey != "" && attempts < maxRestProxySwapAttempts {
+				config.MarkProxyUnhealthy(poolKey)
+				attempts++
+				logger.Warnf("[Route] REST proxy swap for %s after transport error: %v", accountEmailForLog(account), err)
+				continue
+			}
+			return nil, err
+		}
+		if poolKey != "" {
+			config.MarkProxyHealthy(poolKey)
+		}
+		return resp, nil
+	}
+}
+
+// maskProxyForLog returns a log-safe proxy string: scheme://[user:***@]host:port,
+// or "direct" when no proxy is configured. Password is never logged.
+func maskProxyForLog(proxyURL string) string {
+	if proxyURL == "" {
+		return "direct"
+	}
+	u, err := url.Parse(proxyURL)
+	if err != nil || u.Host == "" {
+		return "direct"
+	}
+	auth := ""
+	if u.User != nil {
+		name := u.User.Username()
+		if _, hasPw := u.User.Password(); hasPw {
+			auth = name + ":***@"
+		} else if name != "" {
+			auth = name + "@"
+		}
+	}
+	return fmt.Sprintf("%s://%s%s", u.Scheme, auth, u.Host)
+}
+
 // buildKiroTransport constructs an HTTP Transport with optional outbound proxy support.
 func buildKiroTransport(proxyURL string) *http.Transport {
 	t := &http.Transport{
@@ -173,6 +324,14 @@ func buildKiroTransport(proxyURL string) *http.Transport {
 		IdleConnTimeout:     90 * time.Second,
 		DisableCompression:  false,
 		ForceAttemptHTTP2:   true,
+		// Cap the connect/proxy-handshake phase so a dead or hung proxy fails
+		// fast and the request rotates to another account, instead of hanging
+		// for the full 5-minute stream timeout. The 5-minute client timeout
+		// still covers the streaming body once connected.
+		DialContext: (&net.Dialer{
+			Timeout:   10 * time.Second,
+			KeepAlive: 30 * time.Second,
+		}).DialContext,
 	}
 	if isDirectProxyOptOut(proxyURL) {
 		return t
@@ -440,6 +599,56 @@ func parseAndStream(body io.ReadCloser, callback *KiroStreamCallback) error {
 	return parseEventStream(body, callback)
 }
 
+// secretPreviewRe masks obvious credential tokens in the content preview so
+// debug logs never leak API keys / bearer tokens that appear inside prompts.
+var secretPreviewRe = regexp.MustCompile(`(?i)(sk-[a-z0-9_-]{6,}|bearer\s+[a-z0-9._-]{8,}|(?:api[_-]?key|token|secret|password)["']?\s*[:=]\s*["']?[a-z0-9._-]{6,})`)
+
+func maskSecrets(s string) string {
+	return secretPreviewRe.ReplaceAllString(s, "[REDACTED]")
+}
+
+// summarizeKiroPayload returns a compact, single-line description of a request
+// payload for debug logging: the request shape (model, history depth, tool
+// counts, content size) plus a short, secret-masked preview of the current
+// message content. It deliberately avoids dumping the full payload, which can
+// be hundreds of KB and contain user secrets.
+func summarizeKiroPayload(payload *KiroPayload) string {
+	if payload == nil {
+		return "<nil>"
+	}
+	cs := &payload.ConversationState
+	uim := &cs.CurrentMessage.UserInputMessage
+
+	tools, toolResults := 0, 0
+	if uim.UserInputMessageContext != nil {
+		tools = len(uim.UserInputMessageContext.Tools)
+		toolResults = len(uim.UserInputMessageContext.ToolResults)
+	}
+
+	const previewLen = 200
+	preview := uim.Content
+	truncated := false
+	if len([]rune(preview)) > previewLen {
+		preview = string([]rune(preview)[:previewLen])
+		truncated = true
+	}
+	// Collapse whitespace/newlines so the preview stays on one log line.
+	preview = strings.Join(strings.Fields(preview), " ")
+	preview = maskSecrets(preview)
+	if truncated {
+		preview += "…"
+	}
+
+	convID := cs.ConversationID
+	if len(convID) > 8 {
+		convID = convID[:8]
+	}
+
+	return fmt.Sprintf("conv=%s model=%s task=%s trigger=%s history=%d tools=%d toolResults=%d images=%d contentChars=%d content=%q",
+		convID, uim.ModelID, cs.AgentTaskType, cs.ChatTriggerType,
+		len(cs.History), tools, toolResults, len(uim.Images), len(uim.Content), preview)
+}
+
 // CallKiroAPI calls the Kiro streaming API, trying each configured endpoint with automatic fallback.
 //
 // This is a thin wrapper that discards upstream diagnostics. Callers that need
@@ -469,9 +678,10 @@ func CallKiroAPIWithDiagnostics(account *config.Account, payload *KiroPayload, c
 		return err
 	}
 
-	// Debug: dump full payload for troubleshooting upstream rejections
-	if payloadJSON, err := json.Marshal(payload); err == nil {
-		logger.Debugf("[KiroAPI] Request payload: %s", string(payloadJSON))
+	// Debug: log a compact summary (shape + masked content preview) instead of
+	// the full payload, which can be hundreds of KB and contain secrets.
+	if enabled := logger.GetLevel(); enabled <= logger.LevelDebug {
+		logger.Debugf("[KiroAPI] Request: %s", summarizeKiroPayload(payload))
 	}
 
 	// Wrap OnToolUse to restore original tool names for the client.
@@ -488,7 +698,17 @@ func CallKiroAPIWithDiagnostics(account *config.Account, payload *KiroPayload, c
 		callback = &wrapped
 	}
 
-	if payload != nil && strings.TrimSpace(payload.ProfileArn) == "" && !config.IsAPIKeyAccount(account) {
+	// Resolve the outbound proxy FIRST. When require-proxy is on and the account
+	// has no proxy, this returns a blocking error so we bail before any network
+	// call below (e.g. ResolveProfileArn), preventing a direct-connection IP leak.
+	// poolKey (non-empty only when the proxy came from the pool) lets us report
+	// health back and rotate to another pool proxy on a transport failure.
+	proxyURL, poolKey, proxyErr := SelectProxyForAccount(account)
+	if proxyErr != nil {
+		return proxyErr
+	}
+
+	if payload != nil && strings.TrimSpace(payload.ProfileArn) == "" {
 		if profileArn, err := ResolveProfileArn(account); err == nil {
 			payload.ProfileArn = profileArn
 		} else if isProfileArnResolutionSoftError(err) {
@@ -519,160 +739,137 @@ func CallKiroAPIWithDiagnostics(account *config.Account, payload *KiroPayload, c
 	endpoints := endpointsForAccount(account)
 	isAPIKey := config.IsAPIKeyAccount(account)
 
+	// OUTER proxy-swap loop: the inner loop tries each endpoint over the current
+	// proxy. Only a proxy/dial TRANSPORT failure (not an HTTP status) rotates us
+	// to another pool proxy — HTTP 4xx/5xx are upstream/account state and must
+	// never mark a proxy unhealthy.
+	proxyAttempts := 0
 	var lastErr error
-	// shrunkForLength guards the one-shot payload reduction below. It is declared
-	// outside the endpoint loop so a single request can shrink at most once in
-	// total, never once per endpoint.
-	shrunkForLength := false
-	for _, ep := range endpoints {
-	retryEndpoint:
-		// Update the origin field for the selected endpoint.
-		payload.ConversationState.CurrentMessage.UserInputMessage.Origin = ep.Origin
+	for {
+		logger.Infof("[Route] ac=%s model=%s proxy=%s", accountEmailForLog(account), currentMessageModelID(payload), maskProxyForLog(proxyURL))
+		proxyClient := GetClientForProxy(proxyURL)
 
-		// Target the profile's data-plane region; endpoint URLs are declared for us-east-1.
-		// API Key accounts use the CLI runtime host instead of IDE/Q hosts.
-		epURL := regionalizeURLForProfile(ep.URL, account, payload.ProfileArn)
-		if isAPIKey {
-			epURL = cliRuntimeURL(account)
-		}
+		// lastTransportErr captures ONLY proxyClient.Do transport failures for the
+		// current proxy — it drives the swap decision. HTTP-status errors set
+		// lastErr but never lastTransportErr. reachedUpstream records whether any
+		// endpoint got an HTTP response through this proxy: if one did, the proxy
+		// demonstrably works, so a transport error on a different endpoint must not
+		// mark it unhealthy.
+		var lastTransportErr error
+		reachedUpstream := false
+		for _, ep := range endpoints {
+			// Update the origin field for the selected endpoint.
+			payload.ConversationState.CurrentMessage.UserInputMessage.Origin = ep.Origin
 
-		reqBody, _ := json.Marshal(payload)
-		req, err := http.NewRequest("POST", epURL, bytes.NewReader(reqBody))
-		if err != nil {
-			lastErr = err
-			continue
-		}
-
-		host := ""
-		if parsedURL, parseErr := url.Parse(epURL); parseErr == nil {
-			host = parsedURL.Host
-		}
-		headerValues := buildStreamingHeaderValues(account, host)
-
-		if isAPIKey {
-			req.Header.Set("Content-Type", "application/x-amz-json-1.0")
-		} else {
-			req.Header.Set("Content-Type", "application/json")
-		}
-		req.Header.Set("Accept", "*/*")
-		if ep.AmzTarget != "" {
-			req.Header.Set("X-Amz-Target", ep.AmzTarget)
-		}
-		applyKiroBaseHeaders(req, account, headerValues)
-		if !isAPIKey {
-			req.Header.Set("x-amzn-kiro-agent-mode", "vibe")
-		}
-		// CLI captures use optout=false; IDE path keeps true.
-		if isAPIKey {
-			req.Header.Set("x-amzn-codewhisperer-optout", "false")
-		} else {
-			req.Header.Set("x-amzn-codewhisperer-optout", "true")
-		}
-		req.Header.Set("Amz-Sdk-Request", "attempt=1; max=3")
-		req.Header.Set("Amz-Sdk-Invocation-Id", uuid.New().String())
-
-		epStart := time.Now()
-		// Base diagnostics for this endpoint attempt. Region comes from the
-		// regionalised URL, so it reflects where the request actually went
-		// rather than the account's (possibly unrelated) auth region.
-		epAttempt := TraceAttempt{
-			UpstreamEndpoint: ep.Name,
-			UpstreamHost:     host,
-			Region:           regionFromKiroHost(host),
-			ProfileArn:       profileArnSuffix(payload.ProfileArn),
-			StartedAtMs:      epStart.UnixMilli(),
-		}
-		recordEndpointAttempt := func(status int, header http.Header, outcome, retryAfter string, callErr error) {
-			epAttempt.HTTPStatus = status
-			epAttempt.Outcome = outcome
-			epAttempt.DurationMs = time.Since(epStart).Milliseconds()
-			epAttempt.RetryAfter = retryAfter
-			if header != nil {
-				epAttempt.UpstreamRequestID = upstreamRequestIDFromHeader(header)
+			// Target the PROFILE's data-plane region, not the account's auth
+			// region: endpoint URLs are declared for us-east-1, and the two
+			// regions legitimately differ (see kiroRegionForProfile). Passing the
+			// payload ARN makes this request follow the profile it actually
+			// carries, which matters while an ARN is being probed or re-resolved
+			// and is not yet persisted on the account.
+			epURL := regionalizeURLForProfile(ep.URL, account, payload.ProfileArn)
+			// API-key credentials speak the Kiro CLI runtime protocol on a
+			// different host; the IDE/Q hosts reject them outright.
+			if isAPIKey {
+				epURL = cliRuntimeURL(account)
 			}
-			if callErr != nil {
-				msg := callErr.Error()
-				epAttempt.ErrorType = classifyError(msg)
-				epAttempt.Error = scrubTraceText(msg)
+			reqBody, _ := json.Marshal(payload)
+			req, err := http.NewRequest("POST", epURL, bytes.NewReader(reqBody))
+			if err != nil {
+				lastErr = err
+				continue
 			}
-			diag.record(epAttempt)
-		}
 
-		resp, err := GetClientForProxy(ResolveAccountProxyURL(account)).Do(req)
-		if err != nil {
-			lastErr = err
-			recordEndpointAttempt(0, nil, outcomeError, "", err)
-			logger.Warnf("[KiroAPI] Endpoint %s failed: %v", ep.Name, err)
-			continue
-		}
+			host := ""
+			if parsedURL, parseErr := url.Parse(epURL); parseErr == nil {
+				host = parsedURL.Host
+			}
+			headerValues := buildStreamingHeaderValues(account, host)
 
-		if resp.StatusCode == 429 {
-			retryAfter := retryAfterFromHeader(resp.Header.Get("Retry-After"))
-			header := resp.Header
+			// The CLI runtime speaks AWS JSON 1.0; the IDE/Q endpoints take
+			// plain JSON. Sending the wrong content type is rejected upstream.
+			if isAPIKey {
+				req.Header.Set("Content-Type", "application/x-amz-json-1.0")
+			} else {
+				req.Header.Set("Content-Type", "application/json")
+			}
+			req.Header.Set("Accept", "*/*")
+			if ep.AmzTarget != "" {
+				req.Header.Set("X-Amz-Target", ep.AmzTarget)
+			}
+			// applyKiroBaseHeaders owns the Authorization + TokenType/tokentype
+			// pair for BOTH credential kinds (api_key -> lowercase tokentype,
+			// external_idp -> TokenType), so the per-kind header block upstream
+			// set here would be a second, drifting copy and is not reinstated.
+			applyKiroBaseHeaders(req, account, headerValues)
+			// agent-mode is an IDE-only marker; the CLI runtime does not send it.
+			if !isAPIKey {
+				req.Header.Set("x-amzn-kiro-agent-mode", "vibe")
+			}
+			// Real Kiro CLI captures send optout=false; the IDE path sends true.
+			if isAPIKey {
+				req.Header.Set("x-amzn-codewhisperer-optout", "false")
+			} else {
+				req.Header.Set("x-amzn-codewhisperer-optout", "true")
+			}
+			req.Header.Set("Amz-Sdk-Request", "attempt=1; max=3")
+			req.Header.Set("Amz-Sdk-Invocation-Id", uuid.New().String())
+
+			resp, err := proxyClient.Do(req)
+			if err != nil {
+				lastErr = err
+				lastTransportErr = err
+				logger.Warnf("[KiroAPI] Endpoint %s failed: %v", ep.Name, err)
+				continue
+			}
+			// Got an HTTP response through this proxy — it reached upstream.
+			reachedUpstream = true
+
+			if resp.StatusCode == 429 {
+				resp.Body.Close()
+				logger.Warnf("[KiroAPI] Endpoint %s quota exhausted (429), trying next...", ep.Name)
+				lastErr = fmt.Errorf("quota exhausted on %s", ep.Name)
+				continue
+			}
+
+			if resp.StatusCode != 200 {
+				errBody, _ := io.ReadAll(resp.Body)
+				resp.Body.Close()
+				lastErr = fmt.Errorf("HTTP %d from %s: %s", resp.StatusCode, ep.Name, string(errBody))
+				// Authentication errors and payment errors are not retried across endpoints.
+				if resp.StatusCode == 401 || resp.StatusCode == 403 || resp.StatusCode == 402 {
+					return lastErr
+				}
+				logger.Warnf("[KiroAPI] Endpoint %s error: %v", ep.Name, lastErr)
+				continue
+			}
+
+			// Reached upstream and got a streamable 200 through this proxy — it
+			// works, so mark the pool entry healthy once.
+			if poolKey != "" {
+				config.MarkProxyHealthy(poolKey)
+			}
+			err = parseEventStream(resp.Body, callback)
 			resp.Body.Close()
-			if retryAfter != "" {
-				logger.Warnf("[KiroAPI] Endpoint %s throttled/quota exhausted (429, retry after %s); stopping endpoint fan-out for this account", ep.Name, retryAfter)
-				err := fmt.Errorf("HTTP 429 from %s: quota exhausted; retry after %s", ep.Name, retryAfter)
-				recordEndpointAttempt(429, header, outcomeError, retryAfter, err)
-				return err
-			}
-			logger.Warnf("[KiroAPI] Endpoint %s throttled/quota exhausted (429); stopping endpoint fan-out for this account", ep.Name)
-			err := fmt.Errorf("HTTP 429 from %s: quota exhausted", ep.Name)
-			recordEndpointAttempt(429, header, outcomeError, "", err)
 			return err
 		}
 
-		if resp.StatusCode != 200 {
-			errBody, _ := io.ReadAll(resp.Body)
-			status := resp.StatusCode
-			header := resp.Header
-			resp.Body.Close()
-			// upstreamError tags 402 as "overage" so the failover layer routes it
-			// to overage handling instead of the generic RecordError path.
-			lastErr = upstreamError(status, ep.Name, string(errBody))
-			recordEndpointAttempt(status, header, outcomeError, "", lastErr)
-			// Auth failures (401/403) and overage (402) are account-level: do not
-			// retry across endpoints. Other status codes fall through to the next
-			// endpoint.
-			if status == 401 || status == 403 || status == 402 {
-				return lastErr
+		// Inner endpoint loop exhausted. If the failure was a proxy transport
+		// error, no endpoint reached upstream through this proxy, and we can
+		// still swap, mark the current proxy unhealthy and rotate to another
+		// pool proxy. reachedUpstream guards against penalizing a working proxy
+		// when one endpoint transport-failed but another got an HTTP response.
+		if !reachedUpstream && shouldSwapProxy(lastTransportErr, poolKey, proxyAttempts) {
+			config.MarkProxyUnhealthy(poolKey)
+			proxyAttempts++
+			newURL, newKey, selErr := SelectProxyForAccount(account)
+			if selErr != nil {
+				return selErr
 			}
-			// The request was too large for the model. Rotating endpoints or
-			// accounts cannot help — every one of them rejects the same bytes —
-			// so shrink the payload once and retry the SAME endpoint. Nothing
-			// has streamed to the client yet on this path (the non-200 branch
-			// runs before parseAndStream), which is what makes retrying safe
-			// here and nowhere later.
-			//
-			// This is the recovery net for a body ceiling that is now derived
-			// from each model's declared window rather than one hand-tuned
-			// constant: if that derivation ever over-estimates what Kiro will
-			// accept, the request degrades to a smaller context instead of
-			// failing outright.
-			if isInputTooLongErrorMessage(lastErr.Error()) && !shrunkForLength {
-				shrunkForLength = true
-				if shrinkPayloadAfterLengthRejection(payload) {
-					logger.Warnf("[KiroAPI] Endpoint %s rejected the request as too long; retrying once with a reduced payload", ep.Name)
-					goto retryEndpoint
-				}
-				logger.Warnf("[KiroAPI] Endpoint %s rejected the request as too long and it could not be reduced further", ep.Name)
-				return lastErr
-			}
-			logger.Warnf("[KiroAPI] Endpoint %s error: %v", ep.Name, lastErr)
+			proxyURL, poolKey = newURL, newKey
 			continue
 		}
-
-		streamHeader := resp.Header
-		// parseAndStream defers resp.Body.Close(), so a panic in a streaming
-		// callback (OnText/OnToolUse/parseEventStream) still returns the upstream
-		// TCP connection to the transport pool instead of leaking it.
-		err = parseAndStream(resp.Body, callback)
-		if err != nil {
-			recordEndpointAttempt(200, streamHeader, outcomeError, "", err)
-		} else {
-			recordEndpointAttempt(200, streamHeader, outcomeSuccess, "", nil)
-		}
-		return err
+		break
 	}
 
 	if lastErr != nil {
@@ -760,6 +957,39 @@ func parseEventStream(body io.Reader, callback *KiroStreamCallback) error {
 	// the distinction this guard exists to make (and which
 	// TestEventStreamHandlesUndersizedFrameLength pins).
 	framesSeen := 0
+
+	// MERGE POLICY NOTE (fork ↔ upstream v1.1.5): the two sides disagreed on what
+	// an AWS event-stream EXCEPTION frame means, and the disagreement was direct —
+	// the fork reported the frame and `continue`d (returning nil), upstream
+	// `return`ed an error immediately. Their tests contradict each other, so one
+	// had to give. Neither side is adopted verbatim; this is the union, because
+	// each side was protecting a different real property:
+	//
+	//   - upstream's property (CORRECTNESS): a stream that failed must not be
+	//     reported as a success. Returning nil made OnComplete fire, the handler
+	//     bill the customer key, pool.RecordSuccess CLEAR the account's error count
+	//     and cooldown, and the client receive a normal stop_reason for a truncated
+	//     answer. That is the identical failure class the round-12 empty-stream
+	//     guard (errKiroEmptyStream, above) was added to close, and the sibling
+	//     Bedrock reader already treats these frames as terminal
+	//     (bedrock_eventstream.go:121 — asserted by bedrock_eventstream_test.go).
+	//     Leaving the Kiro path silent made the SAME upstream condition observable
+	//     on one surface and invisible on the other;
+	//   - the fork's property (SAFETY): do not stop reading, because no real Kiro
+	//     exception frame has ever been captured and killing the read mid-answer on
+	//     the path every request uses would be a worse failure than the
+	//     misclassification it fixes.
+	//
+	// So the frame is recorded, NOT acted on immediately: the loop keeps draining
+	// and every subsequent content frame is still delivered to the client exactly
+	// as before. The error surfaces only at end-of-stream, where it costs no text.
+	// The handlers then emit an explicit error chunk + terminator on the
+	// already-started stream (handler.go) instead of truncating silently.
+	//
+	// Deliberately NOT an early return: that is what would kill a live stream on
+	// inference. Deliberately NOT nil either: silence is what mis-billed and
+	// un-cooled the account.
+	var failureFrameErr error
 	for {
 		// Prelude: 12 bytes (total_len + headers_len + crc)
 		prelude := make([]byte, 12)
@@ -806,7 +1036,8 @@ func parseEventStream(body io.Reader, callback *KiroStreamCallback) error {
 			continue
 		}
 
-		eventType := extractEventType(msgBuf[0:headersLength])
+		headerBytes := msgBuf[0:headersLength]
+		eventType := extractStringHeader(headerBytes, ":event-type")
 		payloadBytes := msgBuf[headersLength : len(msgBuf)-4]
 
 		// Surface AWS event-stream EXCEPTION frames.
@@ -839,6 +1070,15 @@ func parseEventStream(body io.Reader, callback *KiroStreamCallback) error {
 				truncateForLog(exceptionType, maxLoggedExceptionType), len(payloadBytes))
 			if callback.OnUpstreamException != nil {
 				callback.OnUpstreamException(exceptionType, payloadBytes)
+			}
+			// Remember the FIRST failure frame and keep draining (see the merge
+			// policy note at failureFrameErr). The message is shaped so the existing
+			// string-matching classifiers work on it unchanged: the exception type is
+			// included verbatim, so a "ThrottlingException" reaches
+			// isQuotaErrorMessage via its "429" mapping below rather than being
+			// misfiled as a generic transport fault.
+			if failureFrameErr == nil {
+				failureFrameErr = upstreamFailureFrameError(exceptionType, payloadBytes)
 			}
 			continue
 		}
@@ -954,10 +1194,20 @@ func parseEventStream(body io.Reader, callback *KiroStreamCallback) error {
 		callback.OnCredits(totalCredits)
 	}
 
+	// OnComplete fires even when a failure frame was seen, and deliberately so: a
+	// failure frame can carry a usage block, the upstream charges for those tokens
+	// either way, and OnComplete is the ONLY channel that reports them (every
+	// implementation just assigns the counters — it is not a success signal; the
+	// handlers gate success on the returned error and call pool.RecordSuccess only
+	// when it is nil). Suppressing it here would silently stop billing those tokens,
+	// which is the accounting hole TestFailureFrameStillCountsUsage exists to pin.
 	if callback.OnComplete != nil {
 		callback.OnComplete(inputTokens, outputTokens)
 	}
-	return nil
+	// Surfaced last: the stream has been fully drained and every content frame
+	// delivered, so returning the failure now costs no client text while still
+	// denying the caller a false success (see the merge policy note above).
+	return failureFrameErr
 }
 
 func updateTokensFromEvent(event map[string]interface{}, currentInputTokens, currentOutputTokens int) (int, int) {
@@ -1309,6 +1559,44 @@ func isUpstreamFailureFrame(headers []byte, eventType string) bool {
 	return extractHeaderString(headers, ":exception-type") != ""
 }
 
+// upstreamFailureFrameError builds the error a drained failure frame surfaces at
+// end-of-stream (see the merge policy note in parseEventStream).
+//
+// The message is shaped for the string-matching classifiers this codebase already
+// uses (account_failover.go, pool/account.go) rather than adding a new error kind:
+//
+//   - the exception type is included verbatim, bounded by the same cap used for
+//     logging so a ~64 KiB upstream-controlled header cannot bloat the error that
+//     gets stored in request logs and per-key failure records;
+//   - a THROTTLING type additionally contributes a literal "HTTP 429" token so
+//     isQuotaErrorMessage matches it through pool.HasStatusToken and the account
+//     takes a soft quota cooldown, which is the correct handling for throttling.
+//
+// Only the throttle mapping is inferred, deliberately. Mapping e.g.
+// AccessDeniedException to 403 would route an inferred frame into the
+// suspension/auth classifier, and that path DISABLES the account — a mis-inference
+// there costs an operator a working account, so those types stay unmapped and are
+// treated as generic upstream failures until a real frame is observed. Note also
+// that upstream's alternative (adding "throttl" to isQuotaErrorMessage) is not
+// viable here: it would also match errBedrockThrottled, whose whole purpose is to
+// be a per-model skip that must NOT escalate to an account-wide quota cooldown
+// (asserted by TestErrBedrockThrottledNotQuota).
+func upstreamFailureFrameError(exceptionType string, payload []byte) error {
+	label := truncateForLog(strings.TrimSpace(exceptionType), maxLoggedExceptionType)
+	if label == "" {
+		label = "unknown"
+	}
+	status := ""
+	if lower := strings.ToLower(label); strings.Contains(lower, "throttl") ||
+		strings.Contains(lower, "toomanyrequests") {
+		status = " (HTTP 429)"
+	}
+	if msg := truncateForLog(extractJSONMessage(payload), maxLoggedExceptionType); msg != "" {
+		return fmt.Errorf("kiro stream: upstream failure frame %s%s: %s", label, status, msg)
+	}
+	return fmt.Errorf("kiro stream: upstream failure frame %s%s", label, status)
+}
+
 // upstreamFailureLabel returns the most specific available name for a failure
 // frame, preferring the dedicated header over the generic ones. Same precedence
 // as the Bedrock reader so the two surfaces report a given frame identically.
@@ -1354,6 +1642,61 @@ func extractEventType(headers []byte) string {
 			value := string(headers[offset : offset+valueLen])
 			offset += valueLen
 			if name == ":event-type" {
+				return value
+			}
+			continue
+		}
+
+		// Skip other value types by their fixed byte widths.
+		skipSizes := map[byte]int{0: 0, 1: 0, 2: 1, 3: 2, 4: 4, 5: 8, 8: 8, 9: 16}
+		if valueType == 6 {
+			if offset+2 > len(headers) {
+				break
+			}
+			l := int(headers[offset])<<8 | int(headers[offset+1])
+			offset += 2 + l
+		} else if skip, ok := skipSizes[valueType]; ok {
+			offset += skip
+		} else {
+			break
+		}
+	}
+	return ""
+}
+
+// extractStringHeader returns the value of the named string header (value type 7)
+// from AWS Event Stream message headers, or "" if absent.
+func extractStringHeader(headers []byte, target string) string {
+	offset := 0
+	for offset < len(headers) {
+		if offset >= len(headers) {
+			break
+		}
+		nameLen := int(headers[offset])
+		offset++
+		if offset+nameLen > len(headers) {
+			break
+		}
+		name := string(headers[offset : offset+nameLen])
+		offset += nameLen
+		if offset >= len(headers) {
+			break
+		}
+		valueType := headers[offset]
+		offset++
+
+		if valueType == 7 { // String
+			if offset+2 > len(headers) {
+				break
+			}
+			valueLen := int(headers[offset])<<8 | int(headers[offset+1])
+			offset += 2
+			if offset+valueLen > len(headers) {
+				break
+			}
+			value := string(headers[offset : offset+valueLen])
+			offset += valueLen
+			if name == target {
 				return value
 			}
 			continue

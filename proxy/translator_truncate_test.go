@@ -9,14 +9,8 @@ import (
 
 // TestClaudeToKiroTruncatesOversizedHistory builds a conversation whose history
 // far exceeds the upstream input limit and verifies the converted payload is
-// trimmed below the model's byte ceiling, that a truncation placeholder is
+// trimmed below the configured maxPayloadBytes, that a truncation placeholder is
 // inserted, and that the current message is preserved.
-//
-// The ceiling is read via maxPayloadBytesForModel rather than the bare
-// maxPayloadBytes constant: this fixture uses a 1M-context model, whose body
-// budget scales above the 200K baseline. Comparing against the flat constant
-// asserted the OLD behaviour, where a large-context model was truncated to a
-// fifth of its usable window.
 func TestClaudeToKiroTruncatesOversizedHistory(t *testing.T) {
 	// ~2KB chunk repeated across many turns to blow past the byte limit.
 	big := strings.Repeat("lorem ipsum dolor sit amet ", 80) // ~2.1KB
@@ -24,7 +18,10 @@ func TestClaudeToKiroTruncatesOversizedHistory(t *testing.T) {
 	msgs := []ClaudeMessage{
 		{Role: "user", Content: "start the long task"},
 	}
-	for i := 0; i < 800; i++ {
+	// ~1200 turns × 2 msgs × ~2.1KB ≈ 5MB, comfortably above any configured
+	// maxPayloadBytes preset (max 4MB) so truncation is exercised regardless of
+	// the exact cap value.
+	for i := 0; i < 1200; i++ {
 		msgs = append(msgs,
 			ClaudeMessage{Role: "assistant", Content: "step result: " + big},
 			ClaudeMessage{Role: "user", Content: "next: " + big},
@@ -173,6 +170,57 @@ func TestClaudeToKiroTruncatesToTokenWindowUnderByteLimit(t *testing.T) {
 	// The current message must survive truncation.
 	cur := payload.ConversationState.CurrentMessage.UserInputMessage
 	if !strings.Contains(cur.Content, "FINAL: summarize") {
+		t.Fatalf("current message lost after truncation")
+	}
+}
+
+// TestClaudeToKiroTrimsOnTokenWindowUnderByteCap verifies the token-window
+// ceiling fires independently of the byte cap: a 200K-window model fed a history
+// that is well under the 2MB byte cap but far over its token window must still be
+// trimmed so input leaves output headroom.
+func TestClaudeToKiroTrimsOnTokenWindowUnderByteCap(t *testing.T) {
+	// ~4.5 chars/token → ~1.2M chars ≈ 1.2MB (< 2MB byte cap) but ≈ 270K tokens
+	// (> 200K window), so only the token ceiling should trigger truncation.
+	chunk := strings.Repeat("alpha beta gamma delta ", 260) // ~6KB per turn
+
+	msgs := []ClaudeMessage{{Role: "user", Content: "begin"}}
+	for i := 0; i < 100; i++ {
+		msgs = append(msgs,
+			ClaudeMessage{Role: "assistant", Content: chunk},
+			ClaudeMessage{Role: "user", Content: chunk},
+		)
+	}
+	msgs = append(msgs, ClaudeMessage{Role: "user", Content: "FINAL question"})
+
+	req := &ClaudeRequest{
+		Model:     "claude-sonnet-4.5", // 200K window
+		System:    "You are helpful.",
+		Messages:  msgs,
+		MaxTokens: 8000,
+	}
+
+	payload := ClaudeToKiro(req, false)
+
+	raw, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatalf("marshal failed: %v", err)
+	}
+	// Guard the premise: this input must be under the byte ceiling, so that a
+	// failure here means the token ceiling did the work (not the byte one).
+	if len(raw) > maxPayloadBytes {
+		t.Fatalf("test premise broken: payload %d bytes exceeds byte limit %d", len(raw), maxPayloadBytes)
+	}
+
+	limit := maxPayloadTokens("claude-sonnet-4.5")
+	if got := estimateKiroPayloadTokens(payload); got > limit {
+		t.Fatalf("payload %d tokens exceeds sonnet limit %d after truncation", got, limit)
+	}
+
+	// The current message must survive truncation. The fixture above appends
+	// "FINAL question"; the merge had spliced in the sibling test's
+	// "FINAL: summarize" marker, so this assertion could only ever fail.
+	cur := payload.ConversationState.CurrentMessage.UserInputMessage
+	if !strings.Contains(cur.Content, "FINAL question") {
 		t.Fatalf("current message lost after truncation")
 	}
 }
@@ -453,4 +501,11 @@ func TestTruncateStringToBytes(t *testing.T) {
 	if got := truncateStringToBytes(s, len(s)+10); got != s {
 		t.Fatalf("expected full string when budget exceeds length, got %q", got)
 	}
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }

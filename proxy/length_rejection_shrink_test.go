@@ -144,7 +144,7 @@ func TestBudgetVariantMatchesDefaultBehaviour(t *testing.T) {
 	a := buildShrinkFixture(t, "claude-sonnet-4.5", 200)
 	b := buildShrinkFixture(t, "claude-sonnet-4.5", 200)
 
-	truncatePayloadToLimit(a, true)
+	truncatePayloadToLimit(a, true, "claude-sonnet-4.5")
 	truncatePayloadToBudget(b, true, maxPayloadTokens("claude-sonnet-4.5"))
 
 	if payloadByteSize(a) != payloadByteSize(b) {

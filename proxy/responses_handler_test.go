@@ -106,6 +106,49 @@ func TestResponsesStoreAndLoad(t *testing.T) {
 	}
 }
 
+// TestResponsesStorePersistsOwner asserts the owning API key ID round-trips through
+// the store, which is what the M3 tenant-isolation check compares against. The owner
+// must never be echoed to clients (json:"-" on ResponsesObject.OwnerApiKeyID).
+//
+// MERGE POLICY NOTE (fork ↔ upstream v1.1.5): upstream called this field
+// APIKeyID and the fork calls it OwnerApiKeyID; the merged ResponsesObject keeps
+// the fork's name (loadResponse still reads upstream's persisted `api_key_id` as
+// a fallback so old records keep their owner). The assertion is unchanged.
+func TestResponsesStorePersistsOwner(t *testing.T) {
+	cfgFile := filepath.Join(t.TempDir(), "config.json")
+	if err := config.Init(cfgFile); err != nil {
+		t.Fatalf("config.Init: %v", err)
+	}
+
+	resp := &ResponsesObject{
+		ID:            "resp_owner_test_001",
+		Object:        "response",
+		CreatedAt:     time.Now().Unix(),
+		Status:        "completed",
+		Model:         "claude-sonnet-4.5",
+		OwnerApiKeyID: "key_owner_abc",
+	}
+	if err := saveResponse(resp); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+	loaded, err := loadResponse(resp.ID)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if loaded.OwnerApiKeyID != "key_owner_abc" {
+		t.Fatalf("owner not persisted: got %q want key_owner_abc", loaded.OwnerApiKeyID)
+	}
+
+	// The owner must not appear in the client-facing JSON encoding.
+	encoded, err := json.Marshal(loaded)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if strings.Contains(string(encoded), "key_owner_abc") {
+		t.Fatalf("owner API key id leaked into client JSON: %s", string(encoded))
+	}
+}
+
 func TestResponsesPreviousResponseIDExpands(t *testing.T) {
 	prev := &ResponsesObject{
 		ID:          "resp_prev",

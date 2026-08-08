@@ -11,9 +11,11 @@ import (
 	"kiro-go/config"
 	"kiro-go/logger"
 	"kiro-go/pool"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"sync"
@@ -195,7 +197,9 @@ type Handler struct {
 	// closeState guards Handler.Close so it is idempotent. A zero value is
 	// usable, so the test suite's `&Handler{...}` literals need no change.
 	// See proxy/shutdown.go.
-	closeState closeState
+	closeState   closeState
+	stopPurge    chan struct{}
+	shutdownOnce sync.Once
 	// 模型缓存
 	cachedModels    []ModelInfo
 	modelsCacheMu   sync.RWMutex
@@ -269,6 +273,24 @@ type Handler struct {
 	// timer (round-robin). Inert when no pool is configured.
 	proxyRotator *proxyRotator
 
+	// tokenRefreshLocks holds one mutex per account ID so a slow token refresh
+	// on one account never blocks refreshes (or requests) for other accounts.
+	// This supersedes the fork's single process-wide tokenRefreshMu: the guarded
+	// section performs a network round-trip, so a global lock serialized every
+	// account behind the slowest one.
+	tokenRefreshLocks sync.Map // accountID -> *sync.Mutex
+	// Rate-limit / DoS-hardening collaborators (per-key RPM throttle, per-key
+	// concurrent-IP cap, application-layer DoS guard, per-key usage stats).
+	rpmThrottle *rpmThrottle
+	ipLimiter   *ipLimiter
+	guard       *dosGuard
+	usage       *usageStats
+	// adminGuard throttles brute-force guessing of the admin password on /admin/api/*.
+	adminGuard *adminAuthGuard
+	// adminSessions holds opaque, expiring admin session tokens so the browser never
+	// stores the raw admin password (H5) and the plaintext-password cookie is retired (M5).
+	adminSessions *adminSessionStore
+
 	// MERGE POLICY NOTE (fork ↔ upstream v1.1.5): union. The fields above are the
 	// fork's subsystems; the ones below are upstream's Microsoft Enterprise SSO
 	// profile-selection state. They are disjoint, so both are kept.
@@ -292,6 +314,25 @@ type microsoftProfileSelection struct {
 
 type microsoftProfileDiscovery struct {
 	cancel context.CancelFunc
+}
+
+// safeGo runs fn in a new goroutine with panic containment: a panic inside fn is
+// recovered and logged (value + stack) instead of crashing the whole process.
+func safeGo(fn func()) {
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				logger.Errorf("[safeGo] recovered from panic in background goroutine: %v\n%s", r, debug.Stack())
+			}
+		}()
+		fn()
+	}()
+}
+
+// tokenRefreshLock returns the per-account refresh mutex, creating it on first use.
+func (h *Handler) tokenRefreshLock(accountID string) *sync.Mutex {
+	m, _ := h.tokenRefreshLocks.LoadOrStore(accountID, &sync.Mutex{})
+	return m.(*sync.Mutex)
 }
 
 type thinkingStreamSource int
@@ -479,6 +520,7 @@ func NewHandler() *Handler {
 		startTime:       time.Now().Unix(),
 		stopRefresh:     make(chan struct{}),
 		stopStatsSaver:  make(chan struct{}),
+		stopPurge:       make(chan struct{}),
 		promptCache:     newPromptCacheTracker(defaultPromptCacheTTL),
 		rateLimiter:     newRateLimiter(),
 		// A4: shared by both admin gates so a brute-force attempt cannot be
@@ -493,6 +535,12 @@ func NewHandler() *Handler {
 		microsoftSelections:  make(map[string]*microsoftProfileSelection),
 		microsoftCanceled:    make(map[string]time.Time),
 		microsoftDiscoveries: make(map[string]*microsoftProfileDiscovery),
+		rpmThrottle:          newRPMThrottle(),
+		ipLimiter:            newIPLimiter(),
+		guard:                newDosGuard(loadDosGuardConfig()),
+		usage:                newUsageStats(),
+		adminGuard:           loadAdminAuthGuard(),
+		adminSessions:        newAdminSessionStore(adminSessionTTL),
 	}
 	h.loadRequestLogs()
 	h.loadAuditLogs()
@@ -509,7 +557,7 @@ func NewHandler() *Handler {
 	h.promptCache.Load(cachePath)
 	h.promptCache.startSaveLoop(cachePath, 30*time.Second)
 	// 启动后台刷新
-	go h.backgroundRefresh()
+	safeGo(func() { h.backgroundRefresh() })
 	// 启动后台统计保存 (每30秒保存一次)
 	go h.backgroundStatsSaver()
 	// 清理过期的 stored responses（>30 天）. Capture the directory before the
@@ -518,7 +566,44 @@ func NewHandler() *Handler {
 	go purgeExpiredResponsesInDir(responsesCleanupDir, responsesDefaultTTL)
 	// Opt-in auto-ingest watcher (KIRO_IMPORT_WATCH); no-op when disabled.
 	h.startImportWatcher()
+	safeGo(func() { h.backgroundStatsSaver() })
+	// 清理过期的 stored responses（>30 天），定时循环而非仅启动时一次
+	safeGo(func() { h.backgroundPurge() })
 	return h
+}
+
+// backgroundPurge periodically deletes expired stored responses. It runs once at
+// startup and then hourly, so long-lived processes don't accumulate expired files
+// on disk until the next restart (M4). Stops on Shutdown.
+func (h *Handler) backgroundPurge() {
+	purgeExpiredResponses(responsesDefaultTTL)
+	ticker := time.NewTicker(time.Hour)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			purgeExpiredResponses(responsesDefaultTTL)
+		case <-h.stopPurge:
+			return
+		}
+	}
+}
+
+// Shutdown stops the handler's background goroutines and flushes any pending
+// hot-path config changes to disk. Safe to call multiple times (idempotent via
+// sync.Once); the background savers each persist once more before returning, so
+// usage/stats accumulated since the last 30s tick are not lost on SIGTERM.
+func (h *Handler) Shutdown() {
+	h.shutdownOnce.Do(func() {
+		close(h.stopRefresh)
+		close(h.stopStatsSaver)
+		close(h.stopPurge)
+		// Capture the latest in-memory global counters and persist synchronously,
+		// so the caller can rely on a durable write having happened by the time
+		// Shutdown returns (backgroundStatsSaver's own stop-branch flush races us,
+		// but saveStats + FlushDirty are both safe to run concurrently).
+		h.saveStats()
+	})
 }
 
 // backgroundRefresh 后台定时刷新账户信息
@@ -722,6 +807,9 @@ func (h *Handler) authenticateForClaude(w http.ResponseWriter, r *http.Request) 
 	entry, err := h.authenticate(r)
 	if err != nil {
 		ae, _ := err.(*authError)
+		if ae != nil && ae.notice {
+			return withLimitNotice(r)
+		}
 		if ae == nil {
 			ae = newAuthError(http.StatusUnauthorized, "authentication_error", err.Error())
 		}
@@ -742,6 +830,9 @@ func (h *Handler) authenticateForOpenAI(w http.ResponseWriter, r *http.Request) 
 	entry, err := h.authenticate(r)
 	if err != nil {
 		ae, _ := err.(*authError)
+		if ae != nil && ae.notice {
+			return withLimitNotice(r)
+		}
 		if ae == nil {
 			ae = newAuthError(http.StatusUnauthorized, "authentication_error", err.Error())
 		}
@@ -757,6 +848,20 @@ func (h *Handler) authenticateForOpenAI(w http.ResponseWriter, r *http.Request) 
 	return withApiKeyContext(r, entry)
 }
 
+// resolvePublicBaseURL returns the externally reachable base URL (scheme://host[:port])
+// used to build OAuth redirect_uri values for the SSO loopback callback.
+//
+// Only config.PublicBaseURL (explicit operator override) is honored. Auto-detecting from
+// the admin request Host is intentionally NOT done: the loopback SSO server listens on its
+// own port (e.g. 3128), while the admin request arrives on the UI port/domain (e.g. 8080).
+// The request host therefore names the wrong endpoint and would produce a redirect_uri the
+// callback server never receives. When unset, "" is returned and the SSO flow falls back to
+// http://localhost:<loopbackPort> (correct for the pure-local case). For a reverse proxy /
+// custom domain, set PublicBaseURL to the domain that routes to the loopback port.
+func resolvePublicBaseURL() string {
+	return config.GetPublicBaseURL()
+}
+
 // ServeHTTP 路由分发
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	path := r.URL.Path
@@ -764,15 +869,41 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// Debug-level request trace for fine-grained visibility
 	logger.Debugf("[HTTP] %s %s from %s", r.Method, path, r.RemoteAddr)
 
-	// CORS - 完整的头部支持
-	w.Header().Set("Access-Control-Allow-Origin", "*")
-	w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
-	w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Api-Key, anthropic-version, anthropic-beta, x-api-key, x-stainless-os, x-stainless-lang, x-stainless-package-version, x-stainless-runtime, x-stainless-runtime-version, x-stainless-arch")
-	w.Header().Set("Access-Control-Expose-Headers", "x-request-id, x-ratelimit-limit-requests, x-ratelimit-limit-tokens, x-ratelimit-remaining-requests, x-ratelimit-remaining-tokens, x-ratelimit-reset-requests, x-ratelimit-reset-tokens")
+	// CORS: only the public API surface (/v1/... consumed by third-party tools) is meant
+	// to be called cross-origin. The admin panel is served same-origin, so we do NOT emit
+	// a wildcard Access-Control-Allow-Origin for /admin/* — that would invite any website
+	// to script the admin API against a logged-in operator's browser.
+	if !strings.HasPrefix(path, "/admin") {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Api-Key, anthropic-version, anthropic-beta, x-api-key, x-stainless-os, x-stainless-lang, x-stainless-package-version, x-stainless-runtime, x-stainless-runtime-version, x-stainless-arch")
+		w.Header().Set("Access-Control-Expose-Headers", "x-request-id, x-ratelimit-limit-requests, x-ratelimit-limit-tokens, x-ratelimit-remaining-requests, x-ratelimit-remaining-tokens, x-ratelimit-reset-requests, x-ratelimit-reset-tokens")
+	}
 
 	if r.Method == "OPTIONS" {
 		w.WriteHeader(204)
 		return
+	}
+
+	// Resolve the client IP once and stash it on the context so downstream handlers /
+	// auth can reuse it (honours the guard's trust-proxy / X-Forwarded-For config;
+	// falls back to raw RemoteAddr host when the guard is disabled).
+	clientIP := h.resolveClientIP(r)
+	r = withClientIP(r, clientIP)
+
+	// 应用层 DoS 防护：仅作用于会触发上游调用 / 鉴权的公开 API 端点。
+	// 管理端点 (/admin/*) 由独立密码保护且非公开分享，不在此限。
+	// 在路由前完成：每 IP 拒绝式限速 → 请求体大小上限。全局并发槽故意 NOT 在此获取，
+	// 而是在鉴权成功后（RPM 延迟之后）通过 h.acquireGuardedSlot 获取，避免仅被 RPM
+	// 延迟的请求长时间占用 KIRO_MAX_CONCURRENT 槽位而饿死其他客户端。
+	if h.guard != nil && isGuardedAPIPath(path) {
+		if !h.guard.allowIP(clientIP) {
+			h.sendGuardError(w, path, http.StatusTooManyRequests, "rate_limit_error", "Too many requests from your address")
+			return
+		}
+		if h.guard.maxBodyBytes > 0 {
+			r.Body = http.MaxBytesReader(w, r.Body, h.guard.maxBodyBytes)
+		}
 	}
 
 	// 路由
@@ -789,27 +920,52 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if ar == nil {
 			return
 		}
+		release, ok := h.acquireGuardedSlot(w, path)
+		if !ok {
+			return
+		}
+		defer release()
 		h.handleClaudeMessages(w, ar)
 	case path == "/v1/messages/count_tokens" || path == "/messages/count_tokens":
 		ar := h.authenticateForClaude(w, r)
 		if ar == nil {
 			return
 		}
+		release, ok := h.acquireGuardedSlot(w, path)
+		if !ok {
+			return
+		}
+		defer release()
 		h.handleCountTokens(w, ar)
 	case path == "/v1/chat/completions" || path == "/chat/completions":
 		ar := h.authenticateForOpenAI(w, r)
 		if ar == nil {
 			return
 		}
+		release, ok := h.acquireGuardedSlot(w, path)
+		if !ok {
+			return
+		}
+		defer release()
 		h.handleOpenAIChat(w, ar)
 	case path == "/v1/responses" || path == "/responses":
 		ar := h.authenticateForOpenAI(w, r)
 		if ar == nil {
 			return
 		}
+		release, ok := h.acquireGuardedSlot(w, path)
+		if !ok {
+			return
+		}
+		defer release()
 		h.handleOpenAIResponses(w, ar)
 	case path == "/v1/models" || path == "/models":
 		h.handleModels(w, r)
+	// 自助查询端点：用客户自己的 key 鉴权（非 admin 密码），只返回该 key 用量
+	case path == "/v1/key/info" || path == "/key/info":
+		h.apiKeySelfInfo(w, r)
+	case path == "/v1/key/logs" || path == "/key/logs":
+		h.apiKeySelfLogs(w, r)
 	case path == "/api/event_logging/batch":
 		// Claude Code 遥测端点 - 直接返回 200 OK
 		w.Header().Set("Content-Type", "application/json; charset=utf-8")
@@ -875,6 +1031,21 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// 管理端点
 	case path == "/admin" || path == "/admin/":
 		h.serveAdminPage(w, r)
+	// 客户自助门户（无需 admin 密码，用自己的 API key 查询用量）
+	case path == "/check" || path == "/check/":
+		setWebSecurityHeaders(w)
+		http.ServeFile(w, r, "web/portal.html")
+	// 自助用量仪表盘：GET 提供页面，POST 用客户自己的 key 返回该 key 的用量快照
+	case (path == "/usage" || path == "/usage/") && r.Method == "GET":
+		h.serveUsagePage(w, r)
+	case (path == "/usage" || path == "/usage/" || path == "/v1/usage") && r.Method == "POST":
+		h.apiUsageSelfService(w, r)
+	// Session login/logout must be reachable WITHOUT a prior session (they sit
+	// before the password gate in handleAdminAPI).
+	case path == "/admin/api/login":
+		h.handleAdminLogin(w, r)
+	case path == "/admin/api/logout":
+		h.handleAdminLogout(w, r)
 	case strings.HasPrefix(path, "/admin/api/"):
 		h.handleAdminAPI(w, r)
 	case strings.HasPrefix(path, "/admin/"):
@@ -892,11 +1063,59 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			json.NewEncoder(w).Encode(map[string]string{"error": "Invalid or missing API key"})
 			return
 		}
+		release, ok := h.acquireGuardedSlot(w, path)
+		if !ok {
+			return
+		}
+		defer release()
 		h.handleStats(w, r)
 
 	default:
 		http.Error(w, "Not Found", 404)
 	}
+}
+
+// resolveClientIP returns the best-effort client IP. It prefers the DoS guard's
+// resolver (which honours the trust-proxy / X-Forwarded-For configuration) and
+// falls back to the raw RemoteAddr host when the guard is disabled.
+func (h *Handler) resolveClientIP(r *http.Request) string {
+	if h.guard != nil {
+		return h.guard.clientIP(r)
+	}
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		return r.RemoteAddr
+	}
+	return host
+}
+
+// acquireGuardedSlot reserves one of the global concurrency slots (KIRO_MAX_CONCURRENT)
+// for a guarded API request. It is deliberately invoked AFTER authentication + RPM
+// throttling so a request that is merely being RPM-delayed never pins a slot during
+// its sleep. For non-guarded paths or when the guard is disabled it is a no-op admit.
+// On a full pool it writes a 503 in the endpoint's error shape and returns (nil, false)
+// — the caller MUST return without serving. On success it returns a release closure
+// that MUST be invoked exactly once (via defer).
+func (h *Handler) acquireGuardedSlot(w http.ResponseWriter, path string) (func(), bool) {
+	if h.guard == nil || !isGuardedAPIPath(path) {
+		return func() {}, true
+	}
+	release, ok := h.guard.acquireGlobal()
+	if !ok {
+		h.sendGuardError(w, path, http.StatusServiceUnavailable, "overloaded_error", "Server is at capacity, please retry shortly")
+		return nil, false
+	}
+	return release, true
+}
+
+// sendGuardError writes a DoS-guard rejection in the error shape matching the target
+// endpoint (OpenAI vs Claude) so clients parse it correctly.
+func (h *Handler) sendGuardError(w http.ResponseWriter, path string, status int, errType, message string) {
+	if isOpenAIStylePath(path) {
+		h.sendOpenAIError(w, status, errType, message)
+		return
+	}
+	h.sendClaudeError(w, status, errType, message)
 }
 
 // handleHealth 健康检查（不暴露统计数据）
@@ -1558,6 +1777,77 @@ func (h *Handler) handleCountTokens(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]int{"input_tokens": estimatedTokens})
 }
 
+// noticeOutputTokens returns a rough output-token count for the limit-notice reply so the
+// synthetic usage block looks plausible to clients. No billing is attached to it.
+func noticeOutputTokens(msg string) int {
+	n := len([]rune(msg)) / 4
+	if n < 1 {
+		n = 1
+	}
+	return n
+}
+
+// sendClaudeNotice returns the limit-notice text as a normal (HTTP 200) assistant reply
+// in Claude shape. Used when a valid key is over-limit/disabled/expired so coding clients
+// show the message in the chat window instead of erroring out. No upstream call, no billing.
+func (h *Handler) sendClaudeNotice(w http.ResponseWriter, model string, stream bool, msg string) {
+	outTok := noticeOutputTokens(msg)
+	if !stream {
+		resp := KiroToClaudeResponse(msg, "", false, nil, 1, outTok, model)
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		json.NewEncoder(w).Encode(resp)
+		return
+	}
+
+	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		resp := KiroToClaudeResponse(msg, "", false, nil, 1, outTok, model)
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		json.NewEncoder(w).Encode(resp)
+		return
+	}
+
+	msgID := "msg_" + uuid.New().String()
+	h.sendSSE(w, flusher, "message_start", map[string]interface{}{
+		"type": "message_start",
+		"message": map[string]interface{}{
+			"id":            msgID,
+			"type":          "message",
+			"role":          "assistant",
+			"content":       []interface{}{},
+			"model":         model,
+			"stop_reason":   nil,
+			"stop_sequence": nil,
+			"usage":         map[string]int{"input_tokens": 1, "output_tokens": 0},
+		},
+	})
+	h.sendSSE(w, flusher, "content_block_start", map[string]interface{}{
+		"type":          "content_block_start",
+		"index":         0,
+		"content_block": map[string]string{"type": "text", "text": ""},
+	})
+	h.sendSSE(w, flusher, "content_block_delta", map[string]interface{}{
+		"type":  "content_block_delta",
+		"index": 0,
+		"delta": map[string]string{"type": "text_delta", "text": msg},
+	})
+	h.sendSSE(w, flusher, "content_block_stop", map[string]interface{}{
+		"type":  "content_block_stop",
+		"index": 0,
+	})
+	h.sendSSE(w, flusher, "message_delta", map[string]interface{}{
+		"type":  "message_delta",
+		"delta": map[string]interface{}{"stop_reason": "end_turn"},
+		"usage": map[string]int{"input_tokens": 1, "output_tokens": outTok},
+	})
+	h.sendSSE(w, flusher, "message_stop", map[string]interface{}{
+		"type": "message_stop",
+	})
+}
+
 // handleClaudeMessages Claude API 处理
 func (h *Handler) handleClaudeMessages(w http.ResponseWriter, r *http.Request) {
 	h.handleClaudeMessagesInternal(w, r)
@@ -1590,16 +1880,23 @@ func (h *Handler) handleClaudeMessagesInternal(w http.ResponseWriter, r *http.Re
 		return
 	}
 
+	// Valid-but-blocked key: render the limit-notice as a normal assistant reply.
+	if limitNoticeRequested(r.Context()) {
+		h.sendClaudeNotice(w, req.Model, req.Stream, config.GetLimitNoticeMessage())
+		return
+	}
+
+	apiKeyID := apiKeyIDFromContext(r.Context())
+
 	// 解析模型和 thinking 模式
 	thinkingCfg := config.GetThinkingConfig()
 	actualModel, thinking := resolveClaudeThinkingMode(req.Model, req.Thinking, thinkingCfg.Suffix)
-	req.Model = actualModel
+	// Apply global/per-key model override (ForceModel > per-key Model > client model).
+	req.Model = applyModelOverride(actualModel, apiKeyID, thinkingCfg.Suffix)
 	effectiveReq := cloneClaudeRequestForThinking(&req, thinking)
 	thinkingResponseOpts := resolveClaudeThinkingResponseOptions(req.Thinking, thinkingCfg.ClaudeFormat)
 	estimatedInputTokens := estimateClaudeRequestInputTokens(effectiveReq)
 	cacheProfile := h.promptCache.BuildClaudeProfile(effectiveReq, estimatedInputTokens)
-
-	apiKeyID := apiKeyIDFromContext(r.Context())
 
 	// Pure native web_search: relay via Kiro MCP (generateAssistantResponse does not run it).
 	if hasWebSearchTool(&req) {
@@ -1646,7 +1943,10 @@ func (h *Handler) handleClaudeMessagesInternal(w http.ResponseWriter, r *http.Re
 				// cached response's usage to the key so cache hits cannot bypass
 				// token/credit accounting or the RPM/TPM windows.
 				in, out := usageFromCachedClaudeBody(cached)
-				h.recordSuccessForApiKey(apiKeyID, in, out, 0, req.Model)
+				// account is nil and the duration is ~0 on purpose: a cache hit
+				// is served from memory, so no upstream account did the work and
+				// attributing one would misreport which credential was charged.
+				h.recordSuccessForApiKey(apiKeyID, in, out, 0, req.Model, nil, "claude", time.Now())
 				// ...and log it. Previously this path updated the counters
 				// without emitting any record, so logCount could never be
 				// reconciled against totalRequests.
@@ -1669,6 +1969,38 @@ func (h *Handler) handleClaudeMessagesInternal(w http.ResponseWriter, r *http.Re
 	h.handleClaudeNonStream(w, kiroPayload, req.Model, thinking, thinkingResponseOpts, estimatedInputTokens, cacheProfile, apiKeyID, body, forwarded)
 }
 
+// logSuspiciousReq warns when a request burned a large input context but the
+// model produced almost nothing and ended its turn without calling a tool —
+// typically a thin client prompt (e.g. "continue") over a huge history, where
+// the model just acks intent and stops. These waste quota, so surface them.
+func logSuspiciousReq(api, model string, inputTokens, outputTokens int, hasTool bool) {
+	if inputTokens > 50_000 && outputTokens < 50 && !hasTool {
+		logger.Warnf("[SuspiciousReq] high-input low-output api=%s model=%s in=%d out=%d — thin prompt over large context; model acked and ended turn", api, model, inputTokens, outputTokens)
+	}
+}
+
+// nextAccountForKey picks the next account for a request, honoring the API key's
+// bound-account set when present. A key with BoundAccountIDs is restricted to those
+// accounts; only when none of them is currently usable (all excluded/cooldown/quota/
+// missing-model) does it fall back to the shared pool. Keys with no bound set route
+// through the shared pool as before. excluded accumulates accounts that already failed
+// this request so the retry loop advances.
+func (h *Handler) nextAccountForKey(apiKeyID, model string, excluded map[string]bool) *config.Account {
+	if apiKeyID != "" {
+		if entry := config.GetApiKeyEntry(apiKeyID); entry != nil && len(entry.BoundAccountIDs) > 0 {
+			allowed := make(map[string]bool, len(entry.BoundAccountIDs))
+			for _, id := range entry.BoundAccountIDs {
+				allowed[id] = true
+			}
+			if acc := h.pool.GetNextForModelBoundExcluding(model, allowed, excluded); acc != nil {
+				return acc
+			}
+			// No bound account usable → fall back to the shared pool.
+		}
+	}
+	return h.pool.GetNextForModelExcluding(model, excluded)
+}
+
 // handleClaudeStream Claude 流式响应
 func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload, model string, thinking bool, thinkingOpts claudeThinkingResponseOptions, estimatedInputTokens int, cacheProfile *promptCacheProfile, apiKeyID string, rawBody []byte, forwarded bool) {
 	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
@@ -1686,6 +2018,7 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 
 	// The trace recorder owns request-level timing from here on.
 	tr := newTraceRecorder("claude", model, true, apiKeyID)
+	startedAt := time.Now()
 	msgID := "msg_" + uuid.New().String()
 	startInputTokens := estimatedInputTokens
 	excluded := make(map[string]bool)
@@ -1714,7 +2047,7 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 	}
 
 	for attempt := 0; attempt < maxAccountRetryAttempts; attempt++ {
-		account := h.pool.GetNextForModelWithApiKey(model, excluded, apiKeyID)
+		account := h.nextAccountForKey(apiKeyID, model, excluded)
 		if account == nil {
 			break
 		}
@@ -2112,7 +2445,7 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 			if !messageStarted {
 				continue
 			}
-			h.emitTrace(tr, outcomeError, statusForUpstreamError(err))
+			h.recordFailureForApiKey(apiKeyID, "claude", model, 0, err.Error(), startedAt)
 			// Classify the error type from the authoritative upstream status.
 			//
 			// This was hardcoded to "api_error" for every failure, while the
@@ -2180,11 +2513,12 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 		}
 		outputTokens = estimateClaudeOutputTokens(outputContent, thinkingOutput, toolUses)
 
-		h.recordSuccessForApiKey(apiKeyID, inputTokens, outputTokens, credits, model)
+		h.recordSuccessForApiKey(apiKeyID, inputTokens, outputTokens, credits, model, account, "claude", startedAt)
 		h.pool.RecordSuccess(account.ID)
 		h.pool.RecordLatency(account.ID, float64(time.Since(tr.startedAt).Milliseconds()))
 		h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
 		h.promptCache.Update(account.ID, cacheProfile)
+		logSuspiciousReq("claude", model, inputTokens, outputTokens, len(toolUses) > 0)
 
 		stopReason := "end_turn"
 		if len(toolUses) > 0 {
@@ -2211,17 +2545,14 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 	}
 
 	if lastErr == nil {
+		h.recordFailureForApiKey(apiKeyID, "claude", model, 503, "No available accounts", startedAt)
 		h.sendClaudeError(w, 503, "api_error", "No available accounts")
 		return
 	}
 
-	// statusForUpstreamError maps the upstream failure onto the client-facing
-	// status (429 stays 429, 402 stays 402) instead of flattening everything to
-	// 500, and applyRetryAfterHeader preserves the upstream Retry-After so a
-	// throttled client backs off instead of retrying immediately.
 	status := statusForUpstreamError(lastErr)
-	h.emitTrace(tr, outcomeError, status)
 	applyRetryAfterHeader(w, lastErr)
+	h.recordFailureForApiKey(apiKeyID, "claude", model, status, lastErr.Error(), startedAt)
 	h.sendClaudeError(w, status, "api_error", lastErr.Error())
 }
 
@@ -2248,14 +2579,20 @@ func (h *Handler) backgroundStatsSaver() {
 }
 
 // saveStats 保存统计到配置文件
+// Hot-path counter updates (global stats, per-key usage, per-account stats) only
+// mark config dirty; this coalesces them into one disk write per tick instead of
+// writing the whole config under cfgLock on every request completion.
 func (h *Handler) saveStats() {
 	config.UpdateStats(
-		int(atomic.LoadInt64(&h.totalRequests)),
-		int(atomic.LoadInt64(&h.successRequests)),
-		int(atomic.LoadInt64(&h.failedRequests)),
-		int(atomic.LoadInt64(&h.totalTokens)),
+		atomic.LoadInt64(&h.totalRequests),
+		atomic.LoadInt64(&h.successRequests),
+		atomic.LoadInt64(&h.failedRequests),
+		atomic.LoadInt64(&h.totalTokens),
 		h.getCredits(),
 	)
+	if err := config.FlushDirty(); err != nil {
+		logger.Warnf("[StatsSaver] Failed to persist config: %v", err)
+	}
 }
 
 // getCredits 线程安全获取 credits
@@ -2280,22 +2617,106 @@ func (h *Handler) recordSuccess(inputTokens, outputTokens int, credits float64) 
 	h.addCredits(credits)
 }
 
+// recordFailure counts a terminal request failure against the global counters.
+//
+// MERGE POLICY NOTE (fork ↔ upstream v1.1.5): this is upstream's helper and it is
+// kept, because upstream's recordFailureForApiKey (the failure path every Claude /
+// OpenAI / Responses route now calls) depends on it. The fork counts the same
+// failure inside emitTrace instead; the two must not both run for one request, so
+// emitTrace stays the single terminal record on trace-wired routes and this
+// helper serves the per-key failure path.
+func (h *Handler) recordFailure() {
+	atomic.AddInt64(&h.totalRequests, 1)
+	atomic.AddInt64(&h.failedRequests, 1)
+}
+
 // recordSuccessForApiKey is recordSuccess + per-API-key usage attribution.
 // When apiKeyID is empty (legacy single-key path or unauthenticated path), only the
 // global counters are updated. Persistence errors are logged but do not propagate.
-func (h *Handler) recordSuccessForApiKey(apiKeyID string, inputTokens, outputTokens int, credits float64, model string) {
+// model is recorded in the per-request log for the admin API Log view.
+func (h *Handler) recordSuccessForApiKey(apiKeyID string, inputTokens, outputTokens int, credits float64, model string, account *config.Account, endpoint string, startedAt time.Time) {
 	h.recordSuccess(inputTokens, outputTokens, credits)
+
+	keyName, keyMasked := apiKeyLabels(apiKeyID)
+	if apiKeyID != "" {
+		// MERGE POLICY NOTE (fork ↔ upstream v1.1.5): union. The fork's
+		// RecordApiKeyUsage carries `model` (per-model usage accounting) and folds
+		// the real token count back into the F6 rate window; upstream adds the
+		// usageStats collaborator. Both are kept — dropping the rateLimiter
+		// feedback would leave every TPM check reading only ESTIMATED tokens.
+		if err := config.RecordApiKeyUsage(apiKeyID, int64(inputTokens+outputTokens), credits, model); err != nil {
+			logger.Warnf("[ApiKey] failed to record usage for key %s: %v", apiKeyID, err)
+		}
+		// F6: fold actual tokens into the key's rate window (best-effort TPM), so the
+		// next request's TPM check reflects real consumption.
+		if h.rateLimiter != nil {
+			h.rateLimiter.RecordTokens(apiKeyID, int64(inputTokens+outputTokens), time.Now().Unix())
+		}
+		if h.usage != nil {
+			h.usage.recordSuccess(apiKeyID, model, int64(inputTokens), 0, int64(outputTokens))
+		}
+	}
+
+	accountID := ""
+	accountEmail := ""
+	if account != nil {
+		accountID = account.ID
+		accountEmail = account.Email
+	}
+
+	logRequest(RequestLogEntry{
+		Status:       "ok",
+		Endpoint:     endpoint,
+		APIKeyID:     apiKeyID,
+		APIKeyName:   keyName,
+		APIKeyMasked: keyMasked,
+		Model:        model,
+		AccountID:    accountID,
+		AccountEmail: accountEmail,
+		InputTokens:  inputTokens,
+		OutputTokens: outputTokens,
+		Credits:      credits,
+		DurationMs:   durationMs(startedAt),
+	})
+}
+
+// apiKeyLabels resolves the display name + masked value for a key id (both empty when unknown).
+func apiKeyLabels(apiKeyID string) (name, masked string) {
 	if apiKeyID == "" {
-		return
+		return "", ""
 	}
-	if err := config.RecordApiKeyUsage(apiKeyID, int64(inputTokens+outputTokens), credits, model); err != nil {
-		logger.Warnf("[ApiKey] failed to record usage for key %s: %v", apiKeyID, err)
+	if entry := config.GetApiKeyEntry(apiKeyID); entry != nil {
+		return entry.Name, config.MaskApiKey(entry.Key)
 	}
-	// F6: fold actual tokens into the key's rate window (best-effort TPM), so the
-	// next request's TPM check reflects real consumption.
-	if h.rateLimiter != nil {
-		h.rateLimiter.RecordTokens(apiKeyID, int64(inputTokens+outputTokens), time.Now().Unix())
+	return "", ""
+}
+
+func durationMs(startedAt time.Time) int64 {
+	if startedAt.IsZero() {
+		return 0
 	}
+	return time.Since(startedAt).Milliseconds()
+}
+
+// recordFailureForApiKey is recordFailure + a failure entry in the per-request log so the
+// admin API Log view shows what went wrong (endpoint, model, status code, error detail).
+func (h *Handler) recordFailureForApiKey(apiKeyID, endpoint, model string, statusCode int, errMsg string, startedAt time.Time) {
+	h.recordFailure()
+	if apiKeyID != "" && h.usage != nil {
+		h.usage.recordFailure(apiKeyID, model)
+	}
+	name, masked := apiKeyLabels(apiKeyID)
+	logRequest(RequestLogEntry{
+		Status:       "error",
+		Endpoint:     endpoint,
+		APIKeyID:     apiKeyID,
+		APIKeyName:   name,
+		APIKeyMasked: masked,
+		Model:        model,
+		StatusCode:   statusCode,
+		Error:        errMsg,
+		DurationMs:   durationMs(startedAt),
+	})
 }
 
 // The Claude / OpenAI / Responses routes log through traceRecorder +
@@ -2573,13 +2994,14 @@ func (h *Handler) getRequestLogs() []RequestLog {
 
 // handleClaudeNonStream Claude 非流式响应
 func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayload, model string, thinking bool, thinkingOpts claudeThinkingResponseOptions, estimatedInputTokens int, cacheProfile *promptCacheProfile, apiKeyID string, rawBody []byte, forwarded bool) {
+	startedAt := time.Now()
 	excluded := make(map[string]bool)
 	var lastErr error
 	// The trace recorder owns request-level timing from here on.
 	tr := newTraceRecorder("claude", model, false, apiKeyID)
 
 	for attempt := 0; attempt < maxAccountRetryAttempts; attempt++ {
-		account := h.pool.GetNextForModelWithApiKey(model, excluded, apiKeyID)
+		account := h.nextAccountForKey(apiKeyID, model, excluded)
 		if account == nil {
 			break
 		}
@@ -2705,7 +3127,7 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayl
 		}
 		outputTokens = estimateClaudeOutputTokens(finalContent, rawThinkingContent, toolUses)
 
-		h.recordSuccessForApiKey(apiKeyID, inputTokens, outputTokens, credits, model)
+		h.recordSuccessForApiKey(apiKeyID, inputTokens, outputTokens, credits, model, account, "claude", startedAt)
 		h.pool.RecordSuccess(account.ID)
 		h.pool.RecordLatency(account.ID, float64(time.Since(tr.startedAt).Milliseconds()))
 		h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
@@ -2718,6 +3140,7 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayl
 		tr.noteResponseShape(stopReason, model, len(toolUses))
 		tr.noteResponseText(finalContent)
 		h.emitTrace(tr, outcomeSuccess, http.StatusOK)
+		logSuspiciousReq("claude", model, inputTokens, outputTokens, len(toolUses) > 0)
 
 		responseThinkingContent := rawThinkingContent
 		includeEmptyThinkingBlock := thinking && thinkingOpts.OmitDisplay && rawThinkingContent != ""
@@ -2753,15 +3176,14 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayl
 	}
 
 	if lastErr == nil {
+		h.recordFailureForApiKey(apiKeyID, "claude", model, 503, "No available accounts", startedAt)
 		h.sendClaudeError(w, 503, "api_error", "No available accounts")
 		return
 	}
 
-	// Preserve the upstream status (429/402 stay themselves rather than
-	// flattening to 500) and carry Retry-After through to the client.
 	status := statusForUpstreamError(lastErr)
-	h.emitTrace(tr, outcomeError, status)
 	applyRetryAfterHeader(w, lastErr)
+	h.recordFailureForApiKey(apiKeyID, "claude", model, status, lastErr.Error(), startedAt)
 	h.sendClaudeError(w, status, "api_error", lastErr.Error())
 }
 
@@ -2775,6 +3197,68 @@ func (h *Handler) sendClaudeError(w http.ResponseWriter, status int, errType, me
 			"message": message,
 		},
 	})
+}
+
+// sendOpenAINotice returns the limit-notice text as a normal (HTTP 200) assistant reply
+// in OpenAI chat-completions shape. No upstream call, no billing.
+func (h *Handler) sendOpenAINotice(w http.ResponseWriter, model string, stream bool, msg string) {
+	outTok := noticeOutputTokens(msg)
+	if !stream {
+		thinkingFormat := config.GetThinkingConfig().OpenAIFormat
+		resp := KiroToOpenAIResponseWithReasoning(msg, "", nil, 1, outTok, model, thinkingFormat)
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		json.NewEncoder(w).Encode(resp)
+		return
+	}
+
+	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		thinkingFormat := config.GetThinkingConfig().OpenAIFormat
+		resp := KiroToOpenAIResponseWithReasoning(msg, "", nil, 1, outTok, model, thinkingFormat)
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		json.NewEncoder(w).Encode(resp)
+		return
+	}
+
+	chatID := "chatcmpl-" + uuid.New().String()
+	created := time.Now().Unix()
+	deltaChunk := map[string]interface{}{
+		"id":      chatID,
+		"object":  "chat.completion.chunk",
+		"created": created,
+		"model":   model,
+		"choices": []map[string]interface{}{{
+			"index":         0,
+			"delta":         map[string]string{"content": msg},
+			"finish_reason": nil,
+		}},
+	}
+	data, _ := json.Marshal(deltaChunk)
+	fmt.Fprintf(w, "data: %s\n\n", string(data))
+
+	finalChunk := map[string]interface{}{
+		"id":      chatID,
+		"object":  "chat.completion.chunk",
+		"created": created,
+		"model":   model,
+		"choices": []map[string]interface{}{{
+			"index":         0,
+			"delta":         map[string]interface{}{},
+			"finish_reason": "stop",
+		}},
+		"usage": map[string]int{
+			"prompt_tokens":     1,
+			"completion_tokens": outTok,
+			"total_tokens":      1 + outTok,
+		},
+	}
+	data, _ = json.Marshal(finalChunk)
+	fmt.Fprintf(w, "data: %s\n\n", string(data))
+	fmt.Fprintf(w, "data: [DONE]\n\n")
+	flusher.Flush()
 }
 
 // handleOpenAIChat OpenAI API 处理
@@ -2804,15 +3288,23 @@ func (h *Handler) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Valid-but-blocked key: render the limit-notice as a normal assistant reply.
+	if limitNoticeRequested(r.Context()) {
+		h.sendOpenAINotice(w, req.Model, req.Stream, config.GetLimitNoticeMessage())
+		return
+	}
+
+	apiKeyID := apiKeyIDFromContext(r.Context())
+
 	// 解析模型和 thinking 模式
 	thinkingCfg := config.GetThinkingConfig()
 	actualModel, thinking := ParseModelAndThinking(req.Model, thinkingCfg.Suffix)
-	req.Model = actualModel
+	// Apply global/per-key model override (ForceModel > per-key Model > client model).
+	req.Model = applyModelOverride(actualModel, apiKeyID, thinkingCfg.Suffix)
 	estimatedInputTokens := estimateOpenAIRequestInputTokens(&req)
 
 	kiroPayload := OpenAIToKiro(&req, thinking)
 
-	apiKeyID := apiKeyIDFromContext(r.Context())
 	// forwarded marks a request that already passed through one Kiro-Go pool, so a
 	// custom_api account cannot add another hop (loop guard, see forwardToUpstream).
 	forwarded := r.Header.Get(forwardHeader) != ""
@@ -2838,7 +3330,8 @@ func (h *Handler) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
 				// cached response's usage to the key so cache hits cannot bypass
 				// token/credit accounting or the RPM/TPM windows.
 				in, out := usageFromCachedOpenAIBody(cached)
-				h.recordSuccessForApiKey(apiKeyID, in, out, 0, req.Model)
+				// See the Claude cache-hit site: nil account, ~0 duration.
+				h.recordSuccessForApiKey(apiKeyID, in, out, 0, req.Model, nil, "openai", time.Now())
 				return
 			}
 		}
@@ -2870,13 +3363,14 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 	thinkingFormat := config.GetThinkingConfig().OpenAIFormat
 
 	chatID := "chatcmpl-" + uuid.New().String()
+	startedAt := time.Now()
 	excluded := make(map[string]bool)
 	var lastErr error
 	// The trace recorder owns request-level timing from here on.
 	tr := newTraceRecorder("openai", model, true, apiKeyID)
 
 	for attempt := 0; attempt < maxAccountRetryAttempts; attempt++ {
-		account := h.pool.GetNextForModelWithApiKey(model, excluded, apiKeyID)
+		account := h.nextAccountForKey(apiKeyID, model, excluded)
 		if account == nil {
 			break
 		}
@@ -3235,14 +3729,16 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 			if !responseStarted {
 				continue
 			}
-			h.emitTrace(tr, outcomeError, statusForUpstreamError(err))
-			// Stream already started: cannot retry or send a JSON error. Returning
-			// here simply stopped writing, so a client that had already received
-			// content saw the connection end with no error payload, no
-			// finish_reason, and no [DONE] sentinel: the partial answer looked like
-			// a COMPLETE one. Emit an explicit error chunk, a finish_reason, and
-			// [DONE] so the failure is unambiguous (mirrors handleClaudeStream's
-			// error SSE and handleResponsesStream's response.failed).
+			h.recordFailureForApiKey(apiKeyID, "openai", model, 0, err.Error(), startedAt)
+			// MERGE POLICY NOTE (fork ↔ upstream v1.1.5): the fork's client-facing
+			// terminator is restored here. The merge kept only the bookkeeping call
+			// above and then `return`ed, which is the exact defect the fork had
+			// already fixed: the stream simply stopped writing, so a client that had
+			// already received content saw the connection end with no error payload,
+			// no finish_reason and no [DONE] sentinel — a partial answer that looked
+			// COMPLETE. Emit an explicit error chunk, a finish_reason and [DONE] so
+			// the failure is unambiguous (mirrors handleClaudeStream's error SSE and
+			// handleResponsesStream's response.failed).
 			errChunk := map[string]interface{}{
 				"id":      chatID,
 				"object":  "chat.completion.chunk",
@@ -3293,10 +3789,12 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 			outputTokens += estimateApproxTokens(tc.Function.Arguments)
 		}
 
-		h.recordSuccessForApiKey(apiKeyID, inputTokens, outputTokens, credits, model)
+		h.recordSuccessForApiKey(apiKeyID, inputTokens, outputTokens, credits, model, account, "openai", startedAt)
 		h.pool.RecordSuccess(account.ID)
 		h.pool.RecordLatency(account.ID, float64(time.Since(tr.startedAt).Milliseconds()))
 		h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
+		logSuspiciousReq("openai", model, inputTokens, outputTokens, len(toolCalls) > 0)
+
 		finishReason := "stop"
 		if len(toolCalls) > 0 {
 			finishReason = "tool_calls"
@@ -3334,23 +3832,22 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 		return
 	}
 
-	// Preserve the upstream status (429/402 stay themselves rather than
-	// flattening to 500) and carry Retry-After through to the client.
+	h.recordFailure()
 	status := statusForUpstreamError(lastErr)
-	h.emitTrace(tr, outcomeError, status)
 	applyRetryAfterHeader(w, lastErr)
 	h.sendOpenAIError(w, status, errorTypeForOpenAIStatus(status), lastErr.Error())
 }
 
 // handleOpenAINonStream OpenAI 非流式响应
 func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, payload *KiroPayload, model string, thinking bool, estimatedInputTokens int, apiKeyID string, rawBody []byte, forwarded bool) {
+	startedAt := time.Now()
 	excluded := make(map[string]bool)
 	var lastErr error
 	// The trace recorder owns request-level timing from here on.
 	tr := newTraceRecorder("openai", model, false, apiKeyID)
 
 	for attempt := 0; attempt < maxAccountRetryAttempts; attempt++ {
-		account := h.pool.GetNextForModelWithApiKey(model, excluded, apiKeyID)
+		account := h.nextAccountForKey(apiKeyID, model, excluded)
 		if account == nil {
 			break
 		}
@@ -3463,7 +3960,7 @@ func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, payload *KiroPayl
 		}
 		outputTokens = estimateOpenAIOutputTokens(finalContent, reasoningContent, toolUses)
 
-		h.recordSuccessForApiKey(apiKeyID, inputTokens, outputTokens, credits, model)
+		h.recordSuccessForApiKey(apiKeyID, inputTokens, outputTokens, credits, model, account, "openai", startedAt)
 		h.pool.RecordSuccess(account.ID)
 		h.pool.RecordLatency(account.ID, float64(time.Since(tr.startedAt).Milliseconds()))
 		h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
@@ -3475,6 +3972,7 @@ func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, payload *KiroPayl
 		tr.noteResponseShape(finishReason, model, len(toolUses))
 		tr.noteResponseText(finalContent)
 		h.emitTrace(tr, outcomeSuccess, http.StatusOK)
+		logSuspiciousReq("openai", model, inputTokens, outputTokens, len(toolUses) > 0)
 
 		thinkingFormat := config.GetThinkingConfig().OpenAIFormat
 		resp := KiroToOpenAIResponseWithReasoning(finalContent, reasoningContent, toolUses, inputTokens, outputTokens, model, thinkingFormat)
@@ -3484,15 +3982,14 @@ func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, payload *KiroPayl
 	}
 
 	if lastErr == nil {
+		h.recordFailureForApiKey(apiKeyID, "openai", model, 503, "No available accounts", startedAt)
 		h.sendOpenAIError(w, 503, "server_error", "No available accounts")
 		return
 	}
 
-	// Preserve the upstream status (429/402 stay themselves rather than
-	// flattening to 500) and carry Retry-After through to the client.
 	status := statusForUpstreamError(lastErr)
-	h.emitTrace(tr, outcomeError, status)
 	applyRetryAfterHeader(w, lastErr)
+	h.recordFailureForApiKey(apiKeyID, "openai", model, status, lastErr.Error(), startedAt)
 	h.sendOpenAIError(w, status, errorTypeForOpenAIStatus(status), lastErr.Error())
 }
 
@@ -3525,8 +4022,9 @@ func (h *Handler) refreshAccountToken(account *config.Account, force bool) (bool
 		return false, fmt.Errorf("account is required for token refresh")
 	}
 
-	h.tokenRefreshMu.Lock()
-	defer h.tokenRefreshMu.Unlock()
+	mu := h.tokenRefreshLock(account.ID)
+	mu.Lock()
+	defer mu.Unlock()
 
 	var latest *config.Account
 	accounts := config.GetAccounts()
@@ -3680,60 +4178,150 @@ func (h *Handler) ensureValidToken(account *config.Account) error {
 
 // ==================== 管理 API ====================
 
-func (h *Handler) handleAdminAPI(w http.ResponseWriter, r *http.Request) {
-	// 验证密码
+// passwordMatches compares a supplied admin password against the configured one in
+// constant time so the highest-value secret is not exposed to a byte-by-byte timing
+// side-channel (matches the API-key path).
+func passwordMatches(supplied string) bool {
+	return subtle.ConstantTimeCompare([]byte(supplied), []byte(config.GetPassword())) == 1
+}
+
+// handleAdminLogin verifies the admin password and, on success, mints an opaque
+// session token delivered in an HttpOnly cookie. The password is accepted from the
+// JSON body ({"password","remember"}) or the X-Admin-Password header; it is never
+// persisted anywhere client-side. Brute-force attempts are throttled per IP.
+func (h *Handler) handleAdminLogin(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	if r.Method != http.MethodPost {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Method Not Allowed"})
+		return
+	}
+
+	ip := h.resolveClientIP(r)
+	if locked, retryAfter := h.adminGuard.locked(ip); locked {
+		w.Header().Set("Retry-After", strconv.Itoa(int(retryAfter.Seconds())+1))
+		w.WriteHeader(http.StatusTooManyRequests)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Too many failed attempts, try again later"})
+		return
+	}
+
 	password := r.Header.Get("X-Admin-Password")
-	if password == "" {
-		cookie, _ := r.Cookie("admin_password")
-		if cookie != nil {
-			password = cookie.Value
+	remember := r.URL.Query().Get("remember") == "1"
+	if password == "" && r.Body != nil {
+		var body struct {
+			Password string `json:"password"`
+			Remember bool   `json:"remember"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err == nil {
+			password = body.Password
+			remember = remember || body.Remember
 		}
 	}
 
-	// Fail CLOSED when no admin password is configured.
+	if !passwordMatches(password) {
+		h.adminGuard.recordFailure(ip)
+		w.WriteHeader(http.StatusUnauthorized)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Unauthorized"})
+		return
+	}
+	h.adminGuard.recordSuccess(ip)
+
+	if h.adminSessions == nil {
+		// No session store (should not happen in production) — succeed without a
+		// cookie so header-based clients still work.
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]bool{"success": true})
+		return
+	}
+	token, err := h.adminSessions.mint()
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(map[string]string{"error": "could not create session"})
+		return
+	}
+	h.setAdminSessionCookie(w, r, token, remember)
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(map[string]bool{"success": true})
+}
+
+// handleAdminLogout revokes the caller's session (if any) and clears the cookie.
+func (h *Handler) handleAdminLogout(w http.ResponseWriter, r *http.Request) {
+	if h.adminSessions != nil {
+		if c, err := r.Cookie(adminSessionCookieName); err == nil {
+			h.adminSessions.revoke(c.Value)
+		}
+	}
+	h.clearAdminSessionCookie(w, r)
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(map[string]bool{"success": true})
+}
+
+// adminAuthorized reports whether a request may access the admin API. A request is
+// authorized by EITHER a valid opaque session cookie (the browser flow — the raw
+// password is never stored client-side) OR a correct X-Admin-Password header (for
+// curl / programmatic clients). The legacy plaintext-password cookie is no longer
+// accepted (M5). suppliedPassword returns any header password so the caller can
+// decide whether a rejection counts as a brute-force attempt.
+func (h *Handler) adminAuthorized(r *http.Request) (ok bool, suppliedPassword string) {
+	if h.adminSessions != nil {
+		if c, err := r.Cookie(adminSessionCookieName); err == nil && h.adminSessions.valid(c.Value) {
+			return true, ""
+		}
+	}
+	pw := r.Header.Get("X-Admin-Password")
+	if pw != "" {
+		return passwordMatches(pw), pw
+	}
+	return false, ""
+}
+
+func (h *Handler) handleAdminAPI(w http.ResponseWriter, r *http.Request) {
+	// MERGE POLICY NOTE (fork ↔ upstream v1.1.5): union of TWO independent
+	// brute-force throttles, both kept deliberately.
 	//
-	// The check used to be a bare `password != config.GetPassword()` with no
-	// non-empty guard on the configured side, so a blank cfg.Password made
-	// "" == "" succeed and opened every /admin/api/* route to an unauthenticated
-	// caller — including /config/export (raw config.json with refresh tokens and
-	// ksk_ keys) and /export (full credential export). The admin UI cannot blank
-	// the password, but config.SetPassword is unguarded and a hand-edited or
-	// migrated config.json with "password": "" loads verbatim, so this was a
-	// latent fail-open on operator-supplied config.
+	//   - adminGuard (upstream) is keyed on resolveClientIP, which honours the
+	//     configured trusted-proxy chain, and also gates /admin/login.
+	//   - adminAuthThrottle (the fork's A4) is keyed on RemoteAddr ONLY and is
+	//     SHARED with authenticateAdminKey, so an attacker cannot double their
+	//     guess budget by alternating the two admin surfaces.
 	//
-	// The API-key path already fails closed in exactly this situation (see
-	// authenticate in auth.go: "Auth required but nothing configured → fail
-	// closed"); this now matches it.
-	// A4: a locked-out source is refused before the secret is compared at all,
-	// so crossing the threshold yields no information about the password.
-	// Checked after the header/cookie read but before GetPassword so the
-	// throttle applies even on a deployment with no password configured.
+	// They are not interchangeable: dropping A4 breaks the shared-budget property
+	// (TestAdminLockoutIsSharedAcrossBothGates drives this exact function), and
+	// dropping adminGuard leaves /admin/login unthrottled. Both are nil-safe, so
+	// the bare &Handler{...} literals in the test suite keep working.
 	adminIP := adminAuthClientIP(r)
 	if allowed, retryAfter := h.adminAuthThrottle.Allow(adminIP, time.Now()); !allowed {
 		rejectAdminAuthThrottled(w, retryAfter)
 		return
 	}
 
-	expected := config.GetPassword()
-	if expected == "" {
-		h.adminAuthThrottle.RecordFailure(adminIP, time.Now())
-		w.WriteHeader(401)
-		json.NewEncoder(w).Encode(map[string]string{
-			"error": "Admin access is not available: no admin password is configured",
-		})
+	// Brute-force throttle: reject early when this client IP is currently locked out
+	// from too many wrong password attempts.
+	ip := h.resolveClientIP(r)
+	if locked, retryAfter := h.adminGuard.locked(ip); locked {
+		w.Header().Set("Retry-After", strconv.Itoa(int(retryAfter.Seconds())+1))
+		w.WriteHeader(http.StatusTooManyRequests)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Too many failed attempts, try again later"})
 		return
 	}
 
-	// Constant-time comparison so an unauthenticated endpoint does not leak the
-	// password prefix through response timing. Constant time removes the timing
-	// oracle; the throttle above is what removes the unlimited guess budget.
-	if subtle.ConstantTimeCompare([]byte(password), []byte(expected)) != 1 {
-		h.adminAuthThrottle.RecordFailure(adminIP, time.Now())
+	authorized, suppliedPassword := h.adminAuthorized(r)
+	if !authorized {
+		// Only a WRONG password counts as a brute-force attempt; a missing or stale
+		// session cookie does not (the frontend simply redirects to the login page).
+		if suppliedPassword != "" {
+			h.adminGuard.recordFailure(ip)
+			h.adminAuthThrottle.RecordFailure(adminIP, time.Now())
+		}
 		w.WriteHeader(401)
 		json.NewEncoder(w).Encode(map[string]string{"error": "Unauthorized"})
 		return
 	}
 	h.adminAuthThrottle.RecordSuccess(adminIP)
+	if suppliedPassword != "" {
+		h.adminGuard.recordSuccess(ip)
+	}
 
 	path := strings.TrimPrefix(r.URL.Path, "/admin/api")
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
@@ -3862,6 +4450,18 @@ func (h *Handler) handleAdminAPI(w http.ResponseWriter, r *http.Request) {
 		h.apiPreviewIdeCache(w, r)
 	case path == "/auth/import-ide-cache" && r.Method == "POST":
 		h.apiImportIdeCache(w, r)
+	case path == "/auth/local-cache/scan" && r.Method == "GET":
+		h.apiScanLocalCache(w, r)
+	case path == "/auth/local-cache/import" && r.Method == "POST":
+		h.apiImportLocalCache(w, r)
+	case path == "/auth/apikeys-batch" && r.Method == "POST":
+		h.apiImportApiKeys(w, r)
+	case path == "/auth/kiro-sso/start" && r.Method == "POST":
+		h.apiStartKiroSso(w, r)
+	case path == "/auth/kiro-sso/poll" && r.Method == "POST":
+		h.apiPollKiroSso(w, r)
+	case path == "/auth/kiro-sso/cancel" && r.Method == "POST":
+		h.apiCancelKiroSso(w, r)
 	case path == "/status" && r.Method == "GET":
 		h.apiGetStatus(w, r)
 	case path == "/settings" && r.Method == "GET":
@@ -3896,6 +4496,20 @@ func (h *Handler) handleAdminAPI(w http.ResponseWriter, r *http.Request) {
 		h.apiGetTraceStorage(w, r)
 	case strings.HasPrefix(path, "/logs/") && r.Method == "GET":
 		h.apiGetTraceDetail(w, r, strings.TrimPrefix(path, "/logs/"))
+	case path == "/request-logs" && r.Method == "GET":
+		h.apiGetRequestLogs(w, r)
+	case path == "/request-logs" && r.Method == "DELETE":
+		h.apiClearRequestLogs(w, r)
+	case path == "/usage-summary" && r.Method == "GET":
+		h.apiGetUsageSummary(w, r)
+	case path == "/logs" && r.Method == "GET":
+		h.apiGetLogs(w, r)
+	case path == "/logs/stream" && r.Method == "GET":
+		h.apiStreamLogs(w, r)
+	case path == "/logs/level" && r.Method == "GET":
+		h.apiGetLogLevel(w, r)
+	case path == "/logs/level" && r.Method == "POST":
+		h.apiSetLogLevel(w, r)
 	case path == "/generate-machine-id" && r.Method == "GET":
 		h.apiGenerateMachineId(w, r)
 	case path == "/thinking" && r.Method == "GET":
@@ -3910,6 +4524,16 @@ func (h *Handler) handleAdminAPI(w http.ResponseWriter, r *http.Request) {
 		h.apiGetProxy(w, r)
 	case path == "/proxy" && r.Method == "POST":
 		h.apiUpdateProxy(w, r)
+	case path == "/proxy/import" && r.Method == "POST":
+		h.apiImportProxies(w, r)
+	case path == "/proxy/pool" && r.Method == "GET":
+		h.apiGetProxyPool(w, r)
+	case path == "/proxy/pool" && r.Method == "POST":
+		h.apiAddProxyPool(w, r)
+	case path == "/proxy/pool" && r.Method == "DELETE":
+		h.apiRemoveProxyPool(w, r)
+	case path == "/proxy/pool/toggle" && r.Method == "POST":
+		h.apiToggleProxyPool(w, r)
 	case path == "/prompt-filter" && r.Method == "GET":
 		h.apiGetPromptFilter(w, r)
 	case path == "/prompt-filter" && r.Method == "POST":
@@ -3922,9 +4546,18 @@ func (h *Handler) handleAdminAPI(w http.ResponseWriter, r *http.Request) {
 		h.apiListApiKeys(w, r)
 	case path == "/api-keys" && r.Method == "POST":
 		h.apiCreateApiKey(w, r)
+	case path == "/api-keys/bulk" && r.Method == "POST":
+		h.apiBulkCreateApiKeys(w, r)
+	case path == "/api-keys/bulk" && r.Method == "DELETE":
+		h.apiBulkDeleteApiKeys(w, r)
+	case path == "/api-keys/export" && r.Method == "POST":
+		h.apiExportApiKeys(w, r)
 	case strings.HasPrefix(path, "/api-keys/") && strings.HasSuffix(path, "/reset-usage") && r.Method == "POST":
 		id := strings.TrimSuffix(strings.TrimPrefix(path, "/api-keys/"), "/reset-usage")
 		h.apiResetApiKeyUsage(w, r, id)
+	case strings.HasPrefix(path, "/api-keys/") && strings.HasSuffix(path, "/reset-all") && r.Method == "POST":
+		id := strings.TrimSuffix(strings.TrimPrefix(path, "/api-keys/"), "/reset-all")
+		h.apiResetApiKeyUsageAll(w, r, id)
 	case strings.HasPrefix(path, "/api-keys/") && r.Method == "GET":
 		h.apiGetApiKey(w, r, strings.TrimPrefix(path, "/api-keys/"))
 	case strings.HasPrefix(path, "/api-keys/") && r.Method == "PUT":
@@ -4354,6 +4987,21 @@ func (h *Handler) apiAddAccount(w http.ResponseWriter, r *http.Request) {
 		account.RegionOverride = normalized
 	}
 
+	// Handle API-key credential creation
+	if account.KiroApiKey != "" || strings.EqualFold(account.AuthMethod, "api_key") || strings.EqualFold(account.AuthMethod, "apikey") {
+		// Reject empty API key
+		if account.KiroApiKey == "" {
+			w.WriteHeader(400)
+			json.NewEncoder(w).Encode(map[string]string{"error": "kiroApiKey is required"})
+			return
+		}
+		// Normalize authMethod and set expiry
+		account.AuthMethod = "api_key"
+		account.ExpiresAt = 0
+		account.AccessToken = account.KiroApiKey // Set accessToken to kiroApiKey for pool compatibility
+		// Don't call RefreshToken for API-key accounts
+	}
+
 	if err := config.AddAccount(account); err != nil {
 		w.WriteHeader(500)
 		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
@@ -4361,13 +5009,14 @@ func (h *Handler) apiAddAccount(w http.ResponseWriter, r *http.Request) {
 	}
 
 	h.pool.Reload()
-	// 新账号若已启用且有 token，立即拉取并缓存模型列表
-	if account.Enabled && account.HasUpstreamCredential() {
-		go func(acc config.Account) {
+	// 新账号若已启用且有 token（或是 API-key 账号），立即拉取并缓存模型列表
+	if account.Enabled && (account.AccessToken != "" || account.IsApiKeyCredential()) {
+		acc := account
+		safeGo(func() {
 			if err := h.fetchAndCacheAccountModels(&acc); err != nil {
 				logger.Warnf("[ModelsCache] Auto-refresh failed for new account %s: %v", acc.Email, err)
 			}
-		}(account)
+		})
 	}
 	json.NewEncoder(w).Encode(map[string]interface{}{"success": true, "id": account.ID})
 }
@@ -4621,12 +5270,23 @@ func (h *Handler) apiUpdateAccount(w http.ResponseWriter, r *http.Request, id st
 
 	h.pool.Reload()
 	// 账号从禁用→启用时，自动拉取并缓存模型列表；或区域覆盖变更后重新拉取。
+	//
+	// MERGE POLICY NOTE (fork ↔ upstream v1.1.5): the fork's CONDITION is kept and
+	// upstream's safeGo body is kept. Both parts matter:
+	//   - regionOverrideChanged is the reason this branch re-fetches at all after a
+	//     region pin moves; without it the account keeps serving the stale model
+	//     list from the OLD region (and the assignments above become dead code).
+	//   - HasUpstreamCredential() replaces AccessToken != "", which only recognised
+	//     OAuth accounts — an api_key / Bedrock account never re-listed its models.
+	//   - safeGo (not a bare `go func`) contains a panic in the refresh instead of
+	//     taking the whole process down.
 	if existing.Enabled && existing.HasUpstreamCredential() && ((!oldEnabled) || regionOverrideChanged) {
-		go func(acc config.Account) {
+		acc := *existing
+		safeGo(func() {
 			if err := h.fetchAndCacheAccountModels(&acc); err != nil {
 				logger.Warnf("[ModelsCache] Auto-refresh failed for account %s: %v", acc.Email, err)
 			}
-		}(*existing)
+		})
 	}
 	json.NewEncoder(w).Encode(map[string]bool{"success": true})
 }
@@ -4764,12 +5424,13 @@ func (h *Handler) apiBatchAccounts(w http.ResponseWriter, r *http.Request) {
 		h.pool.Reload()
 		// 为本次新启用的账号异步拉取模型缓存
 		for _, acc := range toRefreshModels {
-			go func(a config.Account) {
+			a := acc
+			safeGo(func() {
 				a.Enabled = true
 				if err := h.fetchAndCacheAccountModels(&a); err != nil {
 					logger.Warnf("[ModelsCache] Auto-refresh failed for batch-enabled account %s: %v", a.Email, err)
 				}
-			}(acc)
+			})
 		}
 		json.NewEncoder(w).Encode(map[string]interface{}{"success": true, "count": len(req.IDs)})
 
@@ -5932,8 +6593,32 @@ func (h *Handler) finalizeKiroSsoAccount(w http.ResponseWriter, result *auth.Kir
 		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
 		return
 	}
+
 	h.pool.Reload()
-	writeKiroSsoCompleted(w, account)
+
+	// Resolve profile ARN + fetch account info in background.
+	// external_idp accounts: resolve profileArn via ListAvailableProfiles (with
+	// TokenType: EXTERNAL_IDP header) first — this is the correct health-check.
+	// GetUsageLimits is optional metadata; failure does NOT ban the account.
+	safeGo(func() {
+		// Step 1: Resolve profile ARN (required for runtime generate endpoint)
+		if _, err := ResolveProfileArn(&account); err != nil {
+			logger.Warnf("[apiPollKiroSso] Profile ARN resolve failed for external_idp account %s: %v", account.Email, err)
+		}
+		// Step 2: Usage/subscription info (best-effort, non-fatal)
+		if _, err := RefreshAccountInfo(&account); err != nil {
+			logger.Warnf("[apiPollKiroSso] Account info refresh failed for external_idp account %s: %v", account.Email, err)
+		}
+		h.fetchAndCacheAccountModels(&account)
+	})
+
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"status": "completed",
+		"account": map[string]interface{}{
+			"id":    account.ID,
+			"email": account.Email,
+		},
+	})
 }
 
 func (h *Handler) apiImportSsoToken(w http.ResponseWriter, r *http.Request) {
@@ -6087,6 +6772,161 @@ func (h *Handler) apiImportCredentials(w http.ResponseWriter, r *http.Request) {
 			"id":    account.ID,
 			"email": account.Email,
 		},
+	})
+}
+
+// apiScanLocalCache handles GET /admin/api/auth/local-cache/scan.
+//
+// It scans the local AWS SSO cache (~/.aws/sso/cache) for Kiro IDE credentials
+// and returns a non-secret summary of each discovered identity so the UI can
+// present them for one-click import. Secrets are never included in the response;
+// each entry carries a fingerprint used to reference it in the import call.
+//
+// Returns available=false (not an error) when no local cache exists, so the UI
+// can hide the feature on containerized/remote deployments.
+func (h *Handler) apiScanLocalCache(w http.ResponseWriter, r *http.Request) {
+	dir, _ := auth.LocalCacheDir()
+	creds, err := auth.ScanLocalKiroCredentials()
+	if err != nil {
+		w.WriteHeader(500)
+		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		return
+	}
+
+	type item struct {
+		Fingerprint string `json:"fingerprint"`
+		SourceFile  string `json:"sourceFile"`
+		AuthMethod  string `json:"authMethod"`
+		Provider    string `json:"provider"`
+		Region      string `json:"region"`
+		LoginHint   string `json:"loginHint,omitempty"`
+		HasClient   bool   `json:"hasClient"`
+		Importable  bool   `json:"importable"`
+		Reason      string `json:"reason,omitempty"`
+	}
+	items := make([]item, 0, len(creds))
+	for _, c := range creds {
+		it := item{
+			Fingerprint: c.Fingerprint,
+			SourceFile:  c.SourceFile,
+			AuthMethod:  c.AuthMethod,
+			Provider:    c.Provider,
+			Region:      c.Region,
+			LoginHint:   c.LoginHint,
+			HasClient:   c.HasClient,
+			Importable:  true,
+		}
+		// IdC tokens need a client registration to refresh; flag if missing.
+		if c.AuthMethod == "idc" && !c.HasClient {
+			it.Importable = false
+			it.Reason = "missing clientId/clientSecret (client registration file not found)"
+		}
+		items = append(items, it)
+	}
+
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"success":   true,
+		"available": len(creds) > 0,
+		"cacheDir":  dir,
+		"count":     len(items),
+		"accounts":  items,
+	})
+}
+
+// apiImportLocalCache handles POST /admin/api/auth/local-cache/import.
+//
+// Body: {"fingerprints": ["tok-abcd1234", ...]} — the fingerprints returned by
+// the scan endpoint. When omitted or empty, every importable credential found
+// in the cache is imported. Each credential is run through the same OAuth import
+// path as manual credential import, so region probing and profile resolution
+// apply automatically.
+func (h *Handler) apiImportLocalCache(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Fingerprints []string `json:"fingerprints"`
+	}
+	// Body is optional; ignore decode errors and treat as "import all".
+	_ = json.NewDecoder(r.Body).Decode(&req)
+
+	creds, err := auth.ScanLocalKiroCredentials()
+	if err != nil {
+		w.WriteHeader(500)
+		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		return
+	}
+	if len(creds) == 0 {
+		w.WriteHeader(404)
+		json.NewEncoder(w).Encode(map[string]string{"error": "no local Kiro credentials found"})
+		return
+	}
+
+	want := make(map[string]bool, len(req.Fingerprints))
+	for _, f := range req.Fingerprints {
+		want[f] = true
+	}
+
+	type result struct {
+		Fingerprint string `json:"fingerprint"`
+		SourceFile  string `json:"sourceFile"`
+		Success     bool   `json:"success"`
+		AccountID   string `json:"accountId,omitempty"`
+		Email       string `json:"email,omitempty"`
+		Error       string `json:"error,omitempty"`
+	}
+	var results []result
+	imported := 0
+	for _, c := range creds {
+		if len(want) > 0 && !want[c.Fingerprint] {
+			continue
+		}
+		res := result{Fingerprint: c.Fingerprint, SourceFile: c.SourceFile}
+
+		if c.AuthMethod == "idc" && !c.HasClient {
+			res.Error = "missing clientId/clientSecret"
+			results = append(results, res)
+			continue
+		}
+
+		// MERGE POLICY NOTE (fork ↔ upstream v1.1.5): upstream called its own
+		// importOAuthCredential(credentialImportPayload{...}) here. The fork had
+		// already converged EVERY credential-import entry point onto importOne, so
+		// this route is rewired to it rather than reintroducing a second import
+		// core that would drift (importOne owns the pre-refresh fingerprint, the
+		// duplicate-id / duplicate-credential pre-checks that avoid burning a
+		// rotation of a live refresh token, the external_idp ARN allow-list check
+		// and the api_key branch — none of which the upstream helper had).
+		//
+		// IdPClientID and LoginHint are dropped deliberately: importCredentialRequest
+		// carries no such fields. LoginHint is a display label only, and the IdP
+		// client id is not an input to auth.RefreshToken on this path (ClientID /
+		// ClientSecret are the refresh credentials). Nothing auth-bearing is lost.
+		account, importErr := h.importOne(importCredentialRequest{
+			AccessToken:  c.AccessToken,
+			RefreshToken: c.RefreshToken,
+			ClientID:     c.ClientID,
+			ClientSecret: c.ClientSecret,
+			AuthMethod:   c.AuthMethod,
+			Provider:     c.Provider,
+			Region:       c.Region,
+			IssuerURL:    c.IssuerURL,
+			Scopes:       c.Scopes,
+		})
+		if importErr != nil {
+			res.Error = importErr.Error()
+			results = append(results, res)
+			continue
+		}
+		res.Success = true
+		res.AccountID = account.ID
+		res.Email = account.Email
+		imported++
+		results = append(results, res)
+	}
+
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"success":  imported > 0,
+		"imported": imported,
+		"total":    len(results),
+		"results":  results,
 	})
 }
 
@@ -6959,6 +7799,11 @@ func (h *Handler) apiGetSettings(w http.ResponseWriter, r *http.Request) {
 		"traceCaptureAcknowledgeRisk": config.GetTraceCaptureAcknowledgeRisk(),
 		"traceRetentionHours":         config.GetTraceRetentionHours(),
 		"traceMaxBodyBytes":           config.GetTraceMaxBodyBytes(),
+		"maxPayloadBytes":             config.GetMaxPayloadBytes(),
+		"publicBaseURL":               config.GetPublicBaseURL(),
+		"limitNoticeMessage":          config.GetLimitNoticeMessage(),
+		"forceModel":                  config.GetForceModel(),
+		"identityModel":               config.GetIdentityModel(),
 	})
 }
 
@@ -7065,6 +7910,11 @@ func (h *Handler) apiUpdateSettings(w http.ResponseWriter, r *http.Request) {
 		TraceCaptureAcknowledgeRisk *bool   `json:"traceCaptureAcknowledgeRisk,omitempty"`
 		TraceRetentionHours         *int    `json:"traceRetentionHours,omitempty"`
 		TraceMaxBodyBytes           *int    `json:"traceMaxBodyBytes,omitempty"`
+		MaxPayloadBytes             *int    `json:"maxPayloadBytes,omitempty"`
+		PublicBaseURL               *string `json:"publicBaseURL,omitempty"`
+		LimitNoticeMessage          *string `json:"limitNoticeMessage,omitempty"`
+		ForceModel                  *string `json:"forceModel,omitempty"`
+		IdentityModel               *string `json:"identityModel,omitempty"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		w.WriteHeader(400)
@@ -7093,6 +7943,13 @@ func (h *Handler) apiUpdateSettings(w http.ResponseWriter, r *http.Request) {
 	// reads the toggle live on each selection.
 	if req.QuotaAwareRouting != nil {
 		if err := config.UpdateQuotaAwareRouting(*req.QuotaAwareRouting); err != nil {
+		}
+	}
+
+	// maxPayloadBytes is read per-request by truncatePayloadToLimit, so the new
+	// value takes effect on the next request — no restart or pool reload needed.
+	if req.MaxPayloadBytes != nil {
+		if err := config.UpdateMaxPayloadBytes(*req.MaxPayloadBytes); err != nil {
 			w.WriteHeader(500)
 			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
 			return
@@ -7104,6 +7961,11 @@ func (h *Handler) apiUpdateSettings(w http.ResponseWriter, r *http.Request) {
 	// explicit recheck).
 	if req.ExternalUsageAutoDisable != nil {
 		if err := config.UpdateExternalUsageAutoDisable(*req.ExternalUsageAutoDisable); err != nil {
+		}
+	}
+
+	if req.PublicBaseURL != nil {
+		if err := config.UpdatePublicBaseURL(*req.PublicBaseURL); err != nil {
 			w.WriteHeader(500)
 			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
 			return
@@ -7120,6 +7982,11 @@ func (h *Handler) apiUpdateSettings(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if err := config.UpdateWebhookURL(url); err != nil {
+		}
+	}
+
+	if req.LimitNoticeMessage != nil {
+		if err := config.SetLimitNoticeMessage(strings.TrimSpace(*req.LimitNoticeMessage)); err != nil {
 			w.WriteHeader(500)
 			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
 			return
@@ -7129,6 +7996,11 @@ func (h *Handler) apiUpdateSettings(w http.ResponseWriter, r *http.Request) {
 	// F9: Prometheus /metrics toggle (public, unauthenticated when enabled).
 	if req.MetricsEnabled != nil {
 		if err := config.UpdateMetricsEnabled(*req.MetricsEnabled); err != nil {
+		}
+	}
+
+	if req.ForceModel != nil {
+		if err := config.SetForceModel(strings.TrimSpace(*req.ForceModel)); err != nil {
 			w.WriteHeader(500)
 			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
 			return
@@ -7143,6 +8015,11 @@ func (h *Handler) apiUpdateSettings(w http.ResponseWriter, r *http.Request) {
 			ttl = *req.ResponseCacheTTLSeconds
 		}
 		if err := config.UpdateResponseCacheConfig(*req.ResponseCacheEnabled, ttl); err != nil {
+		}
+	}
+
+	if req.IdentityModel != nil {
+		if err := config.SetIdentityModel(strings.TrimSpace(*req.IdentityModel)); err != nil {
 			w.WriteHeader(500)
 			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
 			return
@@ -7192,6 +8069,27 @@ func (h *Handler) apiUpdateSettings(w http.ResponseWriter, r *http.Request) {
 	}
 
 	json.NewEncoder(w).Encode(map[string]bool{"success": true})
+}
+
+// apiGetLogsFacets serves GET /admin/api/logs/facets: the distinct values present
+// in the retained window, so the UI can offer dropdowns instead of making an
+// operator guess substrings.
+//
+// MERGE POLICY NOTE (fork ↔ upstream v1.1.5): fork-only handler. It was lost in
+// the union (its route in handleAdminAPI survived, so the merged tree failed to
+// build), and is restored here beside the sibling trace handlers it belongs with.
+func (h *Handler) apiGetLogsFacets(w http.ResponseWriter, r *http.Request) {
+	facets := computeTraceFacets(h.getRequestLogs())
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		"success":     true,
+		"models":      facets.Models,
+		"apis":        facets.APIs,
+		"accounts":    facets.Accounts,
+		"errorTypes":  facets.ErrorTypes,
+		"outcomes":    facets.Outcomes,
+		"captureMode": config.GetTraceCaptureMode(),
+	})
 }
 
 // apiGetTraceStorage reports on-disk trace usage so an operator can see the cost
@@ -7376,23 +8274,6 @@ func (h *Handler) apiGetLogs(w http.ResponseWriter, r *http.Request) {
 		"nextCursor": page.NextCursor,
 		"hasMore":    page.HasMore,
 		"dropped":    h.traceStore.Dropped(),
-	})
-}
-
-// apiGetLogsFacets serves GET /admin/api/logs/facets: the distinct values present
-// in the retained window, so the UI can offer dropdowns instead of making an
-// operator guess substrings.
-func (h *Handler) apiGetLogsFacets(w http.ResponseWriter, r *http.Request) {
-	facets := computeTraceFacets(h.getRequestLogs())
-	w.Header().Set("Content-Type", "application/json; charset=utf-8")
-	_ = json.NewEncoder(w).Encode(map[string]interface{}{
-		"success":     true,
-		"models":      facets.Models,
-		"apis":        facets.APIs,
-		"accounts":    facets.Accounts,
-		"errorTypes":  facets.ErrorTypes,
-		"outcomes":    facets.Outcomes,
-		"captureMode": config.GetTraceCaptureMode(),
 	})
 }
 
@@ -7693,12 +8574,18 @@ func (h *Handler) apiGetAccountFull(w http.ResponseWriter, r *http.Request, id s
 		"region":       account.Region,
 		// MERGE POLICY NOTE (fork ↔ upstream v1.1.5): union of both sides' export
 		// fields. profileArn appears on both; the duplicate was dropped.
-		"regionOverride":    account.RegionOverride,
-		"profileArn":        account.ProfileArn,
-		"profilePinned":     account.ProfilePinned,
-		"tokenEndpoint":     account.TokenEndpoint,
-		"issuerUrl":         account.IssuerURL,
-		"scopes":            account.Scopes,
+		"regionOverride": account.RegionOverride,
+		"profileArn":     account.ProfileArn,
+		"profilePinned":  account.ProfilePinned,
+		"tokenEndpoint":  account.TokenEndpoint,
+		"issuerUrl":      account.IssuerURL,
+		"scopes":         account.Scopes,
+		// Upstream-only external_idp fields. The rest of upstream's side of this
+		// conflict duplicated keys already emitted above (a duplicate key in a map
+		// literal is a compile error, not a silent overwrite), so only these two
+		// genuinely new ones are kept.
+		"idpClientId":       account.IdPClientID,
+		"loginHint":         account.LoginHint,
 		"expiresAt":         account.ExpiresAt,
 		"machineId":         account.MachineId,
 		"weight":            account.Weight,
@@ -7839,13 +8726,138 @@ func (h *Handler) apiGetAccountModelsCached(w http.ResponseWriter, r *http.Reque
 
 // ==================== 静态文件服务 ====================
 
+// setWebSecurityHeaders adds anti-clickjacking and defense-in-depth headers to the
+// HTML admin panel and self-service portal (M6).
+//
+//   - X-Frame-Options: DENY and CSP frame-ancestors 'none' stop the pages from being
+//     embedded in an iframe, blocking clickjacking of a logged-in admin.
+//   - X-Content-Type-Options: nosniff prevents MIME-sniffing of served assets.
+//   - Referrer-Policy: no-referrer keeps admin URLs/keys out of Referer headers.
+//
+// The CSP intentionally does NOT lock down script-src/style-src: the panel uses inline
+// <script> blocks, ~80 inline event handlers, and a runtime Tailwind build, so a strict
+// policy would break it. It restricts the safe-to-restrict directives (framing, objects,
+// base URI). A full script/style lockdown would require reworking the frontend to use
+// nonces and external handlers.
+func setWebSecurityHeaders(w http.ResponseWriter) {
+	w.Header().Set("X-Frame-Options", "DENY")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	w.Header().Set("Referrer-Policy", "no-referrer")
+	w.Header().Set("Content-Security-Policy", "frame-ancestors 'none'; object-src 'none'; base-uri 'none'")
+}
+
 func (h *Handler) serveAdminPage(w http.ResponseWriter, r *http.Request) {
+	setWebSecurityHeaders(w)
 	http.ServeFile(w, r, "web/index.html")
 }
 
 func (h *Handler) serveStaticFile(w http.ResponseWriter, r *http.Request) {
+	setWebSecurityHeaders(w)
 	path := strings.TrimPrefix(r.URL.Path, "/admin/")
 	http.ServeFile(w, r, "web/"+path)
+}
+
+// logEntryJSON is the wire shape for a captured log line.
+type logEntryJSON struct {
+	Ts    int64  `json:"ts"`
+	Level string `json:"level"`
+	Text  string `json:"text"`
+}
+
+func toLogEntryJSON(e logger.Entry) logEntryJSON {
+	return logEntryJSON{
+		Ts:    e.Time.UnixMilli(),
+		Level: logger.LevelName(e.Level),
+		Text:  e.Text,
+	}
+}
+
+// apiStreamLogs GET /admin/api/logs/stream - Server-Sent Events stream of log lines.
+func (h *Handler) apiStreamLogs(w http.ResponseWriter, r *http.Request) {
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		w.WriteHeader(500)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Streaming not supported"})
+		return
+	}
+
+	// handleAdminAPI sets application/json; override for SSE.
+	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	w.Header().Set("X-Accel-Buffering", "no")
+
+	writeEntry := func(e logger.Entry) {
+		data, _ := json.Marshal(toLogEntryJSON(e))
+		fmt.Fprintf(w, "data: %s\n\n", data)
+	}
+
+	// Backfill retained history first, then stream live entries.
+	for _, e := range logger.History() {
+		writeEntry(e)
+	}
+	flusher.Flush()
+
+	ch, cancel := logger.Subscribe()
+	defer cancel()
+
+	ctx := r.Context()
+	ticker := time.NewTicker(25 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case e := <-ch:
+			writeEntry(e)
+			// Coalesce: drain everything already queued and write it in one
+			// batch so a burst costs a single flush (one socket write) instead
+			// of one per line.
+			for drained := true; drained; {
+				select {
+				case e2 := <-ch:
+					writeEntry(e2)
+				default:
+					drained = false
+				}
+			}
+			flusher.Flush()
+		case <-ticker.C:
+			fmt.Fprint(w, ": ping\n\n")
+			flusher.Flush()
+		}
+	}
+}
+
+// apiGetLogLevel GET /admin/api/logs/level - returns the active log level.
+func (h *Handler) apiGetLogLevel(w http.ResponseWriter, r *http.Request) {
+	json.NewEncoder(w).Encode(map[string]string{"level": logger.LevelName(logger.GetLevel())})
+}
+
+// apiSetLogLevel POST /admin/api/logs/level - changes the active log level at runtime and persists it.
+func (h *Handler) apiSetLogLevel(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Level string `json:"level"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		w.WriteHeader(400)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Invalid JSON"})
+		return
+	}
+	lvl, ok := logger.ParseLevel(req.Level)
+	if !ok {
+		w.WriteHeader(400)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Invalid level, must be: debug, info, warn, or error"})
+		return
+	}
+	logger.SetLevel(lvl)
+	if err := config.UpdateLogLevel(logger.LevelName(lvl)); err != nil {
+		w.WriteHeader(500)
+		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		return
+	}
+	json.NewEncoder(w).Encode(map[string]string{"level": logger.LevelName(lvl)})
 }
 
 // apiGetThinkingConfig 获取 thinking 配置
@@ -7969,10 +8981,17 @@ func isValidProxyScheme(u string) bool {
 // rotation pool (proxyURLs) and interval (proxyRotateMinutes). When the pool is
 // non-empty the rotator cycles it; otherwise the single proxyURL is applied.
 func (h *Handler) apiUpdateProxy(w http.ResponseWriter, r *http.Request) {
+	// MERGE POLICY NOTE (fork ↔ upstream v1.1.5): union of both request shapes.
+	// The fork sends a rotation pool (proxyURLs + proxyRotateMinutes); upstream
+	// added requireProxy. The merged struct kept only upstream's two fields while
+	// the merged BODY still validated and forwarded the pool, so the endpoint
+	// silently stopped parsing proxyURLs/proxyRotateMinutes — rotation would have
+	// been cleared on every settings save. All four fields are decoded.
 	var req struct {
 		ProxyURL           string   `json:"proxyURL"`
 		ProxyURLs          []string `json:"proxyURLs"`
 		ProxyRotateMinutes int      `json:"proxyRotateMinutes"`
+		RequireProxy       *bool    `json:"requireProxy"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		w.WriteHeader(400)
@@ -8019,6 +9038,134 @@ func (h *Handler) apiUpdateProxy(w http.ResponseWriter, r *http.Request) {
 		applyProxyConfig(req.ProxyURL)
 	}
 
+	if req.RequireProxy != nil {
+		if err := config.UpdateRequireProxy(*req.RequireProxy); err != nil {
+			w.WriteHeader(500)
+			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+	}
+
+	json.NewEncoder(w).Encode(map[string]bool{"success": true})
+}
+
+// validProxyScheme 校验代理 URL 前缀，与 apiUpdateProxy 保持一致。
+func validProxyScheme(u string) bool {
+	return strings.HasPrefix(u, "http://") ||
+		strings.HasPrefix(u, "https://") ||
+		strings.HasPrefix(u, "socks5://") ||
+		strings.HasPrefix(u, "socks5h://")
+}
+
+// apiGetProxyPool 返回共享代理池（含完整 URL，客户端负责展示脱敏）
+func (h *Handler) apiGetProxyPool(w http.ResponseWriter, r *http.Request) {
+	pool := config.GetProxyPool()
+	entries := make([]map[string]any, 0, len(pool))
+	for _, p := range pool {
+		entries = append(entries, map[string]any{
+			"url":               p.URL,
+			"healthy":           p.Healthy,
+			"failCount":         p.FailCount,
+			"lastFailAt":        p.LastFailAt,
+			"lastOkAt":          p.LastOKAt,
+			"disabledPermanent": p.DisabledPermanent,
+		})
+	}
+	json.NewEncoder(w).Encode(map[string]any{"pool": entries})
+}
+
+// apiAddProxyPool 向代理池批量添加，接受 {url} 或 {urls:[...]}
+func (h *Handler) apiAddProxyPool(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		URL  string   `json:"url"`
+		URLs []string `json:"urls"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		w.WriteHeader(400)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Invalid JSON"})
+		return
+	}
+
+	urls := req.URLs
+	if req.URL != "" {
+		urls = append(urls, req.URL)
+	}
+	if len(urls) == 0 {
+		w.WriteHeader(400)
+		json.NewEncoder(w).Encode(map[string]string{"error": "url or urls required"})
+		return
+	}
+
+	existing := make(map[string]bool)
+	for _, p := range config.GetProxyPool() {
+		existing[p.URL] = true
+	}
+
+	added, skipped := 0, 0
+	for _, u := range urls {
+		if !validProxyScheme(u) || existing[u] {
+			skipped++
+			continue
+		}
+		if err := config.AddProxyToPool(u); err != nil {
+			w.WriteHeader(500)
+			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+		existing[u] = true
+		added++
+	}
+	json.NewEncoder(w).Encode(map[string]int{
+		"added":   added,
+		"skipped": skipped,
+		"total":   len(config.GetProxyPool()),
+	})
+}
+
+// apiRemoveProxyPool 从代理池移除指定 URL
+func (h *Handler) apiRemoveProxyPool(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		URL string `json:"url"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		w.WriteHeader(400)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Invalid JSON"})
+		return
+	}
+	if req.URL == "" {
+		w.WriteHeader(400)
+		json.NewEncoder(w).Encode(map[string]string{"error": "url required"})
+		return
+	}
+	if err := config.RemoveProxyFromPool(req.URL); err != nil {
+		w.WriteHeader(500)
+		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		return
+	}
+	json.NewEncoder(w).Encode(map[string]bool{"success": true})
+}
+
+// apiToggleProxyPool 永久禁用/启用某个池化代理
+func (h *Handler) apiToggleProxyPool(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		URL      string `json:"url"`
+		Disabled bool   `json:"disabled"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		w.WriteHeader(400)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Invalid JSON"})
+		return
+	}
+	if req.URL == "" {
+		w.WriteHeader(400)
+		json.NewEncoder(w).Encode(map[string]string{"error": "url required"})
+		return
+	}
+	if err := config.SetProxyPoolDisabled(req.URL, req.Disabled); err != nil {
+		w.WriteHeader(500)
+		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		return
+	}
 	json.NewEncoder(w).Encode(map[string]bool{"success": true})
 }
 
@@ -8079,6 +9226,13 @@ func (h *Handler) apiExportAccounts(w http.ResponseWriter, r *http.Request) {
 		TokenEndpoint string `json:"tokenEndpoint,omitempty"`
 		IssuerURL     string `json:"issuerUrl,omitempty"`
 		Scopes        string `json:"scopes,omitempty"`
+		// IdPClientID / LoginHint complete the external_idp set: the IdP client id
+		// is a distinct credential from ClientID, and login_hint is what the IdP
+		// needs to route a re-auth to the right identity. Both were emitted by
+		// upstream's side of the literal below but were missing from this struct,
+		// so a restored external_idp account lost them.
+		IdPClientID string `json:"idpClientId,omitempty"`
+		LoginHint   string `json:"loginHint,omitempty"`
 	}
 
 	type ExportSubscription struct {
@@ -8200,6 +9354,14 @@ func (h *Handler) apiExportAccounts(w http.ResponseWriter, r *http.Request) {
 				TokenEndpoint: a.TokenEndpoint,
 				IssuerURL:     a.IssuerURL,
 				Scopes:        a.Scopes,
+				// Upstream's side of this conflict re-listed Region / ExpiresAt /
+				// AuthMethod / Provider / IssuerURL / Scopes, which are already set
+				// above (a duplicate field in a struct literal is a compile error).
+				// Its Region: a.Region is deliberately NOT taken: exportRegion above
+				// resolves an api_key account's real data-plane region, so taking the
+				// raw stored value would restore the account pinned to the wrong one.
+				IdPClientID: a.IdPClientID,
+				LoginHint:   a.LoginHint,
 			},
 			Subscription: ExportSubscription{
 				Type:  subType,

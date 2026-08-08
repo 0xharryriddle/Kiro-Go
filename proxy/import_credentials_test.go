@@ -79,7 +79,12 @@ func TestApiImportCredentialsRejectsWhenRefreshFails(t *testing.T) {
 
 	h := &Handler{pool: accountpool.GetPool()}
 
-	body := `{"refreshToken":"rt-broken","accessToken":"at-still-valid-elsewhere","clientId":"c","clientSecret":"s","authMethod":"idc","region":"us-east-1"}`
+	// No accessToken fallback in the payload: a failed refresh has nothing to
+	// fall back on, so the import must be rejected outright (the regression this
+	// test guards). When an accessToken IS provided, the handler intentionally
+	// tolerates the failure (see commit 63b7187) — that path is covered
+	// separately.
+	body := `{"refreshToken":"rt-broken","clientId":"c","clientSecret":"s","authMethod":"idc","region":"us-east-1"}`
 	req := httptest.NewRequest("POST", "/auth/credentials", strings.NewReader(body))
 	rec := httptest.NewRecorder()
 

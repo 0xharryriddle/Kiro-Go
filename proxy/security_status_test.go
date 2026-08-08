@@ -26,6 +26,14 @@ func TestSecurityStatusReportsDefaultPassword(t *testing.T) {
 	if err := config.Init(cfgFile); err != nil {
 		t.Fatalf("config init: %v", err)
 	}
+	// config.passwordOverride (the ADMIN_PASSWORD override) is process-global and
+	// is NOT reset by Init: Init reloads cfg from the new path but leaves the
+	// override in place, because in production the override must survive a config
+	// reload. Any sibling test that calls config.SetPassword therefore leaks its
+	// password into this one, and GetPassword returns that instead of the
+	// default — which is why this test passed alone and failed in the full suite.
+	// Clearing the override restores the fresh-process precondition asserted below.
+	config.SetPassword("")
 
 	h := &Handler{}
 	rec := httptest.NewRecorder()

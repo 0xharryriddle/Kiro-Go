@@ -23,6 +23,7 @@ import (
 	"kiro-go/pool"
 	"kiro-go/proxy"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -96,6 +97,14 @@ func main() {
 	if *hostFlag != "" {
 		config.SetHost(*hostFlag)
 	}
+	// Security guard: refuse to boot a publicly-reachable instance that still uses the
+	// built-in default admin password. A public VPS that forgets to set ADMIN_PASSWORD
+	// would otherwise expose full admin access (account tokens, key creation) to anyone.
+	// Loopback-only binds are allowed for local development.
+	if config.GetPassword() == "changeme" && !isLoopbackHost(config.GetHost()) {
+		log.Fatalf("Refusing to start: admin password is still the default on a non-loopback host (%s). "+
+			"Set the ADMIN_PASSWORD environment variable to a strong secret, or bind to 127.0.0.1.", config.GetHost())
+	}
 
 	// 初始化账号池
 	pool.GetPool()
@@ -119,6 +128,7 @@ func main() {
 		ReadHeaderTimeout: 30 * time.Second,
 		ReadTimeout:       60 * time.Second,
 		IdleTimeout:       120 * time.Second,
+		MaxHeaderBytes:    1 << 20, // 1 MiB — cap header size to blunt header-flood / slowloris.
 	}
 
 	// Graceful shutdown (round 17). Previously this was a bare ListenAndServe with
@@ -180,4 +190,15 @@ func main() {
 	// request that completed during the drain is included in the final save.
 	handler.Close()
 	logger.Infof("Shutdown complete")
+}
+
+// isLoopbackHost reports whether the configured bind host is loopback-only, in which
+// case the admin panel is not reachable from the network and the default-password
+// startup guard can be safely skipped.
+func isLoopbackHost(host string) bool {
+	if host == "localhost" {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }

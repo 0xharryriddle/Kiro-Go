@@ -5,32 +5,63 @@ session (or a reviewer) can pick it up without re-deriving anything. Every
 claim below is verified against the live tree by real command output; items I
 could not verify are labelled as such rather than asserted.
 
-Last verified: repo `harry` branch, working tree mid-merge (see §2).
+Last verified: repo `harry` branch, working tree mid-merge — see §1 (SECOND merge,
+`hian699` v1.2.8). The §1 table below was rewritten on that date; the v1.1.5 numbers
+it used to carry are preserved in §1a so the older record is not lost.
 
 ---
 
 ## 1. Verified state of the tree
 
+**This is a SECOND, DIFFERENT merge from the one the rest of this document
+describes.** §2-§3 and R1 concern upstream `v1.1.5` (`ec4ba56`), which is long since
+committed and pushed. The tree is now mid-merge again, against a different fork.
+
 | Fact | Value | How verified |
 |---|---|---|
 | Branch | `harry` | `git rev-parse --abbrev-ref HEAD` |
-| HEAD | `6158c24` (merge commit) | `git rev-parse HEAD` |
-| Merge parents | `99dda52` + `ec4ba56` (2 parents) | `git rev-list --parents -n1 HEAD` |
-| Merge in progress | NO — `.git/MERGE_HEAD` cleared | file absent |
-| Conflict markers remaining | 0 across all tracked files | grep for `^<<<<<<<`/`^>>>>>>>` |
-| Pushed to `origin/harry` | **NO** — local only | `git rev-list --count origin/harry..HEAD` |
+| HEAD | `9f0b943` (`docs: record round 17 production deployment`) | `git rev-parse HEAD` |
+| Merge in progress | **YES** — `.git/MERGE_HEAD` present | `git rev-parse MERGE_HEAD` |
+| `MERGE_HEAD` | `8a2dfc4` — *"Merge pull request #1 from itbosser/pr-to-hian699"* | `git rev-parse MERGE_HEAD`, `git log -1 --format=%s MERGE_HEAD` |
+| Incoming remote | `hian699` → `https://github.com/hian699/Kiro-Go` | `git remote -v` |
+| Merge base | `a2e3971` | `git merge-base HEAD MERGE_HEAD` |
+| Incoming commits | **48** (`HEAD..MERGE_HEAD`) | `git rev-list --count HEAD..MERGE_HEAD` |
+| Version in tree | `1.2.8` (`config/config.go:783`), `version.json` agrees | `grep`, `cat version.json` |
+| Unmerged paths | **0** | `git diff --name-only --diff-filter=U` (empty) |
+| Conflict markers remaining | **0** across all tracked files | `search_files` for `^(<{7}\|={7}\|>{7})` → 0 hits |
+| Working tree vs HEAD | 97 files changed, +18462/-1658 | `git diff HEAD --shortstat` |
+| Committed | **NO** — resolution sits in the working tree, `MERGE_HEAD` still set | `git status` |
+| Pushed to `origin/harry` | n/a — 0 ahead / 0 behind at HEAD `9f0b943` | `git rev-list --left-right --count origin/harry...HEAD` |
 | Build | clean | `go build ./...` |
-| Test suite | **826 passed, 0 failed** | `go test ./config/ ./pool/ ./auth/ ./proxy/ -count=1` |
-| `-race` | clean, 0 data races | `go test -race ./... -count=1` |
-| `go vet` / `gofmt` | clean | `go vet ./...`, `gofmt -l` |
+| Vet | clean | `go vet ./...` |
+| `gofmt -l` | clean (empty) | `gofmt -l .` |
+| Test suite | **1328 passed, 0 failed** across 6 packages | `go test ./... -count=1` |
+| `-race` | clean, 0 data races | `go test ./... -race -count=1` |
+| Top-level test funcs | **1063** — config 77, pool 91, auth 63, proxy 832 | `grep -rhoE '^func Test[A-Za-z0-9_]+\(' <pkg>/*_test.go \| sort -u \| wc -l` |
+| Source / test lines | 47,005 src / 35,786 test | `find … -exec cat {} + \| wc -l` |
+| Live container | **NOT RUNNING** — `docker ps` returns no `kiro-go` row | `docker ps --filter name=kiro-go` |
 
-**Interpretation.** The merge is complete and committed locally. It arrived as
-*resolved but unstaged* (git reported `U` for 14 paths with no conflict markers
-in any of them — an earlier session resolved them in place without `git add`);
-every path was re-verified marker-free, the full gate was re-run from the exact
-staged state, and the merge was then committed as a real two-parent merge.
+**A correction to my own reading, recorded rather than silently fixed.** I first
+reported `MERGE_HEAD` as `b3fa616` ("Add DoS guard, per-key limits, Force Model…").
+That was wrong: the terminal wrapper dropped a line from a multi-line `git log`
+block, so two separate outputs read as one. `MERGE_HEAD` is `8a2dfc4`, and
+`b3fa616` is merely the newest commit in the incoming range. Re-measured by writing
+each value to a file with an explicit `key=value` label and reading it back — the
+right technique whenever this terminal mangles multi-line output.
 
-Nothing has been pushed. `harry` is ahead of `origin/harry`.
+**Interpretation.** All conflicts are resolved in the working tree and the full gate
+is green from a cold build cache, but nothing is committed: `MERGE_HEAD` is still
+set, so this is a merge awaiting its commit, not a finished one.
+
+### 1a. Superseded — state at the v1.1.5 merge (historical)
+
+Kept so the older record survives the §1 rewrite: HEAD was `6158c24`, a real
+two-parent merge of `99dda52` + `ec4ba56`, `MERGE_HEAD` cleared, 0 conflict markers,
+**826 tests** passing, `-race`/vet/gofmt clean. It arrived *resolved but unstaged*
+(git reported `U` for 14 paths with no markers in any of them — an earlier session
+resolved them in place without `git add`); every path was re-verified marker-free and
+the gate re-run from the exact staged state before committing. That merge was later
+pushed; see R1.
 
 ---
 
@@ -1071,6 +1102,129 @@ auth/config/pool/proxy. Test count measured per package, not asserted: **980**
 top-level test funcs (was 970, +10 — config 72, pool 91, auth 54, proxy 763).
 
 Cumulative: **78 defects** (unchanged — A4 is a missing control, not a defect).
+
+---
+
+### Round-18 — the SECOND merge (`hian699` v1.2.8): resolving 7 red tests
+
+Not a defect round. This is the conflict resolution for the second merge (see §1:
+`MERGE_HEAD` `8a2dfc4`, 48 incoming commits, merge base `a2e3971`). Build and vet
+were already green when this round started; **7 tests were failing**, and they had
+three genuinely different causes. Recording them apart matters, because treating all
+seven as "merge splices" would have produced three wrong fixes.
+
+**Category 1 — real splices (3). Merge cut code; restoring it is the whole fix.**
+
+1. `proxy/translator_truncate_test.go:219` — the assertion checked for the *sibling*
+   test's marker `"FINAL: summarize"` while this test's own fixture appends
+   `"FINAL question"`. It could only ever fail. Assertion corrected to the fixture.
+2. `proxy/handler.go` (OpenAI mid-stream error path) — the merge kept the
+   `recordFailureForApiKey` bookkeeping call and then `return`ed, **dropping the
+   fork's client-facing terminator**: no error chunk, no `finish_reason`, no
+   `data: [DONE]`. That is exactly the defect the fork had already closed — a client
+   that had received partial content saw the connection stop and could not
+   distinguish truncation from completion. Restored, with the `recordFailureForApiKey`
+   call kept so the failure is not double-counted (mirrors the sibling Claude path at
+   `handler.go:2448`).
+3. `proxy/kiro_api_test.go` — fixture omitted `AuthMethod`, but
+   `shouldProbeFallbackRegions` returns **false** for an empty `AuthMethod` with a
+   non-empty `Region` (deliberately: only `external_idp`, `idc`-non-BuilderId, and
+   region-less accounts probe fallbacks). So eu-central-1 was never probed and the
+   test failed with "no available Kiro profile". The scenario it describes *is* the
+   Azure-tenant case, so the fixture now sets `AuthMethod: "external_idp"`.
+
+**Category 2 — test-order pollution, NOT a merge defect (1).**
+
+`TestSecurityStatusReportsDefaultPassword` passed alone and failed in the suite.
+`config.passwordOverride` is a package-level var holding the `ADMIN_PASSWORD`
+override; `SetPassword` writes it and **`Init()` deliberately does not clear it**
+(in production the override must survive a config reload). So any sibling calling
+`config.SetPassword` — there are ~45 such call sites in `proxy/*_test.go` — leaks
+its password in. Fixed in the test by restoring the precondition
+(`config.SetPassword("")`), **not** by changing production behaviour. Worth
+remembering: "passes alone, fails in suite" means shared global state, so look for
+an unreset package-level var before suspecting the merge.
+
+**Category 3 — a genuine, irreconcilable POLICY conflict (2 tests, 5 changed
+assertions). This one deserves care.**
+
+The two sides disagreed on what an AWS event-stream EXCEPTION frame means, and their
+tests contradict each other directly — no implementation satisfies both:
+
+| On an exception-only stream | Fork (4 tests) | Upstream (1 test) |
+|---|---|---|
+| `parseEventStream` returns | `nil` | non-nil error |
+| `OnComplete` fires | yes, usage 123/45 | must not fire |
+
+**Resolution: drain-then-error** — neither side verbatim. The frame is recorded, the
+loop keeps draining and delivers every subsequent content frame, and the error is
+returned at end-of-stream (`failureFrameErr`, `proxy/kiro.go`).
+
+Why this and not the fork's `return nil` (which R2 in §4 chose, and which HANDOFF
+§6b called blocked):
+
+- The fork's stated fear was *killing live streams mid-answer*. Draining removes
+  that fear completely — nothing aborts early, all text still reaches the client. So
+  the fork's rationale is satisfied; only its `err == nil` bookkeeping conflicts.
+- `return nil` is the **same failure class round 12 closed in this same function**
+  (`errKiroEmptyStream`): a false success makes `pool.RecordSuccess` clear the error
+  count and cooldown, and bills the customer key an estimated input total.
+- The sibling Bedrock reader already returns an error for these exact headers
+  (`bedrock_eventstream.go:121`, asserted by `bedrock_eventstream_test.go:89`).
+  Silence on the Kiro path made one upstream condition visible on one surface and
+  invisible on the other.
+- Tiebreak: a false success is silent, mis-bills, and un-cools an account; a false
+  failure is loud and recoverable by failover.
+
+**Upstream's `OnComplete must not fire` rested on a false premise, and I checked
+rather than assumed.** `OnComplete` is implemented at 5 sites
+(`handler.go:2420`, `:3073`, `:3704`, `:3919`, `:8390`) and every one only assigns
+token counters. Success is gated on the returned error — `pool.RecordSuccess` is
+called by the handler when `err == nil`, never by the callback. Suppressing
+`OnComplete` would therefore silently stop billing tokens a failure frame carried,
+which is precisely the accounting hole `TestFailureFrameStillCountsUsage` exists to
+pin. So `OnComplete` still fires; the error return is what denies the false success.
+That test's assertion was inverted (5 assertions changed across
+`kiro_exception_frame_test.go`, `kiro_failure_frame_test.go`, `kiro_test.go`), each
+with a `POLICY CHANGE` comment naming what replaced it — the original requirement
+(reporting, no truncation, usage counted) is still asserted in every case.
+
+**`ThrottlingException` → quota, without upstream's collateral damage.** Upstream
+classified it by adding `"throttl"` to `isQuotaErrorMessage`. That is **not viable
+here**: it would also match `errBedrockThrottled`, whose entire purpose is a
+per-model skip that must NOT escalate to an account-wide 1h cooldown — asserted by
+`TestErrBedrockThrottledNotQuota`. Instead `upstreamFailureFrameError` appends a
+literal `HTTP 429` token for throttle types only, which `isQuotaErrorMessage` matches
+via `pool.HasStatusToken`. Other types are deliberately left unmapped: the 403 path
+*disables* an account, so a mis-inference there costs an operator a working account.
+
+**One production fix fell out of category 1's investigation.** The cross-region probe
+path called `acceptRefreshedProfileArn` (persists `ProfileArn` only) and never
+persisted `ApiRegion`, while the OAuth-refresh path did (`kiro_api.go:609-616`).
+`kiroRegionForProfile` still derives the right region from the cached ARN at request
+time, so this was latent, not broken — but the persisted account showed an empty
+`ApiRegion`, so admin tooling reading it directly, or a next-session `Load()`, would
+not see the pin. Now mirrored via `UpdateAccountProfileArnWithRegion`, non-fatal on
+write failure.
+
+**Mutation-verified — first green proves nothing.** Baseline confirmed green first,
+then each fix reverted in isolation and restored with a SHA-256 comparison:
+
+| Mutation | Result |
+|---|---|
+| `kiro.go`: return `nil` (fork's old policy) | RED — 4 fail |
+| `handler.go`: drop the error chunk + `[DONE]` | RED — 2 fail |
+| `kiro_api.go`: drop the `ApiRegion` pin | RED — 1 fail |
+
+All three files restored byte-identical, and the gate re-run afterwards from a **cold
+build cache** (`go clean -cache`) — a mutate/restore cycle can otherwise leave the
+last mutant in the build output and make `--no-build`-style reuse lie.
+
+Gate: build / vet / `gofmt -l` clean, **1328 passed / 0 failed** across 6 packages,
+`-race` clean. 7 red → 0.
+
+Cumulative: **78 defects** (unchanged — these are merge-resolution fixes, not newly
+discovered production defects; the `ApiRegion` persistence gap was latent).
 
 ---
 

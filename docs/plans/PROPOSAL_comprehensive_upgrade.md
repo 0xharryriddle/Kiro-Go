@@ -518,6 +518,65 @@ Bedrock code.
 
 ---
 
+## 3b. Reconciliation against the `hian699` v1.2.8 merge (round 18, MEASURED)
+
+The second merge (`MERGE_HEAD` `8a2dfc4`, 48 commits) ships features that overlap
+several tracks above. Everything below was verified by reading the wiring, **not** by
+trusting the merge changelog — a constructed struct is not an enforced control, so
+each claim names its enforcement site.
+
+**B5 admission control — LARGELY SHIPPED (re-scope, do not rebuild).**
+`proxy/dos_guard.go` is constructed at `handler.go:540` and *enforced*:
+
+- global in-flight cap → `acquireGuardedSlot` (`handler.go:1099-1108`), rejecting with
+  **503 `overloaded_error`**;
+- per-client-IP token-bucket reject → `handler.go:899-903`, **429 `rate_limit_error`**;
+- per-API-key cap on requests *sleeping* in the RPM delay → `enterKeyWait`
+  (`auth.go:133`), so one key cannot build an unbounded backlog of delayed goroutines;
+- per-IP map bounded by a janitor, so the guard is not itself a memory vector.
+
+Two honest deltas from what B5 proposed: the global rejection is **503, not 429**, and
+I did **not** verify a `Retry-After` on the guard's own 429 path (`handler.go:901` sets
+no header; the `Retry-After` sites found are the auth/limiter/failover paths). What
+remains of B5 is therefore narrow: decide whether the guard's rejections should carry
+`Retry-After`, and whether a *per-account* in-flight ceiling is still wanted — the
+merge caps globally and per-IP/per-key, not per upstream account.
+
+**B4 prefix-affinity — PARTIALLY addressed by a different mechanism. Read before
+building.** The merge ships **session affinity per API key**, not prompt-prefix
+affinity: `pool/account.go:665` gates on `config.GetSessionAffinityEnabled()`
+(default **false**, `config.go:580`), binds `apiKeyID → accountID` with a TTL, and
+bounds the map at `maxAffinityEntries` with oldest-first eviction (`:744-796`).
+Pinned by `TestSessionAffinityBindsApiKeyToAccount` (`pool/account_test.go:595`).
+
+This is a *cruder proxy* for B4's goal: it keeps one key on one account so that
+account's upstream cache stays warm, but it does not hash the prompt prefix, so two
+different conversations on the same key share a binding and one conversation spread
+across keys gets none. B4's measured evidence (95.2% prefix repetition) is not
+invalidated — but any B4 work must now be framed as *refining* this, and must
+account for the flag defaulting off.
+
+**Per-key abuse limits — SHIPPED.** `config.go:446-452` adds `RPMLimit`
+(token-bucket delay), `IPAllowlist` (CIDR/IP restriction), and the distinct
+`rpmLimitHard`/`tpmLimitHard` reject variants, plus a configurable
+`LimitNoticeMessage` (`config.go:729-732`, default at `:2595`) so a throttled client
+gets a friendly in-chat reply instead of a hard error. Note the deliberate tag split
+documented at `config.go:438-448`: sharing `rpmLimit` between the throttle and the
+hard-reject field would have made them indistinguishable on the wire.
+
+**A5 context propagation — STILL OPEN, and it grew.** Measured now:
+`http.NewRequestWithContext` = **2**, plain `http.NewRequest(` = **44** (the proposal
+said 32 upstream sites). The merge added call sites without threading contexts, so
+this item is larger than when it was written, not smaller.
+
+**Proxy-pool failover, `Require-proxy`, and external-IdP proxy routing** are new
+surfaces this document never audited (`RequireProxy`, per-request routing logs, and
+the fix for token refresh leaking the server's real IP through external-IdP
+discovery). They belong on the Track F3 unreviewed-file list rather than being
+assumed correct.
+
+---
+
 ## 4. Already shipped — do NOT rebuild
 
 Verified present in this pass, listed because they are easy to re-propose:
@@ -566,6 +625,13 @@ Ordered by (impact × evidence) ÷ risk, with cheap-and-safe pulled forward:
 Items 1-4 are individually small and mutually independent — they can land as four
 tight rounds without destabilising dispatch. Items 5-8 touch live routing and each
 deserve its own RED-proven round.
+
+**Read §3b before starting any Track B item.** The `hian699` v1.2.8 merge (round 18)
+already ships most of B5 (admission control, enforced — 503 global / 429 per-IP) and a
+coarser stand-in for B4 (per-API-key session affinity, default **off**). Neither is
+what this list assumed when it was written, so B4/B5 need re-scoping rather than
+building from scratch. A5 measured *larger* than stated: 44 plain `http.NewRequest(`
+against 2 `WithContext`. B1 and B2 are unaffected and remain the next real work.
 
 ## 7. Governing constraint
 

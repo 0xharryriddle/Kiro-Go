@@ -11,6 +11,12 @@ services:
       # the callback off the host's external interfaces while still letting the
       # host browser's localhost:3128 reach the container listener below.
       - "127.0.0.1:3128:3128"
+      - "8080:8080"
+      - "3128:3128"
+      - "4649:4649"
+      - "6588:6588"
+      - "8008:8008"
+      - "9091:9091"
     volumes:
       - ./data:/app/data
       # Zero-touch credential drop folder. Any CLIProxyAPI_*.json minted by
@@ -56,4 +62,5 @@ services:
       timeout: 5s
       retries: 3
       start_period: 10s
+      - LOOPBACK_HOST=0.0.0.0
     restart: unless-stopped

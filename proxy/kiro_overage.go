@@ -58,13 +58,14 @@ func FetchOverageStatus(account *config.Account) (*OverageSnapshot, error) {
 		rawURL += "&profileArn=" + neturl.QueryEscape(profileArn)
 	}
 
-	req, err := http.NewRequest("GET", rawURL, nil)
-	if err != nil {
-		return nil, err
-	}
-	setKiroHeaders(req, account)
-
-	resp, err := GetRestClientForProxy(ResolveAccountProxyURL(account)).Do(req)
+	resp, err := doRESTWithProxySwap(account, func() (*http.Request, error) {
+		req, err := http.NewRequest("GET", rawURL, nil)
+		if err != nil {
+			return nil, err
+		}
+		setKiroHeaders(req, account)
+		return req, nil
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -132,14 +133,15 @@ func SetOverageStatus(account *config.Account, enabled bool) (*OverageSnapshot, 
 	}
 	body, _ := json.Marshal(payload)
 
-	req, err := http.NewRequest("POST", regionalizeURL(kiroQAPIBase+"/setUserPreference", account), bytes.NewReader(body))
-	if err != nil {
-		return nil, err
-	}
-	setKiroHeaders(req, account)
-	req.Header.Set("Content-Type", "application/json")
-
-	resp, err := GetRestClientForProxy(ResolveAccountProxyURL(account)).Do(req)
+	resp, err := doRESTWithProxySwap(account, func() (*http.Request, error) {
+		req, err := http.NewRequest("POST", regionalizeURL(kiroQAPIBase+"/setUserPreference", account), bytes.NewReader(body))
+		if err != nil {
+			return nil, err
+		}
+		setKiroHeaders(req, account)
+		req.Header.Set("Content-Type", "application/json")
+		return req, nil
+	})
 	if err != nil {
 		return nil, err
 	}

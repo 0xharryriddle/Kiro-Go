@@ -194,3 +194,27 @@ func TestShouldRetryAccountRefreshOnErrorStatusTokenBoundary(t *testing.T) {
 		}
 	}
 }
+
+func TestIsProxyErrorMessage(t *testing.T) {
+	hits := []string{
+		"require-proxy: no proxy configured for account",
+		"proxyconnect tcp: dial tcp 1.2.3.4:1080: connect: connection refused",
+		"socks connect tcp: i/o timeout",
+		"dial tcp 1.2.3.4:8080: connectex: A connection attempt failed",
+	}
+	for _, m := range hits {
+		if !isProxyErrorMessage(m) {
+			t.Fatalf("expected proxy-error match for %q", m)
+		}
+	}
+	misses := []string{
+		"HTTP 401 unauthorized",
+		"quota exhausted on KiroIDE",
+		"temporarily_suspended",
+	}
+	for _, m := range misses {
+		if isProxyErrorMessage(m) {
+			t.Fatalf("did not expect proxy-error match for %q", m)
+		}
+	}
+}

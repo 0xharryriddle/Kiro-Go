@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
-	"io"
 	"kiro-go/config"
 	"kiro-go/logger"
 	"net/http"
@@ -72,6 +71,13 @@ func refreshTokenDirect(account *config.Account) (string, string, int64, string,
 	proxyURL := account.ProxyURL
 	if proxyURL == "" {
 		proxyURL = config.GetProxyURL()
+	}
+	// When require-proxy is on and no proxy is configured, refuse the refresh
+	// rather than connecting directly — a direct refresh POST would leak the
+	// server's real IP before CallKiroAPI's gate can fire. The error string
+	// carries "require-proxy" so the failover classifier cools down + rotates.
+	if proxyURL == "" && config.GetRequireProxy() {
+		return "", "", 0, "", fmt.Errorf("require-proxy: no proxy configured for account")
 	}
 	client := GetAuthClientForProxy(proxyURL)
 
@@ -293,8 +299,7 @@ func refreshOIDCToken(refreshToken, clientID, clientSecret, region string, clien
 	defer resp.Body.Close()
 
 	if resp.StatusCode != 200 {
-		respBody, _ := io.ReadAll(resp.Body)
-		return "", "", 0, "", fmt.Errorf("refresh failed: %d %s", resp.StatusCode, string(respBody))
+		return "", "", 0, "", fmt.Errorf("refresh failed: %d %s", resp.StatusCode, readErrorBody(resp.Body))
 	}
 
 	var result struct {
@@ -331,8 +336,7 @@ func refreshSocialToken(refreshToken string, client *http.Client) (string, strin
 	defer resp.Body.Close()
 
 	if resp.StatusCode != 200 {
-		respBody, _ := io.ReadAll(resp.Body)
-		return "", "", 0, "", fmt.Errorf("refresh failed: %d %s", resp.StatusCode, string(respBody))
+		return "", "", 0, "", fmt.Errorf("refresh failed: %d %s", resp.StatusCode, readErrorBody(resp.Body))
 	}
 
 	var result struct {

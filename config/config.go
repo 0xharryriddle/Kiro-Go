@@ -22,6 +22,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -128,6 +129,19 @@ type Account struct {
 	// it has been hoisted next to RefreshToken. Re-adding upstream's copies here
 	// would be a duplicate-field compile error, so this side of the hunk is
 	// intentionally empty rather than unioned.
+
+	// Region split (upstream): auth-plane and data-plane regions can differ.
+	// Both fall back to Region via EffectiveAuthRegion/EffectiveApiRegion.
+	AuthRegion string `json:"authRegion,omitempty"`
+	ApiRegion  string `json:"apiRegion,omitempty"`
+
+	// External-IdP login material (upstream "Your organization" Kiro SSO flow).
+	// IdPClientID is the client registered with the IdP (distinct from ClientID,
+	// which is the AWS SSO OIDC client); IdPTokenEndpoint caches the endpoint
+	// resolved via OIDC discovery; LoginHint is the email passed as login_hint.
+	IdPClientID      string `json:"idpClientId,omitempty"`
+	IdPTokenEndpoint string `json:"idpTokenEndpoint,omitempty"`
+	LoginHint        string `json:"loginHint,omitempty"`
 
 	// Per-account outbound proxy (falls back to global ProxyURL if empty)
 	ProxyURL string `json:"proxyURL,omitempty"`
@@ -334,6 +348,48 @@ func (a *Account) IsBedrock() bool {
 	return strings.EqualFold(strings.TrimSpace(a.AuthMethod), "bedrock")
 }
 
+// EffectiveAuthRegion returns the effective auth region for this account,
+// resolved using the fallback chain:
+// account.authRegion > account.region > global authRegion > global region > "us-east-1"
+func (a *Account) EffectiveAuthRegion() string {
+	if a.AuthRegion != "" {
+		return a.AuthRegion
+	}
+	if a.Region != "" {
+		return a.Region
+	}
+	authRegion := GetGlobalAuthRegion()
+	if authRegion != "us-east-1" {
+		return authRegion
+	}
+	globalRegion := GetGlobalRegion()
+	if globalRegion != "us-east-1" {
+		return globalRegion
+	}
+	return "us-east-1"
+}
+
+// EffectiveApiRegion returns the effective API region for this account,
+// resolved using the fallback chain:
+// account.apiRegion > account.region > global apiRegion > global region > "us-east-1"
+func (a *Account) EffectiveApiRegion() string {
+	if a.ApiRegion != "" {
+		return a.ApiRegion
+	}
+	if a.Region != "" {
+		return a.Region
+	}
+	apiRegion := GetGlobalApiRegion()
+	if apiRegion != "us-east-1" {
+		return apiRegion
+	}
+	globalRegion := GetGlobalRegion()
+	if globalRegion != "us-east-1" {
+		return globalRegion
+	}
+	return "us-east-1"
+}
+
 // PromptFilterRule defines a single custom prompt sanitization rule.
 // Type can be: "regex" (regexp find/replace within prompt) or
 // "lines-containing" (remove lines containing the match substring).
@@ -369,19 +425,52 @@ type ApiKeyEntry struct {
 	CreatedAt  int64  `json:"createdAt"`          // Creation timestamp (Unix seconds)
 	LastUsedAt int64  `json:"lastUsedAt,omitempty"`
 
+	// ExpiresAt is an optional expiry timestamp (Unix seconds). 0 = never expires.
+	// Once now >= ExpiresAt, the key is rejected at authentication like a disabled key.
+	ExpiresAt int64 `json:"expiresAt,omitempty"`
+
 	// Limits (0 = unlimited)
 	TokenLimit  int64   `json:"tokenLimit,omitempty"`
 	CreditLimit float64 `json:"creditLimit,omitempty"`
 
-	// Windowed rate limits (0 = unlimited). Unlike the cumulative TokenLimit/
-	// CreditLimit above (which never reset), these are sliding-window rates
-	// enforced in-process: RpmLimit caps requests per 60s, TpmLimit caps tokens
-	// per 60s. Exceeding either yields HTTP 429 with a Retry-After header. The
-	// window counters are in-memory only (single-instance assumption).
-	RpmLimit int64 `json:"rpmLimit,omitempty"` // max requests per 60s window
-	TpmLimit int64 `json:"tpmLimit,omitempty"` // max tokens per 60s window
+	// Windowed HARD limits (0 = unlimited), enforced by rateLimiter.Admit:
+	// RpmLimit caps requests per 60s, TpmLimit caps tokens per 60s; exceeding
+	// either REJECTS with HTTP 429 + Retry-After. Distinct from RPMLimit/TPMLimit
+	// below, which delay instead of rejecting. Tags are deliberately
+	// rpmLimitHard/tpmLimitHard: sharing `rpmLimit` with RPMLimit would make
+	// encoding/json silently emit NEITHER field and decode both as 0.
+	RpmLimit int64 `json:"rpmLimitHard,omitempty"`
+	TpmLimit int64 `json:"tpmLimitHard,omitempty"`
 
-	// Cumulative usage (never auto-reset)
+	// Rate/abuse limits (0 = unlimited).
+	// RPMLimit throttles requests per minute for this key (token-bucket delay, not rejection).
+	// IPLimit caps concurrent distinct client IPs using this key.
+	// IPAllowlist, when non-empty, restricts the key to the listed client IPs/CIDRs.
+	// TPMLimit is display-only metadata (tokens per minute); not enforced here.
+	RPMLimit    int      `json:"rpmLimit,omitempty"`
+	IPLimit     int      `json:"ipLimit,omitempty"`
+	IPAllowlist []string `json:"ipAllowlist,omitempty"`
+	TPMLimit    int      `json:"tpmLimit,omitempty"`
+
+	// BoundAccountIDs restricts this key to a fixed set of accounts. When non-empty,
+	// a request authenticated with this key routes ONLY through these accounts (still
+	// subject to per-account cooldown/quota/model filtering). If none of the bound
+	// accounts is currently usable, routing falls back to the shared pool so the
+	// request is not hard-failed. Empty = no binding (use the shared pool).
+	BoundAccountIDs []string `json:"boundAccountIds,omitempty"`
+
+	// Model is the legacy single-model override, kept only for migration. New code
+	// reads Models instead; on first load a non-empty Model is folded into Models and
+	// then cleared. Do not use directly.
+	Model string `json:"model,omitempty"`
+
+	// Models is the per-key model allowlist. When non-empty, a request authenticated
+	// with this key may use any client-requested model that is in the list; a request
+	// for a model NOT in the list is remapped to the first entry. Empty = no restriction
+	// (use the client's model). The global ForceModel setting still takes precedence.
+	Models []string `json:"models,omitempty"`
+
+	// Current-period usage (cleared by "Reset Usage" for a fresh quota cycle).
 	TokensUsed    int64   `json:"tokensUsed,omitempty"`
 	CreditsUsed   float64 `json:"creditsUsed,omitempty"`
 	RequestsCount int64   `json:"requestsCount,omitempty"`
@@ -390,6 +479,14 @@ type ApiKeyEntry struct {
 	// operators see which models a key spends on. Reset alongside the aggregate
 	// counters by ResetApiKeyUsage. omitempty keeps existing configs unchanged.
 	ModelUsage map[string]ApiKeyModelUsage `json:"modelUsage,omitempty"`
+	// Lifetime usage. Same additions as the current-period counters, but "Reset Usage"
+	// NEVER touches these — they only grow, so an operator always sees the true grand
+	// total from the key's creation. They are cleared only by ResetApiKeyUsageAll
+	// ("Reset All"). Seeded from the current-period counters on first load (migration)
+	// so existing keys don't show a lower lifetime total than what they've already used.
+	LifetimeTokens   int64   `json:"lifetimeTokens,omitempty"`
+	LifetimeCredits  float64 `json:"lifetimeCredits,omitempty"`
+	LifetimeRequests int64   `json:"lifetimeRequests,omitempty"`
 }
 
 // ApiKeyModelUsage is one model's cumulative usage under an API key.
@@ -430,6 +527,12 @@ type Config struct {
 	// EndpointFallback controls whether to try other endpoints when the preferred one fails.
 	// Defaults to true. Set to false to only use the preferred endpoint.
 	EndpointFallback *bool `json:"endpointFallback,omitempty"`
+
+	// Global default regions. Used as a fallback when an account does not
+	// specify its own region. All default to "us-east-1" when empty.
+	Region     string `json:"region,omitempty"`     // Default region for both auth and API
+	AuthRegion string `json:"authRegion,omitempty"` // Default region for token refresh endpoints
+	ApiRegion  string `json:"apiRegion,omitempty"`  // Default region for API request hosts
 
 	// AllowOverUsage allows accounts to continue serving requests even when their
 	// usage quota has been exhausted. When enabled, the pool will not skip accounts
@@ -477,6 +580,13 @@ type Config struct {
 	// the same account (sticky routing) for a TTL window. Default false.
 	SessionAffinityEnabled bool `json:"sessionAffinityEnabled,omitempty"`
 
+	// MaxPayloadBytes is the upper bound for the serialized Kiro request body.
+	// Requests above this are truncated (oldest history dropped) before dispatch.
+	// 0 means "use DefaultMaxPayloadBytes". Read per-request, so changes apply
+	// at runtime without a restart. Do not set >~2.15MB: AWS rejects oversized
+	// bodies with 400 CONTENT_LENGTH_EXCEEDS_THRESHOLD and there is no shrink-retry.
+	MaxPayloadBytes int `json:"maxPayloadBytes,omitempty"`
+
 	// Proxy configuration: optional outbound proxy for Kiro API requests
 	// Format: "socks5://host:port", "socks5://user:pass@host:port",
 	//         "http://host:port",  "http://user:pass@host:port"
@@ -492,6 +602,26 @@ type Config struct {
 	// ProxyRotateMinutes is the round-robin interval for ProxyURLs. <=0 falls back to
 	// DefaultProxyRotateMinutes. Ignored when ProxyURLs is empty.
 	ProxyRotateMinutes int `json:"proxyRotateMinutes,omitempty"`
+
+	// RequireProxy, when true, blocks any outbound Kiro request for an account
+	// that has neither a per-account proxy nor a global proxy. The request is
+	// failed (and the account rotated) instead of connecting directly, so the
+	// server's real IP is never exposed. Default false = current behavior.
+	RequireProxy bool `json:"requireProxy,omitempty"`
+
+	// ProxyPool is a shared pool of outbound proxies with persisted health.
+	// Proxy-level failover picks a healthy proxy; entries that fail are marked
+	// unhealthy and skipped for ProxyUnhealthyCooldown before being retried.
+	ProxyPool []PooledProxy `json:"proxyPool,omitempty"`
+
+	// PublicBaseURL is the externally reachable base URL that routes to the SSO
+	// loopback port (e.g. "https://azr.hian.software" → reverse proxy → container:3128).
+	// When set, OAuth redirect_uri values for the Kiro SSO flow are built from it
+	// instead of being hardcoded to http://localhost:<loopbackPort>, so logins work
+	// through a reverse proxy / custom domain without hand-editing the browser URL.
+	// It must point at the loopback port, NOT the admin UI port. Empty = fall back to
+	// http://localhost:<loopbackPort> (correct for the pure-local case).
+	PublicBaseURL string `json:"publicBaseURL,omitempty"`
 
 	// SanitizeClaudeCodePrompt is kept for backward-compatible JSON loading only.
 	// Migrated to FilterClaudeCode on first load. Do not use directly.
@@ -587,13 +717,47 @@ type Config struct {
 	// allocate without bound — and when requireApiKey is off, unauthenticated.
 	MaxRequestBodyBytes int `json:"maxRequestBodyBytes,omitempty"`
 
-	// Global statistics (persisted across restarts)
-	TotalRequests   int     `json:"totalRequests,omitempty"`   // Total API requests received
-	SuccessRequests int     `json:"successRequests,omitempty"` // Successful requests count
-	FailedRequests  int     `json:"failedRequests,omitempty"`  // Failed requests count
-	TotalTokens     int     `json:"totalTokens,omitempty"`     // Total tokens processed
+	// Global statistics (persisted across restarts). int64 so long-running 32-bit
+	// builds (GOARCH=arm/386) don't wrap TotalTokens at ~2.1B and silently corrupt
+	// the persisted counter (L8).
+	TotalRequests   int64   `json:"totalRequests,omitempty"`   // Total API requests received
+	SuccessRequests int64   `json:"successRequests,omitempty"` // Successful requests count
+	FailedRequests  int64   `json:"failedRequests,omitempty"`  // Failed requests count
+	TotalTokens     int64   `json:"totalTokens,omitempty"`     // Total tokens processed
 	TotalCredits    float64 `json:"totalCredits,omitempty"`    // Total credits consumed
+
+	// LimitNoticeMessage is a friendly in-chat reply shown to a client whose key is
+	// blocked (disabled/expired/over-limit/IP-denied) instead of a 401/429 error.
+	// Empty falls back to a built-in default at render time.
+	LimitNoticeMessage string `json:"limitNoticeMessage,omitempty"`
+
+	// ForceModel, when non-empty, overrides the model of EVERY incoming request
+	// (after thinking-suffix parsing) with this Kiro model ID. It takes precedence
+	// over a per-key model binding and the client-requested model. Empty = disabled.
+	ForceModel string `json:"forceModel,omitempty"`
+
+	// IdentityModel, when non-empty, is the model name the assistant is told to
+	// self-identify as. It does NOT change which upstream model serves the request
+	// (that is ForceModel's job); it only prepends an identity line to the system
+	// prompt so "what model are you?" answers with this name regardless of the real
+	// model. Empty = don't inject anything. See applyPromptFilters in proxy/translator.go.
+	IdentityModel string `json:"identityModel,omitempty"`
 }
+
+// PooledProxy is one outbound proxy in the shared pool, carrying persisted
+// health so proxy-level failover survives restarts. 池化代理，带持久化健康状态。
+type PooledProxy struct {
+	URL               string `json:"url"`
+	Healthy           bool   `json:"healthy"`
+	FailCount         int    `json:"failCount,omitempty"`
+	LastFailAt        int64  `json:"lastFailAt,omitempty"`
+	LastOKAt          int64  `json:"lastOkAt,omitempty"`
+	DisabledPermanent bool   `json:"disabledPermanent,omitempty"`
+}
+
+// ProxyUnhealthyCooldown is how long an unhealthy pooled proxy is skipped by
+// the selector (in proxy/) before it is retried. 不健康代理的冷却时间。
+const ProxyUnhealthyCooldown = 5 * time.Minute
 
 // AccountInfo contains account metadata retrieved from Kiro API.
 // Used for updating subscription and usage information.
@@ -616,12 +780,23 @@ type AccountInfo struct {
 }
 
 // Version current version
-const Version = "1.1.5"
+const Version = "1.2.8"
 
 var (
 	cfg     *Config
 	cfgLock sync.RWMutex
 	cfgPath string
+	// cfgDirty marks that in-memory cfg has unpersisted changes from a hot-path
+	// counter update (RecordApiKeyUsage / UpdateAccountStats). A background flush
+	// coalesces these into one disk write instead of writing the full config on
+	// every request, which previously serialized all request completions on the
+	// exclusive cfgLock + os.WriteFile.
+	cfgDirty atomic.Bool
+	// passwordOverride holds the ADMIN_PASSWORD env override. It is kept OUT of the
+	// persisted Config so a later Save() (e.g. a stats flush) never writes the env
+	// secret to config.json in cleartext (L9). When set, it takes priority over the
+	// stored cfg.Password. Guarded by cfgLock.
+	passwordOverride string
 )
 
 // Init initializes the configuration system with the specified file path.
@@ -783,6 +958,49 @@ func Load() error {
 			return err
 		}
 	}
+
+	// Migration: seed lifetime counters from the current-period counters for keys that
+	// predate the lifetime fields. Without this, an existing key with usage would show a
+	// lifetime total of 0, lower than what it has already consumed. We detect an unseeded
+	// key as one whose lifetime counters are all zero while a current-period counter is
+	// non-zero. Runs once; after the save, lifetime >= current so the condition is false.
+	lifetimeMigrated := false
+	for i := range cfg.ApiKeys {
+		k := &cfg.ApiKeys[i]
+		if k.LifetimeTokens == 0 && k.LifetimeCredits == 0 && k.LifetimeRequests == 0 &&
+			(k.TokensUsed != 0 || k.CreditsUsed != 0 || k.RequestsCount != 0) {
+			k.LifetimeTokens = k.TokensUsed
+			k.LifetimeCredits = k.CreditsUsed
+			k.LifetimeRequests = k.RequestsCount
+			lifetimeMigrated = true
+		}
+	}
+	if lifetimeMigrated {
+		if err := saveLocked(); err != nil {
+			return err
+		}
+	}
+
+	// Migration: fold the legacy single Model override into the Models allowlist. A
+	// one-element allowlist reproduces the old "force this model" behavior exactly
+	// (any client model not equal to it is remapped to it). Clear the legacy field so
+	// future saves don't re-emit it.
+	modelMigrated := false
+	for i := range cfg.ApiKeys {
+		k := &cfg.ApiKeys[i]
+		if strings.TrimSpace(k.Model) != "" {
+			if len(k.Models) == 0 {
+				k.Models = []string{strings.TrimSpace(k.Model)}
+			}
+			k.Model = ""
+			modelMigrated = true
+		}
+	}
+	if modelMigrated {
+		if err := saveLocked(); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
@@ -826,6 +1044,32 @@ func recoverConfigFromBackup() (*Config, error) {
 	return nil, fmt.Errorf("no valid config backup found")
 }
 
+// markDirtyLocked defers persistence to the background flusher instead of writing
+// to disk inline. Hot-path counter updates (per-request usage/stats) use this so
+// they don't hold cfgLock across an os.WriteFile of the whole config, which would
+// serialize every request completion and block all readers. Caller MUST hold cfgLock.
+func markDirtyLocked() {
+	cfgDirty.Store(true)
+}
+
+// FlushDirty persists cfg to disk only if a markDirtyLocked update is pending.
+// Called periodically by the proxy's background stats saver and once on shutdown.
+func FlushDirty() error {
+	if !cfgDirty.Swap(false) {
+		return nil
+	}
+	cfgLock.Lock()
+	defer cfgLock.Unlock()
+	if cfg == nil {
+		return nil
+	}
+	if err := Save(); err != nil {
+		cfgDirty.Store(true) // retry on next tick
+		return err
+	}
+	return nil
+}
+
 // newUUID returns a UUID v4 string. Defined here to avoid pulling extra deps in this file.
 func newUUID() string {
 	return GenerateMachineId()
@@ -833,6 +1077,15 @@ func newUUID() string {
 
 // Save persists the current configuration to the JSON file.
 // Uses indented formatting for human readability.
+//
+// The write is atomic: the payload is written to a sibling temp file (fsync'd)
+// and then renamed over the live config. os.Rename is atomic within a filesystem
+// (and on Windows uses MoveFileEx with MOVEFILE_REPLACE_EXISTING), so a crash /
+// power loss / ENOSPC mid-write can never leave a truncated or empty config.json
+// that would fail Load() on the next boot and lose all account tokens & API keys.
+//
+// Callers already hold cfgLock, so there is no concurrent Save() to race on the
+// fixed temp name.
 func Save() error {
 	data, err := json.MarshalIndent(cfg, "", "  ")
 	if err != nil {
@@ -1030,12 +1283,14 @@ func ExportJSON() ([]byte, error) {
 	return os.ReadFile(cfgPath)
 }
 
-// SetPassword updates the admin password.
-// Primarily used for environment variable override in containerized deployments.
+// SetPassword records the ADMIN_PASSWORD env override. It is stored separately from
+// the persisted Config (see passwordOverride) so a subsequent Save() never writes the
+// env secret to config.json in cleartext (L9). The override takes priority over the
+// stored password for the lifetime of the process.
 func SetPassword(password string) {
 	cfgLock.Lock()
 	defer cfgLock.Unlock()
-	cfg.Password = password
+	passwordOverride = password
 }
 
 // SetPort overrides the HTTP listen port in memory (does not persist). Used by
@@ -1082,6 +1337,9 @@ func Get() *Config {
 func GetPassword() string {
 	cfgLock.RLock()
 	defer cfgLock.RUnlock()
+	if passwordOverride != "" {
+		return passwordOverride
+	}
 	return cfg.Password
 }
 
@@ -1101,6 +1359,36 @@ func GetHost() string {
 		return "127.0.0.1"
 	}
 	return cfg.Host
+}
+
+// GetGlobalRegion returns the global default region. Defaults to "us-east-1".
+func GetGlobalRegion() string {
+	cfgLock.RLock()
+	defer cfgLock.RUnlock()
+	if cfg == nil || cfg.Region == "" {
+		return "us-east-1"
+	}
+	return cfg.Region
+}
+
+// GetGlobalAuthRegion returns the global default auth region. Defaults to "us-east-1".
+func GetGlobalAuthRegion() string {
+	cfgLock.RLock()
+	defer cfgLock.RUnlock()
+	if cfg == nil || cfg.AuthRegion == "" {
+		return "us-east-1"
+	}
+	return cfg.AuthRegion
+}
+
+// GetGlobalApiRegion returns the global default API region. Defaults to "us-east-1".
+func GetGlobalApiRegion() string {
+	cfgLock.RLock()
+	defer cfgLock.RUnlock()
+	if cfg == nil || cfg.ApiRegion == "" {
+		return "us-east-1"
+	}
+	return cfg.ApiRegion
 }
 
 func GetAccounts() []Account {
@@ -1780,6 +2068,28 @@ func UpdateAccountProfileSelection(id, profileArn, dataPlaneRegion string, pinne
 	return false, fmt.Errorf("account not found")
 }
 
+// UpdateAccountProfileArnWithRegion persists a resolved profile ARN and, when
+// apiRegion is non-empty, pins the account's data-plane region to it. Kiro /
+// Q Developer profiles are regional (e.g. KiroProfile-eu-central-1), and the
+// region that owns a profile can differ from the SSO/auth region. Recording the
+// API region alongside the ARN ensures subsequent data-plane calls target the
+// correct regional endpoint without re-probing. The auth region (account.Region)
+// is intentionally left untouched so OIDC token refresh keeps working.
+func UpdateAccountProfileArnWithRegion(id, profileArn, apiRegion string) error {
+	cfgLock.Lock()
+	defer cfgLock.Unlock()
+	for i, a := range cfg.Accounts {
+		if a.ID == id {
+			cfg.Accounts[i].ProfileArn = profileArn
+			if apiRegion != "" {
+				cfg.Accounts[i].ApiRegion = apiRegion
+			}
+			return Save()
+		}
+	}
+	return nil
+}
+
 func DeleteAccount(id string) error {
 	cfgLock.Lock()
 	defer cfgLock.Unlock()
@@ -1852,6 +2162,9 @@ func UpdateSettings(apiKey string, requireApiKey bool, password string) error {
 	cfg.RequireApiKey = requireApiKey
 	if password != "" {
 		cfg.Password = password
+		// An explicit UI password change supersedes the env override, otherwise
+		// GetPassword would keep returning the stale ADMIN_PASSWORD value (L9).
+		passwordOverride = ""
 	}
 	return Save()
 }
@@ -1867,6 +2180,9 @@ func UpdateSettingsPatch(apiKey *string, requireApiKey *bool, password string) e
 	}
 	if password != "" {
 		cfg.Password = password
+		// An explicit UI password change supersedes the env override, otherwise
+		// GetPassword would keep returning the stale ADMIN_PASSWORD value (L9).
+		passwordOverride = ""
 	}
 	return Save()
 }
@@ -1884,7 +2200,7 @@ func UpdateSettingsPatch(apiKey *string, requireApiKey *bool, password string) e
 // Readers in this file already guard cfg this way; writers historically did not,
 // because every writer ran after a successful Init. A shutdown hook is the first
 // caller for which that is no longer guaranteed.
-func UpdateStats(totalReq, successReq, failedReq, totalTokens int, totalCredits float64) error {
+func UpdateStats(totalReq, successReq, failedReq, totalTokens int64, totalCredits float64) error {
 	cfgLock.Lock()
 	defer cfgLock.Unlock()
 	if cfg == nil {
@@ -1895,10 +2211,10 @@ func UpdateStats(totalReq, successReq, failedReq, totalTokens int, totalCredits 
 	cfg.FailedRequests = failedReq
 	cfg.TotalTokens = totalTokens
 	cfg.TotalCredits = totalCredits
-	return Save()
+	return saveLocked()
 }
 
-func GetStats() (int, int, int, int, float64) {
+func GetStats() (int64, int64, int64, int64, float64) {
 	cfgLock.RLock()
 	defer cfgLock.RUnlock()
 	return cfg.TotalRequests, cfg.SuccessRequests, cfg.FailedRequests, cfg.TotalTokens, cfg.TotalCredits
@@ -1906,17 +2222,20 @@ func GetStats() (int, int, int, int, float64) {
 
 // UpdateAccountStats persists an ABSOLUTE counter snapshot for one account.
 //
-// The sole caller (pool.UpdateStats) computes the snapshot under the pool lock
-// and then persists it from a detached goroutine, so two snapshots can land here
-// out of order. Assigning unconditionally let an older snapshot overwrite a newer
-// one, and because these are cumulative counters that showed up as the persisted
-// request/token/credit totals moving BACKWARDS relative to the in-memory pool —
-// under-reporting usage and credits in the admin panel and on disk.
+// Two independent constraints apply, one from each side of the fork:
 //
-// Counters are therefore applied monotonically: a snapshot may only advance them.
-// This is safe because every counter here is cumulative and only ever grows for a
-// given account; the per-account stats are never reset through this function
-// (apiResetStats clears the GLOBAL totals via UpdateStats instead).
+//  1. ORDERING (fork): the sole caller (pool.UpdateStats) computes the snapshot
+//     under the pool lock and persists it from a detached goroutine, so two
+//     snapshots can land here out of order. Assigning unconditionally let an
+//     older snapshot overwrite a newer one, which showed up as the persisted
+//     request/token/credit totals moving BACKWARDS. Counters are therefore
+//     applied monotonically; safe because each is cumulative and never reset
+//     through this function (apiResetStats clears GLOBAL totals via UpdateStats).
+//
+//  2. HOT PATH (upstream): this runs per completed request, so it must NOT
+//     fsync inline. It marks the config dirty and lets backgroundStatsSaver
+//     coalesce the write via FlushDirty. See CLAUDE.md ("never write config on
+//     the request hot path").
 func UpdateAccountStats(id string, requestCount, errorCount, totalTokens int, totalCredits float64, lastUsed int64) error {
 	cfgLock.Lock()
 	defer cfgLock.Unlock()
@@ -1944,10 +2263,11 @@ func UpdateAccountStats(id string, requestCount, errorCount, totalTokens int, to
 				changed = true
 			}
 			if !changed {
-				// Stale snapshot carrying nothing new: skip the disk write.
+				// Stale snapshot carrying nothing new: skip the dirty mark.
 				return nil
 			}
-			return Save()
+			markDirtyLocked()
+			return nil
 		}
 	}
 	return nil
@@ -2271,6 +2591,28 @@ func UpdateThinkingConfig(suffix, openaiFormat, claudeFormat string, showPlaceho
 	return Save()
 }
 
+// defaultLimitNoticeMessage is served when no custom LimitNoticeMessage is configured.
+const defaultLimitNoticeMessage = "Your API key has reached its limit or has expired. Please contact the administrator to renew it."
+
+// GetLimitNoticeMessage returns the configured limit-notice message, or the built-in
+// default when none is set.
+func GetLimitNoticeMessage() string {
+	cfgLock.RLock()
+	defer cfgLock.RUnlock()
+	if strings.TrimSpace(cfg.LimitNoticeMessage) == "" {
+		return defaultLimitNoticeMessage
+	}
+	return cfg.LimitNoticeMessage
+}
+
+// SetLimitNoticeMessage persists the limit-notice message.
+func SetLimitNoticeMessage(msg string) error {
+	cfgLock.Lock()
+	defer cfgLock.Unlock()
+	cfg.LimitNoticeMessage = msg
+	return Save()
+}
+
 // GetPreferredEndpoint 获取首选端点配置
 func GetPreferredEndpoint() string {
 	cfgLock.RLock()
@@ -2346,6 +2688,138 @@ func UpdateProxySettings(proxyURL string, proxyURLs []string, rotateMinutes int)
 	cfg.ProxyURLs = proxyURLs
 	cfg.ProxyRotateMinutes = rotateMinutes
 	return Save()
+}
+
+// GetRequireProxy 返回是否强制所有出站请求走代理
+func GetRequireProxy() bool {
+	cfgLock.RLock()
+	defer cfgLock.RUnlock()
+	if cfg == nil {
+		return false
+	}
+	return cfg.RequireProxy
+}
+
+// UpdateRequireProxy 设置 require-proxy 开关并持久化
+func UpdateRequireProxy(v bool) error {
+	cfgLock.Lock()
+	defer cfgLock.Unlock()
+	cfg.RequireProxy = v
+	return Save()
+}
+
+// GetProxyPool 返回共享代理池的副本，调用方不得修改内部状态。
+func GetProxyPool() []PooledProxy {
+	cfgLock.RLock()
+	defer cfgLock.RUnlock()
+	if cfg == nil {
+		return nil
+	}
+	pool := make([]PooledProxy, len(cfg.ProxyPool))
+	copy(pool, cfg.ProxyPool)
+	return pool
+}
+
+// AddProxyToPool 按 URL 去重加入代理池；已存在则视为成功的空操作。
+// 新条目 Healthy=true 且 LastOKAt=now。
+func AddProxyToPool(url string) error {
+	cfgLock.Lock()
+	defer cfgLock.Unlock()
+	for _, p := range cfg.ProxyPool {
+		if p.URL == url {
+			return nil
+		}
+	}
+	cfg.ProxyPool = append(cfg.ProxyPool, PooledProxy{
+		URL:      url,
+		Healthy:  true,
+		LastOKAt: time.Now().Unix(),
+	})
+	return Save()
+}
+
+// RemoveProxyFromPool 从代理池移除指定 URL；不存在则空操作。
+func RemoveProxyFromPool(url string) error {
+	cfgLock.Lock()
+	defer cfgLock.Unlock()
+	for i, p := range cfg.ProxyPool {
+		if p.URL == url {
+			cfg.ProxyPool = append(cfg.ProxyPool[:i], cfg.ProxyPool[i+1:]...)
+			return Save()
+		}
+	}
+	return nil
+}
+
+// MarkProxyUnhealthy 记录一次失败：FailCount++、LastFailAt=now、Healthy=false。
+// FailCount 每次都在内存中自增，但仅在 healthy->unhealthy 的状态跳变时返回
+// changed=true 并持久化，避免失败风暴引发写入风暴。
+func MarkProxyUnhealthy(url string) (changed bool, err error) {
+	cfgLock.Lock()
+	defer cfgLock.Unlock()
+	for i := range cfg.ProxyPool {
+		if cfg.ProxyPool[i].URL != url {
+			continue
+		}
+		wasHealthy := cfg.ProxyPool[i].Healthy
+		cfg.ProxyPool[i].FailCount++
+		cfg.ProxyPool[i].LastFailAt = time.Now().Unix()
+		cfg.ProxyPool[i].Healthy = false
+		if wasHealthy {
+			return true, Save()
+		}
+		return false, nil
+	}
+	return false, nil
+}
+
+// MarkProxyHealthy 记录恢复：重置 FailCount、Healthy=true、LastOKAt=now。
+// 仅在 unhealthy->healthy 跳变时返回 changed=true 并持久化。
+func MarkProxyHealthy(url string) (changed bool, err error) {
+	// Fast path: a proxy that is already healthy with no accumulated failures
+	// needs no write. Every successful pooled request calls this, so an RLock
+	// here keeps the high-QPS success path from serializing on the write lock.
+	cfgLock.RLock()
+	for i := range cfg.ProxyPool {
+		if cfg.ProxyPool[i].URL == url {
+			if cfg.ProxyPool[i].Healthy && cfg.ProxyPool[i].FailCount == 0 {
+				cfgLock.RUnlock()
+				return false, nil
+			}
+			break
+		}
+	}
+	cfgLock.RUnlock()
+
+	cfgLock.Lock()
+	defer cfgLock.Unlock()
+	for i := range cfg.ProxyPool {
+		if cfg.ProxyPool[i].URL != url {
+			continue
+		}
+		wasHealthy := cfg.ProxyPool[i].Healthy
+		cfg.ProxyPool[i].FailCount = 0
+		cfg.ProxyPool[i].Healthy = true
+		cfg.ProxyPool[i].LastOKAt = time.Now().Unix()
+		if !wasHealthy {
+			return true, Save()
+		}
+		return false, nil
+	}
+	return false, nil
+}
+
+// SetProxyPoolDisabled 永久禁用/启用某个池化代理并持久化。
+func SetProxyPoolDisabled(url string, disabled bool) error {
+	cfgLock.Lock()
+	defer cfgLock.Unlock()
+	for i := range cfg.ProxyPool {
+		if cfg.ProxyPool[i].URL == url {
+			cfg.ProxyPool[i].DisabledPermanent = disabled
+			return Save()
+		}
+	}
+	return nil
 }
 
 // GetAllowOverUsage returns whether over-usage is allowed when account quota is exhausted.
@@ -2469,6 +2943,90 @@ func UpdateMetricsEnabled(enabled bool) error {
 	cfgLock.Lock()
 	defer cfgLock.Unlock()
 	cfg.MetricsEnabled = enabled
+	return Save()
+}
+
+// DefaultMaxPayloadBytes is the serialized-request byte cap used when the setting
+// is unset (0). 2,000,000 sits safely below the ~2.15MB AWS upstream ceiling while
+// leaving room for headers and serialization overhead.
+const DefaultMaxPayloadBytes = 2_000_000
+
+// GetMaxPayloadBytes returns the configured request byte cap, falling back to
+// DefaultMaxPayloadBytes when unset or non-positive.
+func GetMaxPayloadBytes() int {
+	cfgLock.RLock()
+	defer cfgLock.RUnlock()
+	if cfg == nil || cfg.MaxPayloadBytes <= 0 {
+		return DefaultMaxPayloadBytes
+	}
+	return cfg.MaxPayloadBytes
+}
+
+// UpdateMaxPayloadBytes sets the request byte cap and persists the change.
+func UpdateMaxPayloadBytes(n int) error {
+	cfgLock.Lock()
+	defer cfgLock.Unlock()
+	cfg.MaxPayloadBytes = n
+	return Save()
+}
+
+// GetPublicBaseURL returns the configured externally reachable base URL
+// (no trailing slash), or "" when unset. Used to build OAuth redirect_uri
+// values that work behind a reverse proxy / custom domain.
+func GetPublicBaseURL() string {
+	cfgLock.RLock()
+	defer cfgLock.RUnlock()
+	if cfg == nil {
+		return ""
+	}
+	return strings.TrimRight(cfg.PublicBaseURL, "/")
+}
+
+// UpdatePublicBaseURL sets the public base URL and persists the change.
+func UpdatePublicBaseURL(u string) error {
+	cfgLock.Lock()
+	defer cfgLock.Unlock()
+	cfg.PublicBaseURL = strings.TrimRight(strings.TrimSpace(u), "/")
+	return Save()
+}
+
+// GetForceModel returns the global force-model override (empty = disabled). When set,
+// every request's model is rewritten to this Kiro model ID regardless of what the
+// client sent or which model a key is bound to.
+func GetForceModel() string {
+	cfgLock.RLock()
+	defer cfgLock.RUnlock()
+	if cfg == nil {
+		return ""
+	}
+	return strings.TrimSpace(cfg.ForceModel)
+}
+
+// SetForceModel sets (or clears, when passed "") the global force-model override.
+func SetForceModel(m string) error {
+	cfgLock.Lock()
+	defer cfgLock.Unlock()
+	cfg.ForceModel = strings.TrimSpace(m)
+	return Save()
+}
+
+// GetIdentityModel returns the model name the assistant should self-identify as
+// (empty = disabled). This only affects the injected identity line in the system
+// prompt, not which upstream model actually serves the request.
+func GetIdentityModel() string {
+	cfgLock.RLock()
+	defer cfgLock.RUnlock()
+	if cfg == nil {
+		return ""
+	}
+	return strings.TrimSpace(cfg.IdentityModel)
+}
+
+// SetIdentityModel sets (or clears, when passed "") the self-identify model name.
+func SetIdentityModel(m string) error {
+	cfgLock.Lock()
+	defer cfgLock.Unlock()
+	cfg.IdentityModel = strings.TrimSpace(m)
 	return Save()
 }
 

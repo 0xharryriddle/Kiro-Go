@@ -521,7 +521,7 @@ func (h *Handler) recordBedrockSuccess(p forwardParams, inputTokens, outputToken
 		endpoint = "openai"
 	}
 	credits := bedrockCreditsForTokens(inputTokens + outputTokens)
-	h.recordSuccessForApiKey(p.apiKeyID, inputTokens, outputTokens, credits, p.model)
+	h.recordSuccessForApiKey(p.apiKeyID, inputTokens, outputTokens, credits, p.model, p.account, endpoint, reqStart)
 	h.pool.RecordSuccess(p.account.ID)
 	h.pool.RecordLatency(p.account.ID, float64(time.Since(reqStart).Milliseconds()))
 	h.pool.UpdateStats(p.account.ID, inputTokens+outputTokens, credits)

@@ -533,7 +533,7 @@ func (h *Handler) recordCustomApiSuccess(p forwardParams, inputTokens, outputTok
 	// Bill the REAL cost the upstream pool deducted for this request, read as the
 	// delta of its reported creditsUsed, instead of a flat token-derived price.
 	credits := h.billCustomApiRealCost(p, inputTokens, outputTokens)
-	h.recordSuccessForApiKey(p.apiKeyID, inputTokens, outputTokens, credits, p.model)
+	h.recordSuccessForApiKey(p.apiKeyID, inputTokens, outputTokens, credits, p.model, p.account, endpoint, reqStart)
 	h.pool.RecordSuccess(p.account.ID)
 	h.pool.RecordLatency(p.account.ID, float64(time.Since(reqStart).Milliseconds()))
 	h.pool.UpdateStats(p.account.ID, inputTokens+outputTokens, credits)

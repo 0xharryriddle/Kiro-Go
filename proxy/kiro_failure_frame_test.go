@@ -115,11 +115,20 @@ func TestFailureFrameStillCountsUsage(t *testing.T) {
 	cb := KiroStreamCallback{
 		OnComplete: func(in, out int) { gotIn, gotOut = in, out },
 	}
-	if err := parseEventStream(&stream, &cb); err != nil {
-		t.Fatalf("parseEventStream: %v", err)
-	}
+	// POLICY CHANGE (fork ↔ upstream v1.1.5 merge): the frame now surfaces an error
+	// at end-of-stream, so this no longer asserts nil. The BILLING requirement this
+	// test exists for is untouched and is the point of the assertion below: usage on
+	// a failure frame must still be counted, because the upstream charges for those
+	// tokens either way. OnComplete deliberately still fires for that reason — it
+	// only reports counters and is not the success signal (handlers gate success on
+	// the returned error). Upstream's variant of this test asserted the opposite
+	// ("OnComplete must not fire"), which would silently reopen this accounting hole.
+	err := parseEventStream(&stream, &cb)
 	if gotIn != 123 || gotOut != 45 {
 		t.Fatalf("usage on a failure frame was not counted: in=%d out=%d, want 123/45", gotIn, gotOut)
+	}
+	if err == nil {
+		t.Fatal("a failure frame must not be reported as a success")
 	}
 }
 

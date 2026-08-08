@@ -214,7 +214,12 @@ func (h *Handler) runWebSearchLoop(w http.ResponseWriter, req *ClaudeRequest, th
 			h.pool.RecordSuccess(accountID)
 			h.pool.UpdateStats(accountID, tokens, usage.credits)
 		}
-		h.recordSuccessForApiKey(apiKeyID, inputTokens, outputTokens, totalCredits, req.Model)
+		// account is nil here on purpose: this request was served by SEVERAL
+		// accounts (see the per-account settlement loop above), so naming any
+		// single one in the per-key record would misreport who did the work. The
+		// terminal round's account is carried by recordSuccessLog below, and the
+		// authoritative per-account split is already recorded via pool.UpdateStats.
+		h.recordSuccessForApiKey(apiKeyID, inputTokens, outputTokens, totalCredits, req.Model, nil, "claude", reqStart)
 		h.recordSuccessLog("claude", req.Model, lastAccountID, apiKeyID, inputTokens+outputTokens, totalCredits, time.Since(reqStart).Milliseconds())
 
 		if req.Stream {

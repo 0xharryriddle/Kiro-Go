@@ -331,6 +331,46 @@ func resolveClaudeThinkingMode(model string, thinkingCfg *ClaudeThinkingConfig, 
 	return actualModel, suffixThinking || isClaudeThinkingRequested(thinkingCfg)
 }
 
+// applyModelOverride returns the model to actually send upstream, applying the
+// precedence: global ForceModel > per-key Models allowlist > the resolved client model.
+// apiKeyID may be empty (no key / shared). Override values are themselves run through
+// ParseModelAndThinking so an operator can enter a friendly name (e.g. "claude-opus-4-8")
+// and it is normalized the same way a client model would be.
+//
+// Allowlist semantics: when the key has a non-empty Models list, a client model that is
+// in the list is passed through unchanged; a client model that is NOT in the list is
+// remapped to the first entry. A single-element list therefore reproduces the old
+// "force this one model" behavior exactly.
+func applyModelOverride(resolved, apiKeyID, thinkingSuffix string) string {
+	if forced := config.GetForceModel(); forced != "" {
+		norm, _ := ParseModelAndThinking(forced, thinkingSuffix)
+		return norm
+	}
+	if apiKeyID != "" {
+		if entry := config.GetApiKeyEntry(apiKeyID); entry != nil {
+			if allowed := entry.Models; len(allowed) > 0 {
+				first := ""
+				for _, m := range allowed {
+					if strings.TrimSpace(m) == "" {
+						continue
+					}
+					norm, _ := ParseModelAndThinking(m, thinkingSuffix)
+					if first == "" {
+						first = norm
+					}
+					if norm == resolved {
+						return resolved // client model is allowed — pass through
+					}
+				}
+				if first != "" {
+					return first // not allowed — remap to the first allowlisted model
+				}
+			}
+		}
+	}
+	return resolved
+}
+
 func isClaudeThinkingRequested(thinkingCfg *ClaudeThinkingConfig) bool {
 	if thinkingCfg == nil {
 		return false
@@ -639,7 +679,7 @@ func ClaudeToKiro(req *ClaudeRequest, thinking bool) *KiroPayload {
 		}
 	}
 
-	truncatePayloadToLimit(payload, systemPrompt != "")
+	truncatePayloadToLimit(payload, systemPrompt != "", modelID)
 
 	return payload
 }
@@ -667,13 +707,15 @@ func buildClaudeSystemPrompt(system interface{}, thinking bool, thinkingBudget i
 func applyPromptFilters(prompt string) string {
 	prompt = strings.TrimSpace(prompt)
 	if prompt == "" {
-		return ""
+		// No system prompt from the client, but an identity override may still
+		// need to be injected so the assistant self-reports the configured model.
+		return prependIdentity("")
 	}
 
 	// 1. Detect Claude Code CLI system prompt → replace with minimal backend prompt.
 	//    Run before other filters so we don't waste time stripping a prompt we'll replace anyway.
 	if config.GetFilterClaudeCode() && isClaudeCodeSystemPrompt(prompt) {
-		return claudeCodeBackendPrompt
+		return prependIdentity(claudeCodeBackendPrompt)
 	}
 
 	// 2. Strip --- SYSTEM PROMPT --- / --- END SYSTEM PROMPT --- boundary markers.
@@ -700,7 +742,45 @@ func applyPromptFilters(prompt string) string {
 		prompt = redactPII(prompt)
 	}
 
-	return strings.TrimSpace(prompt)
+	// MERGE POLICY NOTE (fork ↔ upstream v1.1.5): union. The fork's step 5 (PII
+	// redaction) is kept, and upstream's prependIdentity wrapper is kept on the
+	// return. The merge had left BOTH returns in sequence, so the fork's plain
+	// return shadowed upstream's and the identity override silently did nothing
+	// on this path — while the function's two OTHER exits (the empty-prompt case
+	// and the Claude Code replacement above) did apply it. The result was an
+	// assistant that self-reported the configured model only when the client sent
+	// no system prompt. prependIdentity is a no-op when IdentityModel is unset.
+	return prependIdentity(strings.TrimSpace(prompt))
+}
+
+// prependIdentity injects a self-identity line at the top of the system prompt
+// when config.IdentityModel is set, so the assistant self-reports as that model
+// regardless of the real upstream model. Empty IdentityModel = no change.
+func prependIdentity(prompt string) string {
+	model := config.GetIdentityModel()
+	if model == "" {
+		return prompt
+	}
+	line := buildIdentityLine(model)
+	if prompt == "" {
+		return line
+	}
+	return line + "\n\n" + prompt
+}
+
+// buildIdentityLine turns a Kiro model id (e.g. "claude-opus-4.8") into a
+// natural identity sentence ("You are Claude Opus 4.8. Model ID: claude-opus-4-8.").
+func buildIdentityLine(model string) string {
+	display := make([]string, 0, 4)
+	for _, seg := range strings.Split(model, "-") {
+		if seg == "" {
+			continue
+		}
+		display = append(display, strings.ToUpper(seg[:1])+seg[1:])
+	}
+	name := strings.Join(display, " ")
+	id := strings.ReplaceAll(model, ".", "-")
+	return fmt.Sprintf("You are %s. Model ID: %s.", name, id)
 }
 
 // piiPatterns are the compiled PII redaction rules, applied in order. Each maps a
@@ -1577,9 +1657,16 @@ func OpenAIToKiro(req *OpenAIRequest, thinking bool) *KiroPayload {
 		}
 	}
 
+	// Apply prompt filters + identity injection, same as the Claude path.
+	systemPrompt = applyPromptFilters(systemPrompt)
+
 	// 如果启用 thinking 模式，注入 thinking 提示
 	if thinking {
-		systemPrompt = ThinkingModePrompt + "\n\n" + systemPrompt
+		if systemPrompt == "" {
+			systemPrompt = ThinkingModePrompt
+		} else {
+			systemPrompt = ThinkingModePrompt + "\n\n" + systemPrompt
+		}
 	}
 
 	// 构建历史消息
@@ -1779,7 +1866,7 @@ func OpenAIToKiro(req *OpenAIRequest, thinking bool) *KiroPayload {
 		}
 	}
 
-	truncatePayloadToLimit(payload, systemPrompt != "")
+	truncatePayloadToLimit(payload, systemPrompt != "", modelID)
 
 	return payload
 }
@@ -2187,7 +2274,14 @@ func shrinkPayloadAfterLengthRejection(payload *KiroPayload) bool {
 // A single placeholder note (truncationPlaceholder) is inserted where older
 // turns were removed so the model is aware context was elided. hasPriming
 // indicates whether history begins with the 2-entry system priming pair.
-func truncatePayloadToLimit(payload *KiroPayload, hasPriming bool) {
+//
+// Two independent ceilings are enforced: the serialized byte cap
+// (config.GetMaxPayloadBytes) and the model's input-token window minus output
+// headroom (maxInputTokensForModel). Trimming continues until BOTH fit, so a
+// small-window model (e.g. 200K) is trimmed on tokens well before the 2MB byte
+// cap would ever fire — which is what prevents the upstream from being fed a
+// near-full context that leaves no room for the reply.
+func truncatePayloadToLimit(payload *KiroPayload, hasPriming bool, model string) {
 	if payload == nil {
 		return
 	}
@@ -2402,6 +2496,81 @@ func historyEntryByteSize(entry KiroHistoryMessage) int {
 		return 0
 	}
 	return len(raw) + 1
+}
+
+// userInputTokenSize estimates the input tokens contributed by a single Kiro
+// user message (its text plus any attached tool specs / tool results).
+func userInputTokenSize(m *KiroUserInputMessage) int {
+	if m == nil {
+		return 0
+	}
+	total := estimateApproxTokens(m.Content)
+	if m.UserInputMessageContext != nil {
+		for _, tw := range m.UserInputMessageContext.Tools {
+			total += estimateApproxTokens(tw.ToolSpecification.Name)
+			total += estimateApproxTokens(tw.ToolSpecification.Description)
+			total += estimateJSONTokens(tw.ToolSpecification.InputSchema.JSON)
+		}
+		for _, tr := range m.UserInputMessageContext.ToolResults {
+			for _, c := range tr.Content {
+				total += estimateApproxTokens(c.Text)
+			}
+		}
+	}
+	return total
+}
+
+// historyEntryTokenSize estimates the input tokens contributed by one history entry.
+func historyEntryTokenSize(entry KiroHistoryMessage) int {
+	if entry.UserInputMessage != nil {
+		return userInputTokenSize(entry.UserInputMessage)
+	}
+	if a := entry.AssistantResponseMessage; a != nil {
+		total := estimateApproxTokens(a.Content)
+		for _, tu := range a.ToolUses {
+			total += estimateApproxTokens(tu.Name) + estimateJSONTokens(tu.Input)
+		}
+		return total
+	}
+	return 0
+}
+
+// payloadInputTokenSize estimates the total input tokens of the serialized payload
+// (current message + full history). Used to trim against the model's token window.
+func payloadInputTokenSize(payload *KiroPayload) int {
+	total := userInputTokenSize(&payload.ConversationState.CurrentMessage.UserInputMessage)
+	for _, h := range payload.ConversationState.History {
+		total += historyEntryTokenSize(h)
+	}
+	return total
+}
+
+// maxInputTokensForModel returns the input-token ceiling for the payload: the
+// model's context window minus room reserved for output. Reserve is the client's
+// requested max_tokens, floored at 10% of the window so at least that much output
+// headroom always remains (and input never exceeds ~90% of the window).
+func maxInputTokensForModel(payload *KiroPayload, model string) int {
+	window := getContextWindowSize(model)
+	reserve := 0
+	if payload.InferenceConfig != nil {
+		reserve = payload.InferenceConfig.MaxTokens
+	}
+	if minReserve := window / 10; reserve < minReserve {
+		reserve = minReserve
+	}
+	if budget := window - reserve; budget > 0 {
+		return budget
+	}
+	return 0
+}
+
+// dropLeadingAssistant removes a leading assistant message from a history tail so
+// it does not directly follow the placeholder user turn with a broken pairing.
+func dropLeadingAssistant(tail []KiroHistoryMessage) []KiroHistoryMessage {
+	for len(tail) > 0 && tail[0].AssistantResponseMessage != nil {
+		tail = tail[1:]
+	}
+	return tail
 }
 
 // payloadByteSize returns the serialized size of the payload in bytes.

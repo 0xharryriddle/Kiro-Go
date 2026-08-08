@@ -171,6 +171,150 @@ func TestUpdateAccountStaleSnapshotPreservesCredentialRotation(t *testing.T) {
 	}
 }
 
+func TestRequireProxyRoundTrip(t *testing.T) {
+	if err := Init(filepath.Join(t.TempDir(), "config.json")); err != nil {
+		t.Fatalf("init config: %v", err)
+	}
+	if GetRequireProxy() {
+		t.Fatalf("expected require-proxy to default off")
+	}
+	if err := UpdateRequireProxy(true); err != nil {
+		t.Fatalf("update require-proxy: %v", err)
+	}
+	if !GetRequireProxy() {
+		t.Fatalf("expected require-proxy to be enabled after update")
+	}
+}
+
+func TestProxyPoolAddDedupeAndRemove(t *testing.T) {
+	if err := Init(filepath.Join(t.TempDir(), "config.json")); err != nil {
+		t.Fatalf("init config: %v", err)
+	}
+	const u = "socks5://host:1080"
+	if err := AddProxyToPool(u); err != nil {
+		t.Fatalf("add proxy: %v", err)
+	}
+	if err := AddProxyToPool(u); err != nil {
+		t.Fatalf("add proxy (dup): %v", err)
+	}
+	pool := GetProxyPool()
+	if len(pool) != 1 {
+		t.Fatalf("expected 1 entry after dup add, got %d", len(pool))
+	}
+	if !pool[0].Healthy {
+		t.Fatalf("expected new entry to be Healthy=true")
+	}
+	if pool[0].LastOKAt == 0 {
+		t.Fatalf("expected LastOKAt to be set on new entry")
+	}
+	if err := RemoveProxyFromPool(u); err != nil {
+		t.Fatalf("remove proxy: %v", err)
+	}
+	if got := len(GetProxyPool()); got != 0 {
+		t.Fatalf("expected empty pool after remove, got %d", got)
+	}
+}
+
+func TestMarkProxyUnhealthyHealthyTransition(t *testing.T) {
+	if err := Init(filepath.Join(t.TempDir(), "config.json")); err != nil {
+		t.Fatalf("init config: %v", err)
+	}
+	const u = "http://host:3128"
+	if err := AddProxyToPool(u); err != nil {
+		t.Fatalf("add proxy: %v", err)
+	}
+
+	// First unhealthy: healthy -> unhealthy transition.
+	changed, err := MarkProxyUnhealthy(u)
+	if err != nil {
+		t.Fatalf("mark unhealthy: %v", err)
+	}
+	if !changed {
+		t.Fatalf("expected changed=true on first unhealthy")
+	}
+	// Second unhealthy: already unhealthy, no transition but FailCount still increments.
+	changed, err = MarkProxyUnhealthy(u)
+	if err != nil {
+		t.Fatalf("mark unhealthy (2): %v", err)
+	}
+	if changed {
+		t.Fatalf("expected changed=false on second unhealthy")
+	}
+
+	pool := GetProxyPool()
+	if len(pool) != 1 {
+		t.Fatalf("expected 1 entry, got %d", len(pool))
+	}
+	if pool[0].Healthy {
+		t.Fatalf("expected Healthy=false after unhealthy calls")
+	}
+	if pool[0].FailCount != 2 {
+		t.Fatalf("expected FailCount=2, got %d", pool[0].FailCount)
+	}
+	if pool[0].LastFailAt == 0 {
+		t.Fatalf("expected LastFailAt to be set")
+	}
+
+	// First healthy: unhealthy -> healthy transition.
+	changed, err = MarkProxyHealthy(u)
+	if err != nil {
+		t.Fatalf("mark healthy: %v", err)
+	}
+	if !changed {
+		t.Fatalf("expected changed=true on first healthy")
+	}
+	// Second healthy: already healthy, no transition.
+	changed, err = MarkProxyHealthy(u)
+	if err != nil {
+		t.Fatalf("mark healthy (2): %v", err)
+	}
+	if changed {
+		t.Fatalf("expected changed=false on second healthy")
+	}
+
+	pool = GetProxyPool()
+	if !pool[0].Healthy {
+		t.Fatalf("expected Healthy=true after healthy calls")
+	}
+	if pool[0].FailCount != 0 {
+		t.Fatalf("expected FailCount reset to 0, got %d", pool[0].FailCount)
+	}
+	if pool[0].LastOKAt == 0 {
+		t.Fatalf("expected LastOKAt to be set")
+	}
+}
+
+func TestProxyPoolRoundTrip(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	if err := Init(path); err != nil {
+		t.Fatalf("init config: %v", err)
+	}
+	urls := []string{"socks5://a:1080", "http://b:3128"}
+	for _, u := range urls {
+		if err := AddProxyToPool(u); err != nil {
+			t.Fatalf("add proxy %q: %v", u, err)
+		}
+	}
+
+	// Reload a fresh Config from the same path.
+	if err := Init(path); err != nil {
+		t.Fatalf("reload config: %v", err)
+	}
+	pool := GetProxyPool()
+	if len(pool) != len(urls) {
+		t.Fatalf("expected %d entries after reload, got %d", len(urls), len(pool))
+	}
+	got := map[string]bool{}
+	for _, p := range pool {
+		got[p.URL] = true
+	}
+	for _, u := range urls {
+		if !got[u] {
+			t.Fatalf("expected %q to survive reload", u)
+		}
+	}
+}
+
 // TestAccountAllowOverageMigration verifies that a config.json from before the
 // upstream-Overages-switch refactor (which carried `allowOverage: true` per
 // account) is migrated into OverageStatus="ENABLED" on first load, and that

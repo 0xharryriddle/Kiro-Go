@@ -99,6 +99,17 @@ func loadResponse(id string) (*ResponsesObject, error) {
 		_ = os.Remove(path)
 		return nil, fmt.Errorf("stored response expired")
 	}
+	// MERGE POLICY NOTE (fork ↔ upstream v1.1.5): the fork's OwnerApiKeyID and
+	// upstream's APIKeyID are the same concept (which customer key created this
+	// response) under two names. ResponsesObject carries only OwnerApiKeyID, so
+	// upstream's persisted `api_key_id` is read as a FALLBACK: a record written
+	// in that shape keeps its owner instead of reading back unowned, which would
+	// make it continuable by any tenant (responses_history.go:82 refuses a
+	// cross-tenant previous_response_id only when the owner is known).
+	owner := doc.OwnerApiKeyID
+	if owner == "" {
+		owner = doc.APIKeyID
+	}
 	return &ResponsesObject{
 		ID:                 doc.ID,
 		Object:             doc.Object,
@@ -112,7 +123,7 @@ func loadResponse(id string) (*ResponsesObject, error) {
 		Instructions:       doc.Instructions,
 		StoredInput:        doc.StoredInput,
 		StoredAt:           doc.StoredAt,
-		OwnerApiKeyID:      doc.OwnerApiKeyID,
+		OwnerApiKeyID:      owner,
 	}, nil
 }
 
@@ -189,4 +200,5 @@ type storedResponseDoc struct {
 	// ownership survives a restart; absent on records written before ownership
 	// tracking existed, which read back as "" (unowned).
 	OwnerApiKeyID string `json:"owner_api_key_id,omitempty"`
+	APIKeyID      string `json:"api_key_id,omitempty"`
 }

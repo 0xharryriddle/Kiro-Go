@@ -6,6 +6,18 @@ was verified by command output at handoff time (2026-07-30, deployed source
 Where something is unverified or unknown, it says so — do not upgrade those to
 facts without checking.
 
+> **STATE CHANGED SINCE THAT HANDOFF — read this first (round 18).**
+> The tree is **mid-merge again**, against a *different* fork this time:
+> `MERGE_HEAD` = `8a2dfc4` from remote `hian699`
+> (`https://github.com/hian699/Kiro-Go`), 48 incoming commits over merge base
+> `a2e3971`, version now `1.2.8`. HEAD is `9f0b943`.
+> All conflicts are resolved in the working tree, 0 conflict markers, 0 unmerged
+> paths, and the gate is green from a cold cache (**1328 tests**), but the merge is
+> **NOT COMMITTED** — `MERGE_HEAD` is still set.
+> Two statements below are now stale and are corrected in place: the container is
+> **not running** (§2), and failure-frame handling is **no longer observation-only**
+> (§6b). Section 6b is the one to read before touching `proxy/kiro.go`.
+
 ---
 
 ## 1. Your task
@@ -64,11 +76,11 @@ these. Verified to be a STALL, not a deadlock — `config` imports nothing from
 | HEAD before this handoff-only sync | `5360970` (round 17d handoff sync) — check `git log -1` for the resulting doc commit |
 | Remote | `origin/harry` identical (0 ahead / 0 behind) |
 | Working tree | clean at commit time |
-| Tests | 980 top-level test funcs pass across `config` `pool` `auth` `proxy` (measured per-package, not remembered: 957 at round 16 + 6 round 17b + 7 round 17c + 10 round 17d. Breakdown: config 72, pool 91, auth 54, proxy 763) |
+| Tests | 980 top-level test funcs at that handoff (config 72, pool 91, auth 54, proxy 763). **Now 1063** after the v1.2.8 merge — config 77, pool 91, auth 63, proxy 832; `go test ./... -count=1` reports **1328 passed** including subtests |
 | `-race` | clean, 0 data races (`go test ./... -race -count=1`) |
 | `go vet` / `gofmt` | clean tree-wide |
 | CI | **now gated** — `.github/workflows/ci.yml` runs build + vet + gofmt + `-race` on push/PR to `main`/`master`/`dev`/`harry`. Go 1.23, matching the Dockerfile builder |
-| Live container | **healthy**, Docker health `healthy`, failing streak 0, restart count 0; `/healthz`, `/v1/models`, and `/admin` all returned HTTP 200 after a full healthcheck interval |
+| Live container | **STALE — now NOT RUNNING.** `docker ps --filter name=kiro-go` returns no row (round 18). It *was* healthy at the 2026-07-30 handoff: Docker health `healthy`, failing streak 0, restart count 0, `/healthz` + `/v1/models` + `/admin` all HTTP 200 after a full healthcheck interval. Nothing has been deployed since, and the v1.2.8 merge is not built into any image |
 | Deployed image built from | `5360970`; image `sha256:2958ed773ea8450d4b1edf9ecc89d8880200c73d509c4083c93bc2eea284e1fb`. Rounds 14-17 are deployed |
 | Rollback | tag `kiro-go-kiro-go:rollback-71f4e867` -> image `sha256:71f4e867f1746743b6ba8126448c5e41932d43653af4cb7b723e43acf0350cad`; extracted binary SHA-256 `ea1c94aca6ce42068e8abbf1870f5a4180eb13264c19c2bae6c82af4b52b9e03` |
 
@@ -439,21 +451,48 @@ three files as unreviewed; two had already been handled, and one line-count loop
 silently reported `0 lines` for all three because the paths were wrong. Re-measure
 before trusting any inventory in this document.
 
-### 6b. Blocked pending observation — do not force
+### 6b. Failure frames — RESOLVED in round 18 (this section changed; read it)
 
-**Failure-frame promotion.** `parseEventStream` now OBSERVES AWS exception frames
-(`:message-type: exception|error`) and logs them, but never treats them as fatal.
-Promoting specific `:exception-type` values to abort a stream needs a **real
-observed frame**. The trace corpus cannot supply one (`noteResponseText` stores
-assembled text, so frame headers are destroyed before capture). Check for
-accumulated evidence:
+**This item is no longer blocked, and the policy it described is no longer what the
+code does.** It used to say: `parseEventStream` observes AWS exception frames
+(`:message-type: exception|error`), logs them, and never treats them as fatal —
+promoting any `:exception-type` needed a real observed frame first.
+
+The second merge (`hian699` v1.2.8) forced the question, because upstream had
+implemented the opposite policy and its test contradicted the fork's four. The
+resolution is **drain-then-error**, and it is neither side verbatim:
+
+- the failure frame is recorded, the loop **keeps draining**, and every subsequent
+  content frame is still delivered to the client;
+- the error is returned only at **end-of-stream** (`failureFrameErr`, `proxy/kiro.go`),
+  so it costs no client text;
+- `OnComplete` still fires, so usage a failure frame carried is still billed.
+
+The old "do not force it" reasoning was about *aborting mid-answer*. Draining removes
+that risk entirely, so the blocker did not apply to this shape. What did apply is the
+opposite risk, which returning `nil` had left open: a false success clears the
+account's cooldown via `pool.RecordSuccess` and bills the customer key an estimated
+input total — the same failure class round 12 closed in this same function.
+
+Still true, and still the reason nothing is promoted per-type: **no real Kiro
+exception frame has ever been observed.** The corpus cannot supply one
+(`noteResponseText` stores assembled text, so headers are destroyed before capture).
+Only throttling is mapped to a status (`HTTP 429`, so `isQuotaErrorMessage` matches
+it); everything else stays a generic upstream failure, because the 403 path
+*disables* an account and a mis-inference there costs a working account.
+
+Evidence counter, still worth checking as frames accumulate:
 
 ```bash
 docker logs kiro-go-kiro-go-1 2>&1 | grep -c "upstream failure frame"
 ```
 
-Zero at handoff. Acting on the AWS spec alone risks killing live streams on the
-hot path — worse than the imprecision it fixes.
+Zero when last checked — and note the container was **not running** at that point, so
+that zero is not evidence of absence. See §2.
+
+**Do not "restore" the observation-only policy** without reading the round-18 entry
+in the checkpoint: five test assertions encode this decision, each carrying a
+`POLICY CHANGE` comment explaining what replaced it.
 
 ### 6c. Closed by operator decision — do NOT "fix"
 

@@ -66,8 +66,15 @@ func TestParseEventStreamReportsExceptionFrames(t *testing.T) {
 			seenMessage = string(payload)
 		},
 	}
-	if err := parseEventStream(&stream, &cb); err != nil {
-		t.Fatalf("parseEventStream returned an error for an observed exception frame: %v", err)
+	// POLICY CHANGE (fork ↔ upstream v1.1.5 merge): a drained failure frame now
+	// surfaces an error at end-of-stream. This assertion was `err != nil -> fatal`
+	// under the fork's observation-only policy; it is inverted rather than deleted
+	// because "must not report success" is the property that replaced it. The
+	// REPORTING requirement this test exists for is unchanged and still asserted
+	// below. See the merge policy note in parseEventStream for why nil was unsafe:
+	// it mis-billed the customer key and cleared the account's cooldown.
+	if err := parseEventStream(&stream, &cb); err == nil {
+		t.Fatal("an observed exception frame must not be reported as a success")
 	}
 
 	if seenType != "ThrottlingException" {
@@ -90,11 +97,17 @@ func TestExceptionFrameDoesNotAbortTheStream(t *testing.T) {
 	cb := KiroStreamCallback{
 		OnText: func(text string, isThinking bool) { got += text },
 	}
-	if err := parseEventStream(&stream, &cb); err != nil {
-		t.Fatalf("parseEventStream error: %v", err)
-	}
+	// POLICY CHANGE (fork ↔ upstream v1.1.5 merge): the frame is now reported as an
+	// error, but only AFTER the stream is fully drained. The requirement this test
+	// exists for — an exception frame must not stop delivery of the content that
+	// follows it — is therefore unchanged and is what the assertion below still
+	// pins. Only the return value moved (nil -> non-nil).
+	err := parseEventStream(&stream, &cb)
 	if got != "text after the exception" {
 		t.Fatalf("text following an exception frame was lost: got %q", got)
+	}
+	if err == nil {
+		t.Fatal("a drained exception frame must still surface an error, not a silent success")
 	}
 }
 
@@ -108,11 +121,16 @@ func TestExceptionFrameWithNoObserverIsSafe(t *testing.T) {
 	cb := KiroStreamCallback{
 		OnText: func(text string, isThinking bool) { got += text },
 	}
-	if err := parseEventStream(&stream, &cb); err != nil {
-		t.Fatalf("parseEventStream error with nil observer: %v", err)
-	}
+	// POLICY CHANGE (fork ↔ upstream v1.1.5 merge): as above, the frame now surfaces
+	// an error after the drain. The property under test is that a nil
+	// OnUpstreamException must not panic or truncate the stream — asserted by the
+	// content check below, which is unchanged.
+	err := parseEventStream(&stream, &cb)
 	if got != "still here" {
 		t.Fatalf("stream broke when no exception observer was set: got %q", got)
+	}
+	if err == nil {
+		t.Fatal("a drained exception frame must surface an error even with no observer set")
 	}
 }
 

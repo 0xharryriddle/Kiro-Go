@@ -65,42 +65,82 @@ func GetApiKeyEntry(id string) *ApiKeyEntry {
 // AddApiKey appends a new API key entry. Generates ID and CreatedAt if missing,
 // rejects empty Key values, and refuses duplicates of an existing Key.
 func AddApiKey(entry ApiKeyEntry) (ApiKeyEntry, error) {
+	entries, err := AddApiKeys([]ApiKeyEntry{entry})
+	if err != nil {
+		return ApiKeyEntry{}, err
+	}
+	return entries[0], nil
+}
+
+func AddApiKeys(entries []ApiKeyEntry) ([]ApiKeyEntry, error) {
 	cfgLock.Lock()
 	defer cfgLock.Unlock()
 	if cfg == nil {
-		return ApiKeyEntry{}, errors.New("config not initialized")
+		return nil, errors.New("config not initialized")
 	}
-	entry.Key = strings.TrimSpace(entry.Key)
-	if entry.Key == "" {
-		return ApiKeyEntry{}, errors.New("api key value must not be empty")
+	if len(entries) == 0 {
+		return nil, errors.New("no api keys provided")
 	}
-	// Derive hash + display mask; the plaintext is never persisted.
-	newHash := HashApiKey(entry.Key)
+
+	// MERGE POLICY NOTE (fork ↔ hian699): upstream's batch shape (many keys per
+	// call, all-or-nothing rollback) is kept, but its de-duplication and storage
+	// were plaintext-based: it wrote entry.Key straight into cfg.ApiKeys and
+	// compared against existing.Key. This fork stores keys HASHED at rest
+	// (KeyHash + display-only KeyMask, Key cleared — see config.go's ApiKeyEntry
+	// and the plaintext→hash migration on load), so `existing.Key` is "" for every
+	// stored entry and a plaintext dedupe check would silently never match while
+	// re-persisting the secret. Dedupe therefore compares HASHES, and the
+	// plaintext is returned to the caller but never stored.
+	seen := make(map[string]bool, len(cfg.ApiKeys)+len(entries))
 	for _, existing := range cfg.ApiKeys {
-		if existing.KeyHash == newHash {
-			return ApiKeyEntry{}, errors.New("api key already exists")
+		if existing.KeyHash != "" {
+			seen[existing.KeyHash] = true
 		}
 	}
-	if entry.ID == "" {
-		entry.ID = newUUID()
+
+	now := time.Now().Unix()
+	// out carries the plaintext back to the caller (the one-time create response
+	// that admin_apikeys.go / admin_bot_api.go hand to the buyer); stored holds
+	// the at-rest copies with the plaintext cleared.
+	out := make([]ApiKeyEntry, len(entries))
+	stored := make([]ApiKeyEntry, len(entries))
+	for i, entry := range entries {
+		entry.Key = strings.TrimSpace(entry.Key)
+		if entry.Key == "" {
+			return nil, errors.New("api key value must not be empty")
+		}
+		hash := HashApiKey(entry.Key)
+		if seen[hash] {
+			return nil, errors.New("api key already exists")
+		}
+		seen[hash] = true
+		if entry.ID == "" {
+			entry.ID = newUUID()
+		}
+		if entry.CreatedAt == 0 {
+			entry.CreatedAt = now
+		}
+		// Bound accounts are optional: an empty set means the key routes through the
+		// shared pool. When set, drop unknown/duplicate ids so only live accounts remain.
+		entry.BoundAccountIDs = sanitizeBoundAccountIDsLocked(entry.BoundAccountIDs)
+		entry.Models = sanitizeModelList(entry.Models)
+		entry.Model = ""
+		entry.KeyHash = hash
+		entry.KeyMask = MaskApiKey(entry.Key)
+		out[i] = entry
+
+		atRest := entry
+		atRest.Key = "" // never store plaintext at rest
+		stored[i] = atRest
 	}
-	if entry.CreatedAt == 0 {
-		entry.CreatedAt = time.Now().Unix()
-	}
-	plaintext := entry.Key
-	entry.KeyHash = newHash
-	entry.KeyMask = MaskApiKey(plaintext)
-	entry.Key = "" // never store plaintext at rest
-	cfg.ApiKeys = append(cfg.ApiKeys, entry)
+
+	oldLen := len(cfg.ApiKeys)
+	cfg.ApiKeys = append(cfg.ApiKeys, stored...)
 	if err := saveLocked(); err != nil {
-		// Roll back the in-memory append so we don't leave inconsistent state.
-		cfg.ApiKeys = cfg.ApiKeys[:len(cfg.ApiKeys)-1]
-		return ApiKeyEntry{}, err
+		cfg.ApiKeys = cfg.ApiKeys[:oldLen]
+		return nil, err
 	}
-	// Return the plaintext to the caller (one-time create response); the stored
-	// copy has it cleared.
-	entry.Key = plaintext
-	return entry, nil
+	return out, nil
 }
 
 // UpdateApiKey applies a patch to an existing API key. Patch semantics:
@@ -144,8 +184,16 @@ func UpdateApiKey(id string, patch ApiKeyEntry) error {
 	cfg.ApiKeys[idx].Enabled = patch.Enabled
 	cfg.ApiKeys[idx].TokenLimit = patch.TokenLimit
 	cfg.ApiKeys[idx].CreditLimit = patch.CreditLimit
-	cfg.ApiKeys[idx].RpmLimit = patch.RpmLimit
-	cfg.ApiKeys[idx].TpmLimit = patch.TpmLimit
+	cfg.ApiKeys[idx].ExpiresAt = patch.ExpiresAt
+	cfg.ApiKeys[idx].RPMLimit = patch.RPMLimit
+	cfg.ApiKeys[idx].IPLimit = patch.IPLimit
+	cfg.ApiKeys[idx].IPAllowlist = patch.IPAllowlist
+	cfg.ApiKeys[idx].TPMLimit = patch.TPMLimit
+	// Bound accounts are always overwritten from the patch (sanitized). Empty = the key
+	// falls back to shared-pool routing; a non-empty set restricts it to those accounts.
+	cfg.ApiKeys[idx].BoundAccountIDs = sanitizeBoundAccountIDsLocked(patch.BoundAccountIDs)
+	cfg.ApiKeys[idx].Models = sanitizeModelList(patch.Models)
+	cfg.ApiKeys[idx].Model = ""
 	if patch.Migrated {
 		cfg.ApiKeys[idx].Migrated = true
 	}
@@ -155,18 +203,44 @@ func UpdateApiKey(id string, patch ApiKeyEntry) error {
 // DeleteApiKey removes the API key entry with the given ID. Returns nil even if
 // the ID is unknown (idempotent), matching the existing DeleteAccount style.
 func DeleteApiKey(id string) error {
+	_, err := DeleteApiKeys([]string{id})
+	return err
+}
+
+func DeleteApiKeys(ids []string) (int, error) {
 	cfgLock.Lock()
 	defer cfgLock.Unlock()
 	if cfg == nil {
-		return errors.New("config not initialized")
+		return 0, errors.New("config not initialized")
 	}
-	for i, e := range cfg.ApiKeys {
-		if e.ID == id {
-			cfg.ApiKeys = append(cfg.ApiKeys[:i], cfg.ApiKeys[i+1:]...)
-			return saveLocked()
+	want := make(map[string]bool, len(ids))
+	for _, id := range ids {
+		if strings.TrimSpace(id) != "" {
+			want[id] = true
 		}
 	}
-	return nil
+	if len(want) == 0 {
+		return 0, errors.New("no api key ids provided")
+	}
+	original := append([]ApiKeyEntry(nil), cfg.ApiKeys...)
+	kept := cfg.ApiKeys[:0]
+	deleted := 0
+	for _, e := range cfg.ApiKeys {
+		if want[e.ID] {
+			deleted++
+			continue
+		}
+		kept = append(kept, e)
+	}
+	cfg.ApiKeys = kept
+	if deleted == 0 {
+		return 0, nil
+	}
+	if err := saveLocked(); err != nil {
+		cfg.ApiKeys = original
+		return deleted, err
+	}
+	return deleted, nil
 }
 
 // FindApiKeyByValue returns a copy of the entry whose stored hash matches the
@@ -216,11 +290,14 @@ func RecordApiKeyUsage(id string, tokens int64, credits float64, model string) e
 		if cfg.ApiKeys[i].ID == id {
 			if tokens > 0 {
 				cfg.ApiKeys[i].TokensUsed += tokens
+				cfg.ApiKeys[i].LifetimeTokens += tokens
 			}
 			if credits > 0 {
 				cfg.ApiKeys[i].CreditsUsed += credits
+				cfg.ApiKeys[i].LifetimeCredits += credits
 			}
 			cfg.ApiKeys[i].RequestsCount++
+			cfg.ApiKeys[i].LifetimeRequests++
 			cfg.ApiKeys[i].LastUsedAt = time.Now().Unix()
 
 			// Per-model breakdown.
@@ -251,8 +328,10 @@ func RecordApiKeyUsage(id string, tokens int64, credits float64, model string) e
 	return errors.New("api key not found")
 }
 
-// ResetApiKeyUsage clears TokensUsed/CreditsUsed/RequestsCount for the entry.
-// LastUsedAt is preserved so operators can still see when the key was last used.
+// ResetApiKeyUsage clears the current-period counters (TokensUsed/CreditsUsed/
+// RequestsCount) for the entry, granting a fresh quota. Lifetime counters are left
+// untouched so the grand total survives. LastUsedAt is preserved so operators can
+// still see when the key was last used.
 func ResetApiKeyUsage(id string) error {
 	cfgLock.Lock()
 	defer cfgLock.Unlock()
@@ -363,6 +442,79 @@ func RechargeApiKey(id string, addCredits float64, addTokens int64) (ApiKeyEntry
 	return ApiKeyEntry{}, errors.New("api key not found")
 }
 
+// ResetApiKeyUsageAll clears BOTH the current-period counters and the lifetime counters
+// for the entry, wiping all recorded usage as if the key were new. LastUsedAt is
+// preserved. Use this for the "Reset All" action; use ResetApiKeyUsage for a routine
+// per-cycle quota reset that keeps the grand total.
+func ResetApiKeyUsageAll(id string) error {
+	cfgLock.Lock()
+	defer cfgLock.Unlock()
+	if cfg == nil {
+		return errors.New("config not initialized")
+	}
+	for i := range cfg.ApiKeys {
+		if cfg.ApiKeys[i].ID == id {
+			cfg.ApiKeys[i].TokensUsed = 0
+			cfg.ApiKeys[i].CreditsUsed = 0
+			cfg.ApiKeys[i].RequestsCount = 0
+			cfg.ApiKeys[i].LifetimeTokens = 0
+			cfg.ApiKeys[i].LifetimeCredits = 0
+			cfg.ApiKeys[i].LifetimeRequests = 0
+			return saveLocked()
+		}
+	}
+	return errors.New("api key not found")
+}
+
+// sanitizeBoundAccountIDsLocked trims, de-duplicates, and drops unknown IDs from a
+// key's bound-account list, keeping only IDs that match a currently-stored account.
+// Order is preserved (first occurrence wins). MUST be called with cfgLock held,
+// since it reads cfg.Accounts directly (the RWMutex is not reentrant).
+func sanitizeBoundAccountIDsLocked(ids []string) []string {
+	if len(ids) == 0 {
+		return nil
+	}
+	known := make(map[string]bool, len(cfg.Accounts))
+	for _, a := range cfg.Accounts {
+		known[a.ID] = true
+	}
+	seen := make(map[string]bool, len(ids))
+	out := make([]string, 0, len(ids))
+	for _, raw := range ids {
+		id := strings.TrimSpace(raw)
+		if id == "" || seen[id] || !known[id] {
+			continue
+		}
+		seen[id] = true
+		out = append(out, id)
+	}
+	return out
+}
+
+// sanitizeModelList trims, drops empties, and de-duplicates a key's model allowlist,
+// preserving order (first occurrence wins). Returns nil for an empty result so the
+// field is omitted from JSON. Model IDs are stored verbatim (as chosen in the UI);
+// normalization to the canonical upstream name happens later in applyModelOverride.
+func sanitizeModelList(models []string) []string {
+	if len(models) == 0 {
+		return nil
+	}
+	seen := make(map[string]bool, len(models))
+	out := make([]string, 0, len(models))
+	for _, raw := range models {
+		m := strings.TrimSpace(raw)
+		if m == "" || seen[m] {
+			continue
+		}
+		seen[m] = true
+		out = append(out, m)
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
 // GenerateApiKeyValue returns a new random 32-byte hex API key prefixed with "sk-".
 func GenerateApiKeyValue() string {
 	buf := make([]byte, 32)
@@ -391,10 +543,16 @@ func MaskApiKey(key string) string {
 	if key == "" {
 		return ""
 	}
-	if len(key) <= 10 {
+	if len(key) <= 6 {
 		return key
 	}
-	return key[:6] + "****" + key[len(key)-4:]
+	return key[:3] + "***" + key[len(key)-3:]
+}
+
+// ApiKeyExpired reports whether the key has a set expiry (ExpiresAt > 0) that is now
+// in the past. Keys with ExpiresAt == 0 never expire.
+func ApiKeyExpired(e ApiKeyEntry) bool {
+	return e.ExpiresAt > 0 && time.Now().Unix() >= e.ExpiresAt
 }
 
 // ApiKeyOverLimit returns (overToken, overCredit) for the entry. Limits with value 0

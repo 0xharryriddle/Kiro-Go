@@ -6,16 +6,25 @@
 
   // State
   const baseUrl = location.origin;
-  if (localStorage.getItem('kiro_remember') !== '1') {
-    localStorage.removeItem('admin_password');
-    localStorage.removeItem('admin_login_time');
-  }
-  let password = sessionStorage.getItem('admin_password') || localStorage.getItem('admin_password') || '';
+  // Auth is cookie-based: the server issues an opaque HttpOnly session token at
+  // login. The admin password is never stored client-side. Purge any credential
+  // left over from older builds that persisted the raw password.
+  ['admin_password', 'admin_login_time', 'kiro_remembered_pwd'].forEach((k) => {
+    localStorage.removeItem(k);
+    sessionStorage.removeItem(k);
+  });
   let currentLang = localStorage.getItem('kiro_lang') || 'zh';
   const dict = { en: null, zh: null };
   let accountsData = [];
   let accountDiagnostics = { summary: {}, diagnostics: [] };
   const selectedAccounts = new Set();
+  // Canonical Kiro model IDs offered in the Force-Model and per-key model dropdowns.
+  // Keep in sync with the model list advertised at /v1/models (handler.go buildModelInfo).
+  const KIRO_MODEL_OPTIONS = [
+    'claude-opus-4.8', 'claude-opus-4.7', 'claude-opus-4.6', 'claude-opus-4.5',
+    'claude-sonnet-4.6', 'claude-sonnet-4.5', 'claude-sonnet-4',
+    'claude-haiku-4.5'
+  ];
   let filterKeyword = '';
   let filterStatus = 'all';
   let privacyModeEnabled = true;
@@ -41,6 +50,7 @@
   let microsoftBusy = false;
   let microsoftGeneration = 0;
   let exportSelectedIds = new Set();
+  let apiKeyExportSelectedIds = new Set();
   let currentVersion = '';
   let testLogs = [];
   let testModalAccountId = '';
@@ -62,6 +72,15 @@
   }
   function escapeAttr(s) {
     return escapeHtml(s).replace(/"/g, '&quot;');
+  }
+  function maskProxyForDisplay(raw) {
+    if (!raw) return '';
+    try {
+      const u = new URL(raw);
+      return `${u.protocol}//${u.host}`;
+    } catch (e) {
+      return '';
+    }
   }
   async function copyText(input) {
     const isPromise = input && typeof input.then === 'function';
@@ -192,7 +211,7 @@
   function renderCustomSelectOptions(select) {
     const wrap = select && select.__customSelect;
     if (!wrap) return;
-    const content = wrap.querySelector('.custom-select-content');
+    const content = wrap.__content;
     const trigger = wrap.querySelector('.custom-select-trigger');
     if (!content) return;
     if (trigger) labelCustomSelect(select, trigger, content, select.id);
@@ -213,7 +232,7 @@
     const wrap = select && select.__customSelect;
     if (!wrap || !wrap.classList.contains('is-open')) return;
     const trigger = wrap.querySelector('.custom-select-trigger');
-    const content = wrap.querySelector('.custom-select-content');
+    const content = wrap.__content;
     if (!trigger || !content) return;
     const rect = trigger.getBoundingClientRect();
     const gap = 4;
@@ -232,7 +251,7 @@
     const wrap = select && select.__customSelect;
     if (!wrap) return;
     const trigger = wrap.querySelector('.custom-select-trigger');
-    const content = wrap.querySelector('.custom-select-content');
+    const content = wrap.__content;
     if (!trigger || !content) return;
     if (open && !select.disabled) {
       closeAllCustomSelects(select);
@@ -323,7 +342,8 @@
     labelCustomSelect(select, trigger, content, id);
 
     wrap.appendChild(trigger);
-    wrap.appendChild(content);
+    document.body.appendChild(content);
+    wrap.__content = content;
     select.insertAdjacentElement('afterend', wrap);
     select.classList.add('custom-select-native');
     select.setAttribute('aria-hidden', 'true');
@@ -611,63 +631,49 @@
     return pending;
   }
 
-  // Fetch wrapper
+  // Fetch wrapper. Auth rides on the HttpOnly session cookie (same-origin), so no
+  // credential header is sent from JS.
   function api(path, opts) {
     opts = opts || {};
-    opts.headers = Object.assign({ 'X-Admin-Password': password }, opts.headers || {});
+    opts.credentials = 'same-origin';
+    opts.headers = Object.assign({}, opts.headers || {});
     if (opts.body && !opts.headers['Content-Type']) opts.headers['Content-Type'] = 'application/json';
     return fetch('/admin/api' + path, opts);
   }
 
   // Login
-  function clearActivePassword() {
-    sessionStorage.removeItem('admin_password');
-    sessionStorage.removeItem('admin_login_time');
-    localStorage.removeItem('admin_password');
-    localStorage.removeItem('admin_login_time');
-    password = '';
-  }
-  function getActiveLoginTime() {
-    const storage = sessionStorage.getItem('admin_password') ? sessionStorage : localStorage;
-    return parseInt(storage.getItem('admin_login_time') || '0', 10);
-  }
-  function setActivePassword(nextPassword, remember) {
-    const now = Date.now().toString();
-    password = nextPassword;
-    sessionStorage.setItem('admin_password', nextPassword);
-    sessionStorage.setItem('admin_login_time', now);
-    if (remember) {
-      localStorage.setItem('admin_password', nextPassword);
-      localStorage.setItem('admin_login_time', now);
-      localStorage.setItem('kiro_remember', '1');
-      localStorage.setItem('kiro_remembered_pwd', nextPassword);
-    } else {
-      localStorage.removeItem('admin_password');
-      localStorage.removeItem('admin_login_time');
-      localStorage.removeItem('kiro_remember');
-      localStorage.removeItem('kiro_remembered_pwd');
-    }
-  }
+  //
+  // The admin password is exchanged once at /admin/api/login for an opaque, expiring
+  // session token that the server stores server-side and delivers in an HttpOnly,
+  // SameSite=Strict (Secure on HTTPS) cookie. The browser never stores the password,
+  // and the cookie cannot be read by JavaScript — so an XSS can't lift a reusable
+  // credential. The SSE log stream (EventSource) authenticates with the same cookie
+  // automatically. "Remember me" controls whether the cookie persists across browser
+  // restarts (server sets Max-Age) versus lasting only for the browser session.
   async function tryAutoLogin() {
-    if (!password) return;
-    const loginTime = getActiveLoginTime();
-    if (loginTime && Date.now() - loginTime > 72 * 3600 * 1000) {
-      clearActivePassword();
-      return;
-    }
+    // No stored credential — just probe whether the session cookie is still valid.
     try {
       const res = await api('/status');
       if (res.ok) { showMain(); loadData(); }
     } catch (e) { }
   }
   async function login() {
-    password = $('pwdField').value;
+    const pwd = $('pwdField').value;
+    const rememberEl = $('rememberPwd');
+    const remember = !!(rememberEl && rememberEl.checked);
     try {
-      const res = await api('/status');
+      const res = await api('/login', {
+        method: 'POST',
+        body: JSON.stringify({ password: pwd, remember: remember }),
+      });
       if (res.ok) {
-        const remember = $('rememberPwd');
-        setActivePassword(password, !!(remember && remember.checked));
+        // Persist only the non-secret remember preference, never the password.
+        if (remember) localStorage.setItem('kiro_remember', '1');
+        else localStorage.removeItem('kiro_remember');
+        $('pwdField').value = '';
         showMain(); loadData();
+      } else if (res.status === 429) {
+        toast(t('login.error'), 'error');
       } else {
         toast(t('login.error'), 'error');
       }
@@ -677,16 +683,14 @@
   }
   function initRememberMe() {
     const remember = $('rememberPwd');
-    const field = $('pwdField');
-    if (!remember || !field) return;
+    if (!remember) return;
+    // Restore only the checkbox state; never pre-fill the password field.
     if (localStorage.getItem('kiro_remember') === '1') {
       remember.checked = true;
-      const saved = localStorage.getItem('kiro_remembered_pwd');
-      if (saved) field.value = saved;
     }
   }
-  function logout() {
-    clearActivePassword();
+  async function logout() {
+    try { await api('/logout', { method: 'POST' }); } catch (e) { }
     location.reload();
   }
   function showMain() {
@@ -1257,6 +1261,7 @@
     const res = await api('/accounts');
     accountsData = await res.json();
     renderAccounts();
+    renderAppliedProxies();
   }
 
   async function loadAccountDiagnostics() {
@@ -1901,6 +1906,32 @@
     await Promise.all([loadExternalIdpDiagnostics(), loadAccounts()]);
   }
 
+  function renderAppliedProxies() {
+    const box = $('appliedProxyList');
+    if (!box) return;
+    const globalMasked = maskProxyForDisplay(window.__globalProxyURL);
+    const groups = new Map();
+    for (const a of accountsData) {
+      const key = maskProxyForDisplay(a.proxyURL) || (globalMasked ? globalMasked + '|global' : '|none');
+      if (!groups.has(key)) groups.set(key, 0);
+      groups.set(key, groups.get(key) + 1);
+    }
+    if (groups.size === 0) {
+      box.innerHTML = '<p class="help-block">' + escapeHtml(t('proxyApplied.empty')) + '</p>';
+      return;
+    }
+    const entries = [...groups.entries()].sort((x, y) => y[1] - x[1]);
+    box.innerHTML = entries.map(([key, count]) => {
+      let label, cls = 'proxy-badge';
+      if (key === '|none') { label = t('account.proxyBadgeNone'); if (window.__requireProxy) cls += ' proxy-badge-warn'; }
+      else if (key.endsWith('|global')) { label = key.slice(0, -('|global'.length)) + ' (' + t('account.proxyBadgeGlobal') + ')'; }
+      else { label = key; }
+      return '<div class="applied-proxy-row">' +
+        '<span class="' + cls + '" title="' + escapeAttr(label) + '">' + escapeHtml(label) + '</span>' +
+        '<span class="applied-proxy-count">' + escapeHtml(t('proxyApplied.accountCount', count)) + '</span>' +
+        '</div>';
+    }).join('');
+  }
   function renderAccounts() {
     const container = $('accountsList');
     if (!container) return;
@@ -1918,6 +1949,17 @@
       const weight = a.weight || 0;
       const weightBadge = weight >= 2 ? '<span class="badge badge-warning">' + escapeHtml(t('accounts.weightShort')) + ':' + weight + '</span>' : '';
       const overageBadge = renderOverageBadge(a);
+      let proxyBadge = '';
+      const maskedProxy = maskProxyForDisplay(a.proxyURL);
+      if (maskedProxy) {
+        proxyBadge = '<span class="proxy-badge" title="' + escapeAttr(maskedProxy) + '">' + escapeHtml(maskedProxy) + '</span>';
+      } else if (window.__globalProxyURL) {
+        proxyBadge = '<span class="proxy-badge">' + escapeHtml(t('account.proxyBadgeGlobal')) + '</span>';
+      } else if (window.__requireProxy) {
+        proxyBadge = '<span class="proxy-badge proxy-badge-warn">' + escapeHtml(t('account.proxyBadgeNone')) + '</span>';
+      } else {
+        proxyBadge = '<span class="proxy-badge">' + escapeHtml(t('account.proxyBadgeDirect')) + '</span>';
+      }
       const banned = a.banStatus && a.banStatus !== 'ACTIVE';
       const idAttr = escapeAttr(a.id);
       const displayEmail = accountDisplayName(a);
@@ -1939,6 +1981,8 @@
         // subscription/trial/overage badges (they'd default to a misleading "Free").
         (a.authMethod === 'custom_api' ? '' : (getSubBadge(a.subscriptionType) + getTrialBadge(a) + overageBadge)) +
         weightBadge +
+        overageBadge +
+        proxyBadge +
         '<span class="badge badge-info">' + escapeHtml(formatAuthMethod(a.provider || a.authMethod)) + '</span>' +
         getStatusBadge(a) +
         '</div>' +
@@ -2123,6 +2167,13 @@
       const jsonPromise = api('/accounts/' + id + '/full').then(async res => {
         if (!res.ok) throw new Error('Failed');
         const a = await res.json();
+        // MERGE POLICY NOTE (fork ↔ hian699 v1.2.8): the merge stacked the incoming
+        // side's inline destructuring AFTER our `return`, so it was unreachable dead
+        // code (legal JS, hence no parse error — which is exactly why it needed
+        // finding by reading rather than by node --check). Removed in favour of the
+        // shared helper, which is a superset for the re-import round trip: it also
+        // carries kiroApiKey and the api_key regionOverride, without which an
+        // api_key account exports to something that can never be re-imported.
         return JSON.stringify(credentialImportPayloadFromFullAccount(a), null, 2);
       });
       await copyText(jsonPromise);
@@ -2884,6 +2935,12 @@
     if ($('responseCacheTTLSeconds')) $('responseCacheTTLSeconds').value = String(d.responseCacheTTLSeconds || 300);
     applyTraceSettings(d);
     await Promise.all([loadThinkingConfig(), loadEndpointConfig(), loadProxyConfig(), loadPromptFilter(), loadApiKeys(), loadConfigStatus(), loadTraceStorage()]);
+    $('maxPayloadBytes').value = String(d.maxPayloadBytes || 2000000);
+    if ($('publicBaseURL')) $('publicBaseURL').value = d.publicBaseURL || '';
+    if ($('limitNoticeMessage')) $('limitNoticeMessage').value = d.limitNoticeMessage || '';
+    populateForceModelOptions(d.forceModel || '');
+    populateIdentityModelOptions(d.identityModel || '');
+    await Promise.all([loadThinkingConfig(), loadEndpointConfig(), loadProxyConfig(), loadProxyPool(), loadPromptFilter(), loadApiKeys()]);
     refreshCustomSelects();
   }
 
@@ -3011,6 +3068,12 @@
     if ($('proxyPool')) $('proxyPool').value = Array.isArray(d.proxyURLs) ? d.proxyURLs.join('\n') : '';
     if ($('proxyRotateMinutes')) $('proxyRotateMinutes').value = d.proxyRotateMinutes || '';
     if ($('proxyActive')) $('proxyActive').textContent = maskProxyDisplay(d.activeProxyURL || '');
+    const requireProxyEl = document.getElementById('requireProxyToggle');
+    if (requireProxyEl) requireProxyEl.checked = !!d.requireProxy;
+    window.__requireProxy = !!d.requireProxy;
+    window.__globalProxyURL = d.proxyURL || '';
+    renderAppliedProxies();
+    renderAccounts();
     const url = d.proxyURL || '';
     if (!url) {
       $('proxyType').value = 'none';
@@ -3065,13 +3128,225 @@
     const okScheme = s => /^(https?|socks5h?):\/\//.test(s);
     if (proxyURLs.some(s => !okScheme(s))) { toast(t('settings.proxyFormatError'), 'warning'); return; }
     const rotateMinutes = parseInt(($('proxyRotateMinutes') ? $('proxyRotateMinutes').value : '') || '0', 10) || 0;
+    // MERGE POLICY NOTE (fork ↔ hian699 v1.2.8): both sides added their own
+    // `const res = await api('/proxy', ...)` here and the merge kept BOTH. That was a
+    // hard SyntaxError ("Identifier 'res' has already been declared"), which does not
+    // fail one button — it stops the whole admin bundle from parsing, so every panel
+    // control dies. It also issued two POSTs, the second overwriting the first and
+    // dropping proxyURLs/proxyRotateMinutes (rotation would silently reset).
+    // apiUpdateProxy (handler.go:8983) takes all four fields in ONE body, with
+    // RequireProxy as a *bool, so the payloads are unioned into a single request.
+    const requireProxyEl = document.getElementById('requireProxyToggle');
+    window.__requireProxy = requireProxyEl ? requireProxyEl.checked : false;
     const res = await api('/proxy', {
       method: 'POST',
-      body: JSON.stringify({ proxyURL: url, proxyURLs, proxyRotateMinutes: rotateMinutes })
+      body: JSON.stringify({
+        proxyURL: url,
+        proxyURLs,
+        proxyRotateMinutes: rotateMinutes,
+        requireProxy: requireProxyEl ? requireProxyEl.checked : false
+      })
     });
     const d = await res.json();
     if (d.success) { toast(t('settings.proxySaved'), 'success'); loadProxyConfig(); }
     else toast(t('common.saveFailed') + ': ' + (d.error || ''), 'error');
+  }
+  async function savePublicBaseURL() {
+    const url = $('publicBaseURL').value.trim();
+    try {
+      const res = await api('/settings', { method: 'POST', body: JSON.stringify({ publicBaseURL: url }) });
+      const d = await res.json().catch(() => ({}));
+      if (!res.ok || d.success === false) throw new Error(d.error || t('common.saveFailed'));
+      toast(t('settings.publicBaseURLSaved'), 'success');
+    } catch (e) {
+      toast((e && e.message) || t('common.saveFailed'), 'error');
+    }
+  }
+  async function saveLimitNotice() {
+    const msg = $('limitNoticeMessage').value.trim();
+    try {
+      const res = await api('/settings', { method: 'POST', body: JSON.stringify({ limitNoticeMessage: msg }) });
+      const d = await res.json().catch(() => ({}));
+      if (!res.ok || d.success === false) throw new Error(d.error || t('common.saveFailed'));
+      toast(t('settings.limitNoticeSaved'), 'success');
+    } catch (e) {
+      toast((e && e.message) || t('common.saveFailed'), 'error');
+    }
+  }
+  // populateForceModelOptions fills the Force-Model <select>. First option ("") = off
+  // (each request keeps its own model); the rest force every request to that model.
+  function populateForceModelOptions(selected) {
+    const sel = $('forceModel');
+    if (!sel) return;
+    const opts = KIRO_MODEL_OPTIONS.slice();
+    if (selected && !opts.includes(selected)) opts.unshift(selected);
+    let html = '<option value="">' + escapeHtml(t('settings.forceModelOff')) + '</option>';
+    html += opts.map(m => '<option value="' + escapeAttr(m) + '"' + (m === selected ? ' selected' : '') + '>' + escapeHtml(m) + '</option>').join('');
+    sel.innerHTML = html;
+    sel.value = selected || '';
+  }
+  async function saveForceModel() {
+    const sel = $('forceModel');
+    const model = sel ? sel.value.trim() : '';
+    try {
+      const res = await api('/settings', { method: 'POST', body: JSON.stringify({ forceModel: model }) });
+      const d = await res.json().catch(() => ({}));
+      if (!res.ok || d.success === false) throw new Error(d.error || t('common.saveFailed'));
+      toast(t('settings.forceModelSaved'), 'success');
+    } catch (e) {
+      toast((e && e.message) || t('common.saveFailed'), 'error');
+    }
+  }
+  // populateIdentityModelOptions fills the Identity-Model <select>. First option ("") = off
+  // (assistant self-identifies from its own training); the rest inject a "You are <model>"
+  // line into the system prompt so the assistant self-reports as that model.
+  function populateIdentityModelOptions(selected) {
+    const sel = $('identityModel');
+    if (!sel) return;
+    const opts = KIRO_MODEL_OPTIONS.slice();
+    if (selected && !opts.includes(selected)) opts.unshift(selected);
+    let html = '<option value="">' + escapeHtml(t('settings.identityModelOff')) + '</option>';
+    html += opts.map(m => '<option value="' + escapeAttr(m) + '"' + (m === selected ? ' selected' : '') + '>' + escapeHtml(m) + '</option>').join('');
+    sel.innerHTML = html;
+    sel.value = selected || '';
+    updateIdentityModelWarning();
+  }
+  // Show the "please be a dev with a conscience" warning only when an identity
+  // model is actually selected (i.e. the feature is on).
+  function updateIdentityModelWarning() {
+    const sel = $('identityModel');
+    const warn = $('identityModelWarn');
+    if (!sel || !warn) return;
+    warn.classList.toggle('hidden', !sel.value.trim());
+  }
+  async function saveIdentityModel() {
+    const sel = $('identityModel');
+    const model = sel ? sel.value.trim() : '';
+    try {
+      const res = await api('/settings', { method: 'POST', body: JSON.stringify({ identityModel: model }) });
+      const d = await res.json().catch(() => ({}));
+      if (!res.ok || d.success === false) throw new Error(d.error || t('common.saveFailed'));
+      toast(t('settings.identityModelSaved'), 'success');
+    } catch (e) {
+      toast((e && e.message) || t('common.saveFailed'), 'error');
+    }
+  }
+  async function importProxies() {
+    const raw = $('proxyImportList').value.trim();
+    if (!raw) { toast(t('proxyImport.listRequired'), 'warning'); return; }
+    const autoTest = $('proxyImportAutoTest').checked;
+    const dryRun = $('proxyImportDryRun').checked;
+    const target = $('proxyImportTarget').value;
+    const btn = $('proxyImportBtn');
+    btn.disabled = true;
+    const dismiss = toast(t('proxyImport.processing'), 'info', { duration: 0 });
+    try {
+      const res = await api('/proxy/import', {
+        method: 'POST',
+        body: JSON.stringify({ proxies: raw, autoTest, dryRun, target })
+      });
+      const d = await res.json();
+      dismiss();
+      if (!d.success) {
+        toast(t('common.failed') + ': ' + (d.error || ''), 'error');
+        return;
+      }
+      renderProxyImportResults(d);
+      toast(t('proxyImport.summary', d.assigned || 0, d.reachable || 0, d.total || 0), d.reachable < d.total ? 'warning' : 'success');
+      if (target === 'pool') loadProxyPool();
+      loadAccounts();
+    } catch (e) {
+      dismiss();
+      toast(t('common.failed'), 'error');
+    } finally {
+      btn.disabled = false;
+    }
+  }
+  function renderProxyImportResults(d) {
+    const box = $('proxyImportResults');
+    const results = d.results || [];
+    if (!results.length) {
+      box.innerHTML = '<p class="help-block">' + escapeHtml(t('proxyImport.noResults')) + '</p>';
+      return;
+    }
+    const ok = results.filter(r => !r.error && !(r.tested && !r.testPassed)).length;
+    const summary = '<div class="proxy-import-summary">' +
+      escapeHtml(t('proxyImport.summary', d.assigned || 0, d.reachable || 0, d.total || 0)) +
+      ' · ' + escapeHtml(t('proxyImport.okCount', ok, results.length)) + '</div>';
+    const rows = results.map(r => {
+      let status, cls;
+      if (r.error) { status = '✗ ' + r.error; cls = 'error-text'; }
+      else if (r.tested && !r.testPassed) { status = '⚠ ' + t('proxyImport.testFailed'); cls = 'warning-text'; }
+      else if (r.tested && r.testPassed) { status = '✓ ' + t('proxyImport.testOk'); cls = 'success-text'; }
+      else if (r.assigned) { status = '✓ ' + t('proxyImport.assigned'); cls = 'success-text'; }
+      else if (r.reachable) { status = '✓ ' + t('proxyImport.reachable'); cls = 'success-text'; }
+      else { status = '✗'; cls = 'error-text'; }
+      const target = r.assignedEmail ? ' → ' + escapeHtml(r.assignedEmail) : '';
+      const scheme = r.scheme ? '[' + escapeHtml(r.scheme) + '] ' : '';
+      const label = escapeHtml(r.maskedUrl || r.raw);
+      return '<div class="proxy-import-row">' +
+        '<span class="font-mono text-xs proxy-import-url" title="' + escapeAttr((r.scheme ? r.scheme + ' ' : '') + (r.maskedUrl || r.raw)) + '">' + scheme + label + target + '</span>' +
+        '<span class="' + cls + ' proxy-import-status">' + escapeHtml(status) + '</span>' +
+        '</div>';
+    }).join('');
+    box.innerHTML = summary + rows;
+  }
+  async function loadProxyPool() {
+    const box = $('proxyPoolList');
+    if (!box) return;
+    try {
+      const res = await api('/proxy/pool');
+      const d = await res.json();
+      renderProxyPool(d.pool || []);
+    } catch (e) {
+      box.innerHTML = '<p class="help-block error-text">' + escapeHtml(t('common.failed')) + '</p>';
+    }
+  }
+  function renderProxyPool(pool) {
+    const box = $('proxyPoolList');
+    if (!box) return;
+    if (!pool.length) {
+      box.innerHTML = '<p class="help-block">' + escapeHtml(t('settings.proxyPoolEmpty')) + '</p>';
+      return;
+    }
+    box.innerHTML = pool.map(p => {
+      const masked = maskProxyForDisplay(p.url) || '•••';
+      let dotCls, stateLabel;
+      if (p.disabledPermanent) { dotCls = 'disabled'; stateLabel = t('settings.proxyPoolDisabled'); }
+      else if (p.healthy) { dotCls = 'healthy'; stateLabel = t('settings.proxyPoolHealthy'); }
+      else { dotCls = 'unhealthy'; stateLabel = t('settings.proxyPoolUnhealthy'); }
+      const fail = (p.failCount || 0) > 0 ? '<span class="applied-proxy-count">' + escapeHtml(t('settings.proxyPoolFailCount', p.failCount)) + '</span>' : '';
+      const toggleLabel = p.disabledPermanent ? t('common.enable') : t('common.disable');
+      return '<div class="proxy-pool-row">' +
+        '<span class="proxy-health-dot ' + dotCls + '" title="' + escapeAttr(stateLabel) + '"></span>' +
+        '<span class="font-mono text-xs" title="' + escapeAttr(masked) + '">' + escapeHtml(masked) + '</span>' +
+        fail +
+        '<span class="proxy-pool-actions">' +
+        '<button class="btn btn-sm" data-pool-action="toggle" data-url="' + escapeAttr(p.url) + '" data-disabled="' + (p.disabledPermanent ? '0' : '1') + '">' + escapeHtml(toggleLabel) + '</button>' +
+        '<button class="btn btn-sm btn-danger" data-pool-action="remove" data-url="' + escapeAttr(p.url) + '">' + escapeHtml(t('settings.proxyPoolRemove')) + '</button>' +
+        '</span>' +
+        '</div>';
+    }).join('');
+  }
+  async function removeProxyFromPool(url) {
+    try {
+      const res = await api('/proxy/pool', { method: 'DELETE', body: JSON.stringify({ url }) });
+      const d = await res.json().catch(() => ({}));
+      if (res.ok && d.success !== false) loadProxyPool();
+      else toast(t('common.failed') + ': ' + (d.error || ''), 'error');
+    } catch (e) {
+      toast(t('common.failed'), 'error');
+    }
+  }
+  async function toggleProxyPool(url, disabled) {
+    try {
+      const res = await api('/proxy/pool/toggle', { method: 'POST', body: JSON.stringify({ url, disabled }) });
+      const d = await res.json().catch(() => ({}));
+      if (res.ok && d.success !== false) loadProxyPool();
+      else toast(t('common.failed') + ': ' + (d.error || ''), 'error');
+    } catch (e) {
+      toast(t('common.failed'), 'error');
+    }
   }
   async function saveRequireApiKey() {
     try {
@@ -3103,6 +3378,8 @@
     const ttlRaw = $('responseCacheTTLSeconds') ? parseInt($('responseCacheTTLSeconds').value, 10) : 0;
     const responseCacheTTLSeconds = isNaN(ttlRaw) || ttlRaw < 0 ? 0 : ttlRaw;
     await api('/settings', { method: 'POST', body: JSON.stringify({ allowOverUsage, quotaAwareRouting, externalUsageAutoDisable, webhookURL, metricsEnabled, responseCacheEnabled, responseCacheTTLSeconds }) });
+    const maxPayloadBytes = parseInt($('maxPayloadBytes').value, 10);
+    await api('/settings', { method: 'POST', body: JSON.stringify({ allowOverUsage, maxPayloadBytes }) });
     toast(t('settings.overUsageSaved'), 'success');
   }
   function formatDateTime(ts) {
@@ -3174,7 +3451,8 @@
       const res = await api('/settings', { method: 'POST', body: JSON.stringify({ password: np }) });
       const d = await res.json().catch(() => ({}));
       if (!res.ok || d.success === false) throw new Error(d.error || t('common.saveFailed'));
-      setActivePassword(np, localStorage.getItem('kiro_remember') === '1');
+      // The current session token stays valid after a password change (sessions are
+      // independent of the password), so no re-login is needed.
       toast(t('settings.passwordChanged'), 'success');
       $('newPassword').value = '';
       loadSecurityStatus();
@@ -3202,6 +3480,7 @@
   let apiKeysCache = [];
   let apiKeyEditingId = '';
   let apiKeyModalSubmitting = false;
+  const selectedApiKeyIds = new Set();
 
   async function loadApiKeys() {
     const list = $('apiKeysList');
@@ -3245,15 +3524,60 @@
     return '<div class="text-xs muted-text">' + escapeHtml(label) + ': ' + escapeHtml(fmt(used)) + ' / ' + escapeHtml(fmt(limit)) + '</div>' + usageBar(used, limit);
   }
 
+  function renderApiKeyStats() {
+    const el = $('apiKeyStats');
+    if (!el) return;
+    const now = Date.now() / 1000;
+    const total = apiKeysCache.length;
+    const disabled = apiKeysCache.filter(k => !k.enabled).length;
+    const expired = apiKeysCache.filter(k => normalizeUnixSeconds(k.expiresAt) && normalizeUnixSeconds(k.expiresAt) <= now).length;
+    const active = apiKeysCache.filter(k => k.enabled && (!normalizeUnixSeconds(k.expiresAt) || normalizeUnixSeconds(k.expiresAt) > now)).length;
+    el.innerHTML =
+      '<div class="stat-card"><div class="stat-card-title">' + escapeHtml(t('apiKeys.statTotal')) + '</div><div class="stat-value">' + escapeHtml(formatNumber(total)) + '</div></div>' +
+      '<div class="stat-card"><div class="stat-card-title">' + escapeHtml(t('apiKeys.statActive')) + '</div><div class="stat-value">' + escapeHtml(formatNumber(active)) + '</div></div>' +
+      '<div class="stat-card"><div class="stat-card-title">' + escapeHtml(t('apiKeys.statExpired')) + '</div><div class="stat-value stat-value--danger">' + escapeHtml(formatNumber(expired)) + '</div></div>' +
+      '<div class="stat-card"><div class="stat-card-title">' + escapeHtml(t('apiKeys.statDisabled')) + '</div><div class="stat-value">' + escapeHtml(formatNumber(disabled)) + '</div></div>';
+  }
+
+  function renderApiKeyBulkBar() {
+    const bar = $('apiKeyBulkBar');
+    const count = $('apiKeyBulkCount');
+    if (!bar || !count) return;
+    const n = selectedApiKeyIds.size;
+    bar.classList.toggle('hidden', n === 0);
+    count.textContent = t('apiKeys.selected', n);
+    // Keep the select-all checkbox in sync: checked when every key is selected,
+    // indeterminate when only some are.
+    const cb = $('apiKeySelectAll');
+    if (cb) {
+      const total = apiKeysCache.length;
+      cb.checked = total > 0 && n === total;
+      cb.indeterminate = n > 0 && n < total;
+    }
+  }
+
+  // toggleApiKeySelectAll selects or clears every created API key at once.
+  function toggleApiKeySelectAll(checked) {
+    selectedApiKeyIds.clear();
+    if (checked) apiKeysCache.forEach(k => { if (k.id) selectedApiKeyIds.add(k.id); });
+    renderApiKeys();
+  }
+
   function renderApiKeys() {
     const list = $('apiKeysList');
     if (!list) return;
+    const ids = new Set(apiKeysCache.map(k => k.id));
+    selectedApiKeyIds.forEach(id => { if (!ids.has(id)) selectedApiKeyIds.delete(id); });
+    renderApiKeyStats();
+    renderApiKeyBulkBar();
     if (!apiKeysCache.length) {
       list.innerHTML = '<div class="muted-text" style="padding:0.5rem 0;">' + escapeHtml(t('apiKeys.empty')) + '</div>';
       return;
     }
     const html = apiKeysCache.map(item => {
-      const id = escapeAttr(item.id || '');
+      const rawId = item.id || '';
+      const id = escapeAttr(rawId);
+      const checked = selectedApiKeyIds.has(rawId) ? ' checked' : '';
       const name = item.name ? escapeHtml(item.name) : '<span class="muted-text">' + escapeHtml(t('apiKeys.unnamed')) + '</span>';
       const masked = escapeHtml(item.keyMasked || '');
       const migrated = item.migrated
@@ -3262,6 +3586,8 @@
       const disabled = !item.enabled
         ? '<span class="text-xs" style="background:rgba(239,68,68,0.15);color:#ef4444;padding:1px 6px;border-radius:4px;">' + escapeHtml(t('apiKeys.disabled')) + '</span>'
         : '';
+      const expiredBadge = apiKeyExpiryBadge(item.expiresAt);
+      const expiryLine = apiKeyExpiryLine(item.expiresAt);
       const tokensLine = usageLine(t('apiKeys.tokens'), item.tokensUsed || 0, item.tokenLimit || 0);
       const creditsLine = usageLine(t('apiKeys.credits'), item.creditsUsed || 0, item.creditLimit || 0);
       const requestsLine = '<div class="text-xs muted-text">' + escapeHtml(t('apiKeys.requests')) + ': ' + escapeHtml(formatNumber(item.requestsCount || 0)) + '</div>';
@@ -3277,12 +3603,39 @@
         modelUsageLine = '<div class="text-xs muted-text">' + escapeHtml(t('apiKeys.byModel')) + ':</div>' +
           '<div class="usage-audit-summary" style="margin:0.15rem 0 0;">' + rows + '</div>';
       }
+      // Lifetime grand total — survives "Reset Usage", only cleared by "Reset All".
+      const lifetimeLine = '<div class="text-xs muted-text">' + escapeHtml(t('apiKeys.lifetime')) + ': ' +
+        escapeHtml(formatNumber(item.lifetimeTokens || 0)) + ' ' + escapeHtml(t('apiKeys.tokens')) + ' · ' +
+        escapeHtml(formatNumber(item.lifetimeRequests || 0)) + ' ' + escapeHtml(t('apiKeys.requests')) + '</div>';
+      const rpmValue = item.rpmLimit && item.rpmLimit > 0 ? formatNumber(item.rpmLimit) + ' ' + t('apiKeys.rpmUnit') : t('apiKeys.unlimited');
+      const rpmLine = '<div class="text-xs muted-text">' + escapeHtml(t('apiKeys.limitRPM')) + ': ' + escapeHtml(rpmValue) + '</div>';
+      const hasAllowlist = Array.isArray(item.ipAllowlist) && item.ipAllowlist.length > 0;
+      // A non-empty allowlist takes precedence over the IP count limit, so show whichever is active.
+      const ipLine = hasAllowlist
+        ? '<div class="text-xs muted-text">' + escapeHtml(t('apiKeys.ipAllowlist')) + ': ' + escapeHtml(item.ipAllowlist.join(', ')) + '</div>'
+        : '<div class="text-xs muted-text">' + escapeHtml(t('apiKeys.limitIP')) + ': ' + escapeHtml(item.ipLimit && item.ipLimit > 0 ? formatNumber(item.ipLimit) : t('apiKeys.unlimited')) + '</div>';
+      // Bound-account line: map ids to a readable email/nickname via the account cache.
+      const boundIds = Array.isArray(item.boundAccountIds) ? item.boundAccountIds : [];
+      const acctById = {};
+      (Array.isArray(accountsData) ? accountsData : []).forEach(a => { acctById[a.id] = a; });
+      const boundNames = boundIds.map(bid => {
+        const a = acctById[bid];
+        return a ? (a.email || a.nickname || bid) : bid;
+      });
+      const boundValue = boundNames.length ? boundNames.join(', ') : t('apiKeys.boundAccountsNone');
+      const boundLine = '<div class="text-xs muted-text">' + escapeHtml(t('apiKeys.boundAccounts')) + ': ' + escapeHtml(boundValue) + '</div>';
+      // Model allowlist line: empty = the key accepts the client's requested model.
+      const modelList = Array.isArray(item.models) ? item.models.filter(Boolean) : [];
+      const modelValue = modelList.length ? modelList.join(', ') : t('apiKeys.modelDefault');
+      const modelsLine = '<div class="text-xs muted-text">' + escapeHtml(t('apiKeys.model')) + ': ' + escapeHtml(modelValue) + '</div>';
       return '<div class="card" data-apikey-id="' + id + '" style="margin-top:0.5rem;padding:0.75rem;">' +
         '<div class="flex items-center gap-2" style="flex-wrap:wrap;justify-content:space-between;">' +
           '<div class="flex items-center gap-2" style="flex-wrap:wrap;">' +
+            '<input type="checkbox" data-apikey-action="select" data-id="' + id + '"' + checked + ' />' +
             '<span class="font-semibold">' + name + '</span>' +
             migrated +
             disabled +
+            expiredBadge +
             '<span class="text-xs muted-text font-mono">' + masked + '</span>' +
           '</div>' +
           '<div class="flex items-center gap-2">' +
@@ -3290,8 +3643,10 @@
               '<input type="checkbox" data-apikey-action="toggle" data-id="' + id + '"' + (item.enabled ? ' checked' : '') + ' />' +
               '<span class="slider"></span>' +
             '</label>' +
+            '<button class="btn btn-outline btn-sm" type="button" data-apikey-action="portal" data-id="' + id + '" title="' + escapeAttr(t('apiKeys.portalLinkHint')) + '"><i class="fa-solid fa-link"></i></button>' +
             '<button class="btn btn-outline btn-sm" type="button" data-apikey-action="edit" data-id="' + id + '">' + escapeHtml(t('apiKeys.actionEdit')) + '</button>' +
             '<button class="btn btn-outline btn-sm" type="button" data-apikey-action="reset" data-id="' + id + '">' + escapeHtml(t('apiKeys.actionReset')) + '</button>' +
+            '<button class="btn btn-outline btn-sm" type="button" data-apikey-action="reset-all" data-id="' + id + '">' + escapeHtml(t('apiKeys.actionResetAll')) + '</button>' +
             '<button class="btn btn-danger btn-sm" type="button" data-apikey-action="delete" data-id="' + id + '">' + escapeHtml(t('apiKeys.actionDelete')) + '</button>' +
           '</div>' +
         '</div>' +
@@ -3300,10 +3655,129 @@
           creditsLine +
           requestsLine +
           modelUsageLine +
+          lifetimeLine +
+          rpmLine +
+          ipLine +
+          expiryLine +
+          boundLine +
+          modelsLine +
         '</div>' +
       '</div>';
     }).join('');
     list.innerHTML = html;
+  }
+
+  // apiKeyBoundSelected is the live set of bound-account ids chosen in the modal. It
+  // persists across search-filter re-renders (a checkbox hidden by the filter must not
+  // lose its selection), so it — not the DOM — is the source of truth for what gets saved.
+  let apiKeyBoundSelected = new Set();
+
+  // initApiKeyBoundAccounts seeds the selection set from the key being edited and paints
+  // the (unfiltered) picker. Call once when opening the modal.
+  function initApiKeyBoundAccounts(selectedIds) {
+    apiKeyBoundSelected = new Set(selectedIds || []);
+    const search = $('apiKeyForm_boundSearch');
+    if (search) search.value = '';
+    renderApiKeyBoundAccounts('');
+  }
+
+  // renderBoundAccounts paints one checkbox per account into containerId, checked from
+  // selectedSet (not the DOM), filtered by the search term. Disabled/banned accounts are
+  // still listed (so an operator can bind ahead of re-enabling) but labelled. Shared by the
+  // single-key and bulk-create modals, each of which owns its own selection set.
+  function renderBoundAccounts(containerId, selectedSet, filter) {
+    const box = $(containerId);
+    if (!box) return;
+    const accts = Array.isArray(accountsData) ? accountsData : [];
+    if (!accts.length) {
+      box.innerHTML = '<div class="muted-text text-xs" style="padding:0.25rem 0;">' + escapeHtml(t('apiKeys.boundAccountsEmpty')) + '</div>';
+      return;
+    }
+    const kw = (filter || '').trim().toLowerCase();
+    const matched = accts.filter(a => {
+      if (!kw) return true;
+      return (a.email || '').toLowerCase().includes(kw) ||
+        (a.nickname || '').toLowerCase().includes(kw) ||
+        (a.id || '').toLowerCase().includes(kw);
+    });
+    if (!matched.length) {
+      box.innerHTML = '<div class="muted-text text-xs" style="padding:0.25rem 0;">' + escapeHtml(t('apiKeys.boundAccountsNoMatch')) + '</div>';
+      return;
+    }
+    box.innerHTML = matched.map(a => {
+      const id = escapeHtml(a.id);
+      const label = escapeHtml(a.email || a.nickname || a.id);
+      const off = !a.enabled || (a.banStatus && a.banStatus !== 'ACTIVE')
+        ? ' <span class="muted-text text-xs">(' + escapeHtml(t('apiKeys.disabled')) + ')</span>'
+        : '';
+      const checked = selectedSet.has(a.id) ? ' checked' : '';
+      return '<label class="flex items-center gap-2" style="padding:2px 0;">' +
+        '<input type="checkbox" class="apikey-bound-account" value="' + id + '"' + checked + ' />' +
+        '<span class="text-sm">' + label + off + '</span>' +
+        '</label>';
+    }).join('');
+  }
+
+  function renderApiKeyBoundAccounts(filter) {
+    renderBoundAccounts('apiKeyForm_boundAccounts', apiKeyBoundSelected, filter);
+  }
+
+  // onApiKeyBoundToggle keeps apiKeyBoundSelected in sync when a checkbox flips.
+  function onApiKeyBoundToggle(id, checked) {
+    if (checked) apiKeyBoundSelected.add(id);
+    else apiKeyBoundSelected.delete(id);
+  }
+
+  // selectedBoundAccountIds returns the chosen ids from the persistent set (not the DOM,
+  // which only holds the currently-filtered subset).
+  function selectedBoundAccountIds() {
+    return Array.from(apiKeyBoundSelected);
+  }
+
+  // Bulk-create modal keeps its own selection set, mirroring the single-key modal above.
+  let apiKeyBulkBoundSelected = new Set();
+
+  function initApiKeyBulkBoundAccounts(selectedIds) {
+    apiKeyBulkBoundSelected = new Set(selectedIds || []);
+    const search = $('apiKeyBulk_boundSearch');
+    if (search) search.value = '';
+    renderApiKeyBulkBoundAccounts('');
+  }
+
+  function renderApiKeyBulkBoundAccounts(filter) {
+    renderBoundAccounts('apiKeyBulk_boundAccounts', apiKeyBulkBoundSelected, filter);
+  }
+
+  // Per-key model allowlist pickers. Each modal owns a Set of ticked model ids; empty =
+  // "use the client's requested model". A ticked model passes through; a client model not
+  // in the set is remapped upstream to the first ticked entry (see applyModelOverride).
+  let apiKeyModelsSelected = new Set();
+  let apiKeyBulkModelsSelected = new Set();
+
+  // renderModelPicker paints one checkbox per canonical Kiro model into containerId,
+  // checked from selectedSet. Any already-selected model that isn't canonical is listed
+  // first so an existing value is never silently dropped.
+  function renderModelPicker(containerId, selectedSet) {
+    const box = $(containerId);
+    if (!box) return;
+    const opts = KIRO_MODEL_OPTIONS.slice();
+    selectedSet.forEach(m => { if (m && !opts.includes(m)) opts.unshift(m); });
+    box.innerHTML = opts.map(m => {
+      const val = escapeAttr(m);
+      const checked = selectedSet.has(m) ? ' checked' : '';
+      return '<label class="flex items-center gap-2" style="padding:2px 0;">' +
+        '<input type="checkbox" class="apikey-model-option" value="' + val + '"' + checked + ' />' +
+        '<span class="text-sm">' + escapeHtml(m) + '</span>' +
+        '</label>';
+    }).join('');
+  }
+
+  // initApiKeyModels seeds a picker's selection set from the key being edited and paints it.
+  function initApiKeyModels(containerId, selectedSet, selectedList) {
+    const set = new Set(Array.isArray(selectedList) ? selectedList.filter(Boolean) : []);
+    if (containerId === 'apiKeyForm_models') apiKeyModelsSelected = set;
+    else apiKeyBulkModelsSelected = set;
+    renderModelPicker(containerId, set);
   }
 
   function openApiKeyModal(entry) {
@@ -3312,18 +3786,27 @@
     titleEl.textContent = t(apiKeyEditingId ? 'apiKeys.modalTitleEdit' : 'apiKeys.modalTitleCreate');
     $('apiKeyForm_name').value = entry ? (entry.name || '') : '';
     const keyEl = $('apiKeyForm_key');
+    // Key is always editable. On edit we leave it blank and show the current masked value
+    // as a placeholder — typing a new value changes the key, leaving it blank keeps it.
+    keyEl.readOnly = false;
+    keyEl.value = '';
     if (apiKeyEditingId) {
-      keyEl.value = entry.keyMasked || '';
-      keyEl.readOnly = true;
+      keyEl.placeholder = t('apiKeys.formKeyEditPlaceholder', entry.keyMasked || '');
     } else {
-      keyEl.value = '';
-      keyEl.readOnly = false;
+      keyEl.placeholder = t('apiKeys.formKeyPlaceholder');
     }
     $('apiKeyForm_enabled').checked = entry ? !!entry.enabled : true;
     $('apiKeyForm_tokenLimit').value = entry ? String(entry.tokenLimit || 0) : '0';
     $('apiKeyForm_creditLimit').value = entry ? String(entry.creditLimit || 0) : '0';
     if ($('apiKeyForm_rpmLimit')) $('apiKeyForm_rpmLimit').value = entry ? String(entry.rpmLimit || 0) : '0';
     if ($('apiKeyForm_tpmLimit')) $('apiKeyForm_tpmLimit').value = entry ? String(entry.tpmLimit || 0) : '0';
+    $('apiKeyForm_expiresAt').value = (entry && entry.expiresAt) ? unixToLocalInput(normalizeUnixSeconds(entry.expiresAt)) : '';
+    if ($('apiKeyForm_rpmLimit')) $('apiKeyForm_rpmLimit').value = entry ? String(entry.rpmLimit || 0) : '0';
+    if ($('apiKeyForm_ipLimit')) $('apiKeyForm_ipLimit').value = entry ? String(entry.ipLimit || 0) : '0';
+    if ($('apiKeyForm_ipAllowlist')) $('apiKeyForm_ipAllowlist').value = (entry && Array.isArray(entry.ipAllowlist)) ? entry.ipAllowlist.join('\n') : '';
+    if ($('apiKeyForm_tpmLimit')) $('apiKeyForm_tpmLimit').value = entry ? String(entry.tpmLimit || 0) : '0';
+    initApiKeyModels('apiKeyForm_models', apiKeyModelsSelected, entry && Array.isArray(entry.models) ? entry.models : []);
+    initApiKeyBoundAccounts(entry && Array.isArray(entry.boundAccountIds) ? entry.boundAccountIds : []);
     apiKeyModalSubmitting = false;
     $('apiKeyModalSaveBtn').disabled = false;
     openDialog('apiKeyModal');
@@ -3336,6 +3819,90 @@
     $('apiKeyModalSaveBtn').disabled = false;
   }
 
+  function openApiKeyBulkModal() {
+    $('apiKeyBulk_count').value = '10';
+    $('apiKeyBulk_namePrefix').value = '';
+    $('apiKeyBulk_enabled').checked = true;
+    $('apiKeyBulk_tokenLimit').value = '0';
+    $('apiKeyBulk_creditLimit').value = '0';
+    $('apiKeyBulk_expiresAt').value = '';
+    if ($('apiKeyBulk_rpmLimit')) $('apiKeyBulk_rpmLimit').value = '0';
+    if ($('apiKeyBulk_ipLimit')) $('apiKeyBulk_ipLimit').value = '0';
+    if ($('apiKeyBulk_ipAllowlist')) $('apiKeyBulk_ipAllowlist').value = '';
+    if ($('apiKeyBulk_tpmLimit')) $('apiKeyBulk_tpmLimit').value = '0';
+    initApiKeyModels('apiKeyBulk_models', apiKeyBulkModelsSelected, []);
+    initApiKeyBulkBoundAccounts([]);
+    $('apiKeyBulkSaveBtn').disabled = false;
+    openDialog('apiKeyBulkModal');
+  }
+
+  function closeApiKeyBulkModal() {
+    closeDialog('apiKeyBulkModal');
+    $('apiKeyBulkSaveBtn').disabled = false;
+  }
+
+  async function createBulkApiKeys() {
+    const btn = $('apiKeyBulkSaveBtn');
+    btn.disabled = true;
+    try {
+      const count = parseInt($('apiKeyBulk_count').value, 10);
+      if (isNaN(count) || count < 1 || count > 100) throw new Error(t('apiKeys.bulkCountError'));
+      const tokenLimit = parseInt($('apiKeyBulk_tokenLimit').value, 10);
+      const creditLimit = parseFloat($('apiKeyBulk_creditLimit').value);
+      const rpmLimit = parseInt($('apiKeyBulk_rpmLimit') ? $('apiKeyBulk_rpmLimit').value : '0', 10);
+      const ipLimit = parseInt($('apiKeyBulk_ipLimit') ? $('apiKeyBulk_ipLimit').value : '0', 10);
+      const tpmLimit = parseInt($('apiKeyBulk_tpmLimit') ? $('apiKeyBulk_tpmLimit').value : '0', 10);
+      const ipAllowlist = $('apiKeyBulk_ipAllowlist')
+        ? $('apiKeyBulk_ipAllowlist').value.split(/[\r\n,]+/).map(s => s.trim()).filter(Boolean)
+        : [];
+      const payload = {
+        count,
+        namePrefix: $('apiKeyBulk_namePrefix').value.trim(),
+        enabled: $('apiKeyBulk_enabled').checked,
+        tokenLimit: isNaN(tokenLimit) || tokenLimit < 0 ? 0 : tokenLimit,
+        creditLimit: isNaN(creditLimit) || creditLimit < 0 ? 0 : creditLimit,
+        expiresAt: localInputToUnix($('apiKeyBulk_expiresAt').value),
+        rpmLimit: isNaN(rpmLimit) || rpmLimit < 0 ? 0 : rpmLimit,
+        ipLimit: isNaN(ipLimit) || ipLimit < 0 ? 0 : ipLimit,
+        ipAllowlist: ipAllowlist,
+        tpmLimit: isNaN(tpmLimit) || tpmLimit < 0 ? 0 : tpmLimit,
+        boundAccountIds: Array.from(apiKeyBulkBoundSelected),
+        models: Array.from(apiKeyBulkModelsSelected)
+      };
+      const res = await api('/api-keys/bulk', { method: 'POST', body: JSON.stringify(payload) });
+      const d = await res.json().catch(() => ({}));
+      if (!res.ok || d.success === false) throw new Error(d.error || t('common.saveFailed'));
+      closeApiKeyBulkModal();
+      await loadApiKeys();
+      if (Array.isArray(d.keys) && d.keys.length) showNewApiKey(d.keys.join('\n'));
+      toast(t('apiKeys.bulkCreated', d.count || count), 'success');
+    } catch (e) {
+      toast((e && e.message) || t('common.saveFailed'), 'error');
+      btn.disabled = false;
+    }
+  }
+
+  async function bulkDeleteApiKeys() {
+    const ids = Array.from(selectedApiKeyIds);
+    if (!ids.length) return;
+    const ok = await confirmAction(t('apiKeys.confirmBulkDelete', ids.length), {
+      title: t('apiKeys.bulkDelete'),
+      confirmText: t('apiKeys.bulkDelete'),
+      variant: 'danger'
+    });
+    if (!ok) return;
+    try {
+      const res = await api('/api-keys/bulk', { method: 'DELETE', body: JSON.stringify({ ids }) });
+      const d = await res.json().catch(() => ({}));
+      if (!res.ok || d.success === false) throw new Error(d.error || t('common.failed'));
+      selectedApiKeyIds.clear();
+      toast(t('apiKeys.bulkDeleted', d.deleted || ids.length), 'success');
+      await loadApiKeys();
+    } catch (e) {
+      toast((e && e.message) || t('common.failed'), 'error');
+    }
+  }
+
   async function submitApiKeyModal() {
     if (apiKeyModalSubmitting) return;
     apiKeyModalSubmitting = true;
@@ -3346,18 +3913,47 @@
       const enabled = $('apiKeyForm_enabled').checked;
       const tokenLimit = parseInt($('apiKeyForm_tokenLimit').value, 10);
       const creditLimit = parseFloat($('apiKeyForm_creditLimit').value);
+      // MERGE POLICY NOTE (fork ↔ hian699 v1.2.8): the merge kept BOTH sides' reads
+      // here, producing duplicate `const rpmLimit` / `const tpmLimit` declarations
+      // (a SyntaxError that stopped the whole admin bundle from parsing) AND a
+      // missing comma after the first `tpmLimit` payload entry. Both sides read the
+      // SAME form fields with equivalent guards, so the duplicate reads were
+      // redundant rather than conflicting; only ipLimit and ipAllowlist are genuinely
+      // new from the incoming side. Declared once, and the payload keys are deduped
+      // (duplicate object keys are legal JS — last wins — so the merged literal was
+      // silently sending each value twice).
+      //
+      // Field mapping is deliberate and matches apiKeyUpdateRequest
+      // (admin_apikeys.go:307): `rpmLimit`/`tpmLimit` are the *int THROTTLE values
+      // these form inputs represent. The *int64 hard-reject variants are the separate
+      // `rpmLimitHard`/`tpmLimitHard` keys and are NOT sent here — neither side sent
+      // them, and conflating the two is exactly what the tag split at
+      // config.go:438-448 exists to prevent.
       const rpmLimit = $('apiKeyForm_rpmLimit') ? parseInt($('apiKeyForm_rpmLimit').value, 10) : 0;
       const tpmLimit = $('apiKeyForm_tpmLimit') ? parseInt($('apiKeyForm_tpmLimit').value, 10) : 0;
+      const ipLimit = $('apiKeyForm_ipLimit') ? parseInt($('apiKeyForm_ipLimit').value, 10) : 0;
+      const expiresAt = localInputToUnix($('apiKeyForm_expiresAt').value);
+      const ipAllowlist = $('apiKeyForm_ipAllowlist')
+        ? $('apiKeyForm_ipAllowlist').value.split(/[\r\n,]+/).map(s => s.trim()).filter(Boolean)
+        : [];
       const payload = {
         name: name,
         enabled: enabled,
         tokenLimit: isNaN(tokenLimit) || tokenLimit < 0 ? 0 : tokenLimit,
         creditLimit: isNaN(creditLimit) || creditLimit < 0 ? 0 : creditLimit,
+        expiresAt: expiresAt,
         rpmLimit: isNaN(rpmLimit) || rpmLimit < 0 ? 0 : rpmLimit,
-        tpmLimit: isNaN(tpmLimit) || tpmLimit < 0 ? 0 : tpmLimit
+        tpmLimit: isNaN(tpmLimit) || tpmLimit < 0 ? 0 : tpmLimit,
+        ipLimit: isNaN(ipLimit) || ipLimit < 0 ? 0 : ipLimit,
+        ipAllowlist: ipAllowlist,
+        boundAccountIds: selectedBoundAccountIds(),
+        models: Array.from(apiKeyModelsSelected)
       };
+      const keyVal = $('apiKeyForm_key').value.trim();
       let res, d;
       if (apiKeyEditingId) {
+        // Only send the key when the operator typed a new value; blank keeps the current one.
+        if (keyVal) payload.key = keyVal;
         res = await api('/api-keys/' + encodeURIComponent(apiKeyEditingId), { method: 'PUT', body: JSON.stringify(payload) });
         d = await res.json().catch(() => ({}));
         if (!res.ok || d.success === false) throw new Error(d.error || t('common.saveFailed'));
@@ -3365,7 +3961,6 @@
         closeApiKeyModal();
         await loadApiKeys();
       } else {
-        const keyVal = $('apiKeyForm_key').value.trim();
         if (keyVal) payload.key = keyVal;
         res = await api('/api-keys', { method: 'POST', body: JSON.stringify(payload) });
         d = await res.json().catch(() => ({}));
@@ -3431,6 +4026,37 @@
     }
   }
 
+  // resetAllApiKeyUsageEntry wipes BOTH current-period and lifetime counters (destructive).
+  async function resetAllApiKeyUsageEntry(id, name) {
+    const ok = await confirmAction(t('apiKeys.confirmResetAll', name || t('apiKeys.unnamed')), {
+      title: t('apiKeys.actionResetAll'),
+      confirmText: t('apiKeys.actionResetAll'),
+      variant: 'danger'
+    });
+    if (!ok) return;
+    try {
+      const res = await api('/api-keys/' + encodeURIComponent(id) + '/reset-all', { method: 'POST' });
+      const d = await res.json().catch(() => ({}));
+      if (!res.ok || d.success === false) throw new Error(d.error || t('common.failed'));
+      toast(t('apiKeys.usageReset'), 'success');
+      await loadApiKeys();
+    } catch (e) {
+      toast((e && e.message) || t('common.failed'), 'error');
+    }
+  }
+
+  // Copies the self-service portal URL so the seller can hand it to a customer
+  // alongside their key. Prefers the configured public base URL, else this origin.
+  async function copyPortalLink() {
+    const base = (($('publicBaseURL') && $('publicBaseURL').value.trim()) || location.origin).replace(/\/+$/, '');
+    try {
+      await copyText(base + '/check');
+      toast(t('apiKeys.portalLinkCopied'), 'success');
+    } catch (e) {
+      toast((e && e.message) || t('common.failed'), 'error');
+    }
+  }
+
   function showNewApiKey(plaintext) {
     $('apiKeyShowValue').value = plaintext || '';
     openDialog('apiKeyShowModal');
@@ -3470,8 +4096,20 @@
         if (action === 'edit') openApiKeyModal(entry);
         else if (action === 'delete') deleteApiKeyEntry(id, name);
         else if (action === 'reset') resetApiKeyUsageEntry(id, name);
+        else if (action === 'reset-all') resetAllApiKeyUsageEntry(id, name);
+        else if (action === 'portal') copyPortalLink();
       });
       list.addEventListener('change', e => {
+        const select = e.target.closest('input[data-apikey-action="select"]');
+        if (select) {
+          const id = select.dataset.id;
+          if (id) {
+            if (select.checked) selectedApiKeyIds.add(id);
+            else selectedApiKeyIds.delete(id);
+            renderApiKeyBulkBar();
+          }
+          return;
+        }
         const cb = e.target.closest('input[data-apikey-action="toggle"]');
         if (!cb) return;
         const id = cb.dataset.id;
@@ -3479,12 +4117,46 @@
         toggleApiKeyEntry(id, cb.checked);
       });
     }
+    const exportBtn = $('exportApiKeysBtn');
+    if (exportBtn) exportBtn.addEventListener('click', showApiKeyExportModal);
     const addBtn = $('addApiKeyBtn');
     if (addBtn) addBtn.addEventListener('click', () => openApiKeyModal(null));
+    const bulkAddBtn = $('bulkAddApiKeyBtn');
+    if (bulkAddBtn) bulkAddBtn.addEventListener('click', openApiKeyBulkModal);
+    const bulkDeleteBtn = $('bulkDeleteApiKeyBtn');
+    if (bulkDeleteBtn) bulkDeleteBtn.addEventListener('click', bulkDeleteApiKeys);
+    const selectAllApiKeys = $('apiKeySelectAll');
+    if (selectAllApiKeys) selectAllApiKeys.addEventListener('change', e => toggleApiKeySelectAll(e.target.checked));
     const saveBtn = $('apiKeyModalSaveBtn');
     if (saveBtn) saveBtn.addEventListener('click', submitApiKeyModal);
     const cancelBtn = $('apiKeyModalCancelBtn');
     if (cancelBtn) cancelBtn.addEventListener('click', closeApiKeyModal);
+    // Bound-account picker: live search, select-all/clear, and keep the selection set in sync.
+    const boundSearch = $('apiKeyForm_boundSearch');
+    if (boundSearch) boundSearch.addEventListener('input', () => renderApiKeyBoundAccounts(boundSearch.value));
+    const boundBox = $('apiKeyForm_boundAccounts');
+    if (boundBox) boundBox.addEventListener('change', e => {
+      const cb = e.target.closest('input.apikey-bound-account');
+      if (cb) onApiKeyBoundToggle(cb.value, cb.checked);
+    });
+    const modelBox = $('apiKeyForm_models');
+    if (modelBox) modelBox.addEventListener('change', e => {
+      const cb = e.target.closest('input.apikey-model-option');
+      if (cb) {
+        if (cb.checked) apiKeyModelsSelected.add(cb.value);
+        else apiKeyModelsSelected.delete(cb.value);
+      }
+    });
+    const boundSelectAll = $('apiKeyForm_boundSelectAll');
+    if (boundSelectAll) boundSelectAll.addEventListener('click', () => {
+      (Array.isArray(accountsData) ? accountsData : []).forEach(a => apiKeyBoundSelected.add(a.id));
+      renderApiKeyBoundAccounts(boundSearch ? boundSearch.value : '');
+    });
+    const boundClear = $('apiKeyForm_boundClear');
+    if (boundClear) boundClear.addEventListener('click', () => {
+      apiKeyBoundSelected.clear();
+      renderApiKeyBoundAccounts(boundSearch ? boundSearch.value : '');
+    });
     const closeBtn = $('apiKeyModalClose');
     if (closeBtn) closeBtn.addEventListener('click', closeApiKeyModal);
     const showCloseBtn = $('apiKeyShowCloseBtn');
@@ -3493,7 +4165,43 @@
     if (showCloseX) showCloseX.addEventListener('click', closeShowApiKeyModal);
     const copyBtn = $('apiKeyShowCopyBtn');
     if (copyBtn) copyBtn.addEventListener('click', copyNewApiKey);
+    const bulkSaveBtn = $('apiKeyBulkSaveBtn');
+    if (bulkSaveBtn) bulkSaveBtn.addEventListener('click', createBulkApiKeys);
+    const bulkCancelBtn = $('apiKeyBulkCancelBtn');
+    if (bulkCancelBtn) bulkCancelBtn.addEventListener('click', closeApiKeyBulkModal);
+    const bulkCloseBtn = $('apiKeyBulkModalClose');
+    if (bulkCloseBtn) bulkCloseBtn.addEventListener('click', closeApiKeyBulkModal);
+    // Bulk bound-account picker: mirrors the single-key picker, backed by its own selection set.
+    const bulkBoundSearch = $('apiKeyBulk_boundSearch');
+    if (bulkBoundSearch) bulkBoundSearch.addEventListener('input', () => renderApiKeyBulkBoundAccounts(bulkBoundSearch.value));
+    const bulkBoundBox = $('apiKeyBulk_boundAccounts');
+    if (bulkBoundBox) bulkBoundBox.addEventListener('change', e => {
+      const cb = e.target.closest('input.apikey-bound-account');
+      if (cb) {
+        if (cb.checked) apiKeyBulkBoundSelected.add(cb.value);
+        else apiKeyBulkBoundSelected.delete(cb.value);
+      }
+    });
+    const bulkModelBox = $('apiKeyBulk_models');
+    if (bulkModelBox) bulkModelBox.addEventListener('change', e => {
+      const cb = e.target.closest('input.apikey-model-option');
+      if (cb) {
+        if (cb.checked) apiKeyBulkModelsSelected.add(cb.value);
+        else apiKeyBulkModelsSelected.delete(cb.value);
+      }
+    });
+    const bulkBoundSelectAll = $('apiKeyBulk_boundSelectAll');
+    if (bulkBoundSelectAll) bulkBoundSelectAll.addEventListener('click', () => {
+      (Array.isArray(accountsData) ? accountsData : []).forEach(a => apiKeyBulkBoundSelected.add(a.id));
+      renderApiKeyBulkBoundAccounts(bulkBoundSearch ? bulkBoundSearch.value : '');
+    });
+    const bulkBoundClear = $('apiKeyBulk_boundClear');
+    if (bulkBoundClear) bulkBoundClear.addEventListener('click', () => {
+      apiKeyBulkBoundSelected.clear();
+      renderApiKeyBulkBoundAccounts(bulkBoundSearch ? bulkBoundSearch.value : '');
+    });
     bindDialogBackdropClose('apiKeyModal', closeApiKeyModal);
+    bindDialogBackdropClose('apiKeyBulkModal', closeApiKeyBulkModal);
     bindDialogBackdropClose('apiKeyShowModal', closeShowApiKeyModal);
   }
 
@@ -3573,7 +4281,8 @@
     credentials: 'fa-solid fa-code',
     cookie: 'fa-solid fa-cookie-bite',
     apikey: 'fa-solid fa-lock',
-    bedrock: 'fa-brands fa-aws'
+    bedrock: 'fa-brands fa-aws',
+    kiro: 'fa-solid fa-building'
   };
   function methodCard(type, title, desc) {
     var icon = METHOD_ICONS[type] || 'fa-solid fa-circle-plus';
@@ -3598,11 +4307,14 @@
     else if (type === 'microsoft') openMicrosoftModal(title, body);
     else if (type === 'sso') modalSso(title, body);
     else if (type === 'local') modalLocal(title, body);
+    else if (type === 'localdetect') modalLocalDetect(title, body);
     else if (type === 'credentials') modalCredentials(title, body);
     else if (type === 'cookie') modalCookie(title, body);
     else if (type === 'apikey') modalApiKey(title, body);
     else if (type === 'customapi') modalCustomApi(title, body);
     else if (type === 'bedrock') modalBedrock(title, body);
+    else if (type === 'apikeybatch') modalApiKeyBatch(title, body);
+    else if (type === 'kiro') modalKiro(title, body);
     if (!modal.classList.contains('active')) openDialog('addModal');
     enhanceCustomSelects(body);
   }
@@ -3611,7 +4323,9 @@
     closeDialog('addModal');
     resetMicrosoftFlow(true);
     iamSession = '';
+    kiroSsoSession = '';
     if (builderIdPollTimer) { clearTimeout(builderIdPollTimer); builderIdPollTimer = null; }
+    if (kiroSsoPollTimer) { clearTimeout(kiroSsoPollTimer); kiroSsoPollTimer = null; }
     builderIdSession = '';
     if (kiroSsoPollTimer) { clearTimeout(kiroSsoPollTimer); kiroSsoPollTimer = null; }
     // If a hosted-portal sign-in is still in flight (modal closed via X/backdrop
@@ -3633,13 +4347,17 @@
       methodCard('iam', t('modal.iamTitle'), t('modal.iamDesc')) +
       methodCard('enterprisesso', t('modal.enterpriseSsoTitle'), t('modal.enterpriseSsoDesc')) +
       methodCard('microsoft', t('modal.microsoftTitle'), t('modal.microsoftDesc')) +
+      methodCard('kiro', t('modal.kiroTitle'), t('modal.kiroDesc')) +
       methodCard('sso', t('modal.ssoTitle'), t('modal.ssoDesc')) +
+      methodCard('localdetect', t('modal.localDetectTitle'), t('modal.localDetectDesc')) +
       methodCard('local', t('modal.localTitle'), t('modal.localDesc')) +
       methodCard('credentials', t('modal.credentialsTitle'), t('modal.credentialsDesc')) +
       methodCard('cookie', t('modal.cookieTitle'), t('modal.cookieDesc')) +
       methodCard('apikey', t('modal.apiKeyTitle'), t('modal.apiKeyDesc')) +
       methodCard('customapi', t('modal.customApiTitle'), t('modal.customApiDesc')) +
       methodCard('bedrock', 'Amazon Bedrock', 'Add a native Bedrock account (static IAM key, SigV4). Converse for non-Claude models.') +
+      methodCard('apikey', t('modal.apikeyTitle'), t('modal.apikeyDesc')) +
+      methodCard('apikeybatch', t('modal.apikeyBatchTitle'), t('modal.apikeyBatchDesc')) +
       '</div>' +
       '<div class="modal-footer"><button class="btn btn-secondary" data-close-add="1" type="button">' + escapeHtml(t('common.cancel')) + '</button></div>';
   }
@@ -3978,6 +4696,80 @@
     $('localClientFile').addEventListener('change', e => loadLocalFile(e.target, 'localClientJson'));
     $('importLocalBtn').addEventListener('click', importLocalKiro);
   }
+  // Auto-detect Kiro credentials from the local SSO cache (same machine only).
+  function modalLocalDetect(title, body) {
+    title.textContent = t('modal.localDetectTitle');
+    body.innerHTML =
+      '<p class="help-block">' + escapeHtml(t('modal.localDetectDesc')) + '</p>' +
+      '<div id="localDetectStatus" class="help-block">' + escapeHtml(t('localDetect.scanning')) + '</div>' +
+      '<div id="localDetectList"></div>' +
+      '<div class="modal-footer">' +
+      '<button class="btn btn-secondary" data-modal-goto="add" type="button">' + escapeHtml(t('common.back')) + '</button>' +
+      '<button class="btn btn-primary" id="localDetectImportBtn" type="button" disabled>' + escapeHtml(t('localDetect.importSelected')) + '</button>' +
+      '</div>';
+    $('localDetectImportBtn').addEventListener('click', importLocalDetected);
+    scanLocalCache();
+  }
+  async function scanLocalCache() {
+    const statusEl = $('localDetectStatus');
+    const listEl = $('localDetectList');
+    const importBtn = $('localDetectImportBtn');
+    try {
+      const res = await api('/auth/local-cache/scan', { method: 'GET' });
+      const d = await res.json();
+      if (!res.ok || d.success === false) throw new Error(d.error || t('common.failed'));
+      if (!d.available || !d.accounts || d.accounts.length === 0) {
+        statusEl.textContent = t('localDetect.notFound');
+        listEl.innerHTML = '';
+        importBtn.disabled = true;
+        return;
+      }
+      statusEl.innerHTML = escapeHtml(t('localDetect.found', d.count)) +
+        ' <code class="code-inline">' + escapeHtml(d.cacheDir || '') + '</code>';
+      listEl.innerHTML = d.accounts.map(a => {
+        const label = (a.loginHint || a.provider || a.authMethod || a.fingerprint);
+        const meta = formatAuthMethod(a.provider || a.authMethod) + ' · ' + a.region +
+          (a.hasClient ? '' : ' · ' + t('localDetect.noClient'));
+        const disabled = a.importable ? '' : 'disabled';
+        const reason = a.importable ? '' : ' <small class="muted-text">(' + escapeHtml(a.reason || '') + ')</small>';
+        return '<label class="export-row' + (a.importable ? '' : ' opacity-50') + '">' +
+          '<input type="checkbox" ' + (a.importable ? 'checked' : '') + ' ' + disabled +
+          ' data-detect-fp="' + escapeAttr(a.fingerprint) + '" />' +
+          '<div class="export-row-text">' +
+          '<div class="export-row-email">' + escapeHtml(label) + reason + '</div>' +
+          '<div class="export-row-meta">' + escapeHtml(meta) + '</div>' +
+          '</div></label>';
+      }).join('');
+      importBtn.disabled = false;
+    } catch (e) {
+      statusEl.textContent = (e && e.message) || t('common.failed');
+      importBtn.disabled = true;
+    }
+  }
+  async function importLocalDetected() {
+    const fps = qsa('[data-detect-fp]:checked', $('localDetectList')).map(cb => cb.dataset.detectFp);
+    if (fps.length === 0) return toastWarning(t('localDetect.selectAtLeastOne'));
+    const importBtn = $('localDetectImportBtn');
+    importBtn.disabled = true;
+    try {
+      const res = await api('/auth/local-cache/import', {
+        method: 'POST', body: JSON.stringify({ fingerprints: fps })
+      });
+      const d = await res.json();
+      if (d.success) {
+        closeModal(); loadAccounts(); loadStats();
+        toastPrimary(t('localDetect.importSuccess', d.imported || 0));
+        (d.results || []).forEach(r => { if (r.success && r.accountId) autoRefreshNewAccount(r.accountId); });
+      } else {
+        const firstErr = (d.results || []).find(r => r.error);
+        toastError(t('common.failed') + (firstErr ? ': ' + firstErr.error : ''));
+        importBtn.disabled = false;
+      }
+    } catch (e) {
+      toastError((e && e.message) || t('common.failed'));
+      importBtn.disabled = false;
+    }
+  }
   function modalCredentials(title, body) {
     title.textContent = t('modal.credentialsTitle');
     body.innerHTML =
@@ -4180,6 +4972,168 @@
       toastError(t('common.failed'));
     }
   }
+  // MERGE POLICY NOTE (fork ↔ hian699 v1.2.8): the merge consumed this function's
+  // DECLARATION line and left its body orphaned directly after addBedrockAccount's
+  // closing brace — the `Unexpected token 'function'` parse error that stopped the
+  // whole admin bundle from loading. Restored rather than deleted, and the incoming
+  // side's variant is deliberately the one that survives.
+  //
+  // Why this variant: `modalApiKey` ends up declared three times in the merged file
+  // (here plus two carried from our side). JS function declarations are hoisted and
+  // the LAST one in scope wins, so the effective modal is this one — and it is the
+  // only variant whose element IDs (apikeyInput / apikeyNickname / apikeyAuthRegion /
+  // apikeyApiRegion, button importApikeyBtn) match the effective `importApiKey`,
+  // which is likewise the last declaration of its name in the file.
+  //
+  // Recorded because it is NOT this merge's fault: our side already shipped a
+  // MISMATCHED pair — its winning modal built `apiKeyValue` while its winning
+  // importer read `kiroApiKeyInput`, so the "apikey" Add button could only ever warn
+  // "missing". Restoring this declaration makes the surviving pair self-consistent
+  // and incidentally fixes that pre-existing break. The two now-dead `modalApiKey`
+  // bodies above (and the two dead `importApiKey` bodies) are unreachable and are
+  // left for a separate cleanup commit rather than ripped out mid-merge.
+  function modalApiKey(title, body) {
+    title.textContent = t('apikey.title');
+    body.innerHTML =
+      '<p class="help-block">' + escapeHtml(t('apikey.desc')) + '</p>' +
+      '<div class="form-group"><label>' + escapeHtml(t('apikey.keyLabel')) + '</label>' +
+      '<input type="password" id="apikeyInput" placeholder="' + escapeAttr(t('apikey.keyPlaceholder')) + '" /></div>' +
+      '<div class="form-group"><label>' + escapeHtml(t('apikey.nickname')) + '</label>' +
+      '<input type="text" id="apikeyNickname" placeholder="' + escapeAttr(t('apikey.nicknamePlaceholder')) + '" /></div>' +
+      '<div class="form-group"><label>' + escapeHtml(t('apikey.authRegion')) + '</label>' +
+      '<input type="text" id="apikeyAuthRegion" value="us-east-1" /></div>' +
+      '<div class="form-group"><label>' + escapeHtml(t('apikey.apiRegion')) + '</label>' +
+      '<input type="text" id="apikeyApiRegion" value="us-east-1" /></div>' +
+      '<div class="modal-footer">' +
+      '<button class="btn btn-secondary" data-modal-goto="add" type="button">' + escapeHtml(t('common.back')) + '</button>' +
+      '<button class="btn btn-primary" id="importApikeyBtn" type="button">' + escapeHtml(t('common.add')) + '</button>' +
+      '</div>';
+    $('importApikeyBtn').addEventListener('click', importApiKey);
+  }
+  function modalApiKeyBatch(title, body) {
+    title.textContent = t('apikeyBatch.title');
+    body.innerHTML =
+      '<p class="help-block">' + escapeHtml(t('apikeyBatch.desc')) + '</p>' +
+      '<div class="form-group"><label>' + escapeHtml(t('apikeyBatch.listLabel')) + '</label>' +
+      '<textarea id="apikeyBatchList" class="font-mono" rows="8" placeholder="' + escapeAttr(t('apikeyBatch.listPlaceholder')) + '"></textarea>' +
+      '<p class="help-block">' + escapeHtml(t('apikeyBatch.listHint')) + '</p></div>' +
+      '<div class="form-group"><label>' + escapeHtml(t('apikey.apiRegion')) + '</label>' +
+      '<input type="text" id="apikeyBatchRegion" value="us-east-1" /></div>' +
+      '<div class="modal-footer">' +
+      '<button class="btn btn-secondary" data-modal-goto="add" type="button">' + escapeHtml(t('common.back')) + '</button>' +
+      '<button class="btn btn-primary" id="importApikeyBatchBtn" type="button">' + escapeHtml(t('apikeyBatch.import')) + '</button>' +
+      '</div>' +
+      '<div id="apikeyBatchResults" class="mt-3"></div>';
+    $('importApikeyBatchBtn').addEventListener('click', importApiKeysBatch);
+  }
+  function modalKiro(title, body) {
+    title.textContent = t('modal.kiroTitle');
+    body.innerHTML =
+      '<p class="help-block">' + escapeHtml(t('modal.kiroDesc')) + '</p>' +
+      '<div id="kiroStep1">' +
+      '<div class="form-group"><label>' + escapeHtml(t('kiro.emailLabel')) + '</label>' +
+      '<input type="email" id="kiroEmail" placeholder="' + escapeAttr(t('kiro.emailPlaceholder')) + '" /></div>' +
+      '<p class="text-xs muted-text">' + escapeHtml(t('kiro.emailHint')) + '</p>' +
+      '<div class="modal-footer">' +
+      '<button class="btn btn-secondary" data-modal-goto="add" type="button">' + escapeHtml(t('common.back')) + '</button>' +
+      '<button class="btn btn-primary" id="startKiroBtn" type="button">' + escapeHtml(t('kiro.startLogin')) + '</button>' +
+      '</div>' +
+      '</div>' +
+      '<div id="kiroStep2" class="hidden">' +
+      '<div class="form-group"><label>' + escapeHtml(t('iam.loginUrl')) + '</label>' +
+      '<textarea id="kiroAuthUrl" readonly rows="3" class="w-full font-mono text-xs p-2"' +
+      ' style="word-break:break-all; resize:none; border:1px solid var(--border); border-radius:var(--radius); background:var(--surface); color:var(--text);"></textarea>' +
+      '</div>' +
+      '<div class="flex gap-2 mt-2">' +
+      '<button class="btn btn-primary btn-sm" id="kiroOpenBtn" type="button">' + escapeHtml(t('builderid.open')) + '</button>' +
+      '<button class="btn btn-outline btn-sm" id="kiroCopyBtn" type="button">' + escapeHtml(t('common.copy')) + '</button>' +
+      '</div>' +
+      '<p id="kiroStatus" class="text-center text-sm mt-4 muted-text">' + escapeHtml(t('builderid.waiting')) + '</p>' +
+      '<div class="modal-footer"><button class="btn btn-secondary" id="kiroCancelBtn" type="button">' + escapeHtml(t('common.cancel')) + '</button></div>' +
+      '</div>';
+    $('startKiroBtn').addEventListener('click', startKiroSso);
+  }
+
+  // Kiro SSO state — declared ONCE at the top of this IIFE (`let kiroSsoSession` /
+  // `let kiroSsoPollTimer`).
+  //
+  // MERGE POLICY NOTE (fork ↔ hian699 v1.2.8): the incoming side re-declared both here
+  // as `var`. Two declarations of one name in the same function scope where either is
+  // `let` is a hard SyntaxError ("Identifier 'kiroSsoSession' has already been
+  // declared"), which killed the whole admin bundle — so this is not a style question.
+  // The redeclaration is dropped rather than the top-level pair, because ours carries
+  // the richer state contract that other code depends on: the synchronous
+  // re-entrancy guard on startKiroSsoLogin, cancel-on-close, and the profile-ARN
+  // selection step. Behaviour is preserved either way — these `var`s only re-initialised
+  // the same two values to their zero state during IIFE setup, before any interaction.
+  async function startKiroSso() {
+    try {
+      var email = $('kiroEmail').value.trim();
+      var res = await api('/auth/kiro-sso/start', {
+        method: 'POST',
+        body: JSON.stringify({ loginHint: email || undefined })
+      });
+      var d = await res.json();
+      if (d.sessionId) {
+        kiroSsoSession = d.sessionId;
+        $('kiroStep1').classList.add('hidden');
+        $('kiroStep2').classList.remove('hidden');
+        $('kiroAuthUrl').textContent = d.authorizeUrl;
+        $('kiroOpenBtn').addEventListener('click', function() {
+          window.open($('kiroAuthUrl').textContent, '_blank');
+        });
+        $('kiroCopyBtn').addEventListener('click', async function() {
+          await copyText($('kiroAuthUrl').textContent);
+          toast(t('common.copied'), 'primary');
+        });
+        $('kiroCancelBtn').addEventListener('click', cancelKiroSso);
+        pollKiroSso(2);
+      } else {
+        toastError(t('common.failed') + ': ' + (d.error || ''));
+      }
+    } catch (e) {
+      toastError(t('login.connectError'));
+    }
+  }
+
+  function pollKiroSso(interval) {
+    kiroSsoPollTimer = setTimeout(async function() {
+      try {
+        var res = await api('/auth/kiro-sso/poll', {
+          method: 'POST',
+          body: JSON.stringify({ sessionId: kiroSsoSession })
+        });
+        var d = await res.json();
+        if (d.status === 'completed') {
+          closeModal(); loadAccounts(); loadStats();
+          toastPrimary(t('builderid.success') + ': ' + (d.account?.email || d.account?.id));
+          autoRefreshNewAccount(d.account?.id);
+        } else if (d.status === 'pending') {
+          $('kiroStatus').textContent = t('builderid.waiting');
+          pollKiroSso(d.interval || interval);
+        } else {
+          cancelKiroSso();
+          toastError(t('common.failed') + ': ' + (d.error || t('kiro.authFailed')));
+        }
+      } catch (e) {
+        cancelKiroSso();
+        toastError(t('login.connectError'));
+      }
+    }, interval * 1000);
+  }
+
+  function cancelKiroSso() {
+    if (kiroSsoPollTimer) { clearTimeout(kiroSsoPollTimer); kiroSsoPollTimer = null; }
+    if (kiroSsoSession) {
+      api('/auth/kiro-sso/cancel', {
+        method: 'POST',
+        body: JSON.stringify({ sessionId: kiroSsoSession })
+      }).catch(function() {});
+    }
+    kiroSsoSession = '';
+    showModal('add');
+  }
+
   function updateLocalFields() {
     const p = $('localProvider').value;
     $('localClientGroup').classList.toggle('hidden', p === 'Google' || p === 'Github');
@@ -4273,7 +5227,25 @@
       const source = json.accounts && Array.isArray(json.accounts)
         ? json.accounts
         : (Array.isArray(json) ? json : [json]);
-      items = source.map(normalizeCredentialRecord);
+      // MERGE POLICY NOTE (fork ↔ hian699 v1.2.8): the merge kept BOTH sides'
+      // normalisation calls, so `items` was computed and then immediately
+      // OVERWRITTEN — our normalizeCredentialRecord result was dead, and every
+      // import silently lost the fields only it provides (notably kiroApiKey, which
+      // the api_key branch below reads, so ksk_ records would fall through to the
+      // OAuth path and fail). The two normalisers are complementary rather than
+      // rival: ours reads camelCase through one credentials-then-root accessor,
+      // theirs adds flat snake_case support (cliproxyapi exports: access_token,
+      // auth_method, issuer_url, token_endpoint) plus the external-IdP routing of
+      // client_id → idpClientId. So they are unioned, with theirs as the base and
+      // ours overlaid; undefined values are pruned so an absent field never clobbers
+      // a present one.
+      items = source.map(record => {
+        const merged = { ...normalizeCredItem(record) };
+        for (const [k, v] of Object.entries(normalizeCredentialRecord(record))) {
+          if (v !== undefined && v !== null && v !== '') merged[k] = v;
+        }
+        return merged;
+      });
     } catch {
       const parsed = parseLineCredentials(raw);
       items = parsed.items;
@@ -4343,6 +5315,30 @@
       else if (methodKey === 'idc') authMethod = 'idc';
       else if (methodKey === 'social' || methodKey === 'google' || methodKey === 'github') authMethod = 'social';
       else authMethod = methodKey ? 'social' : '';
+      // MERGE POLICY NOTE (fork ↔ hian699 v1.2.8): the merge stacked BOTH sides'
+      // classification blocks, redeclaring `authMethod` and `provider` with `let`
+      // (a hard SyntaxError) and leaving the payload literal with a missing comma
+      // after `scopes` plus duplicated `issuerUrl` / `scopes` / `region` keys.
+      // Resolved as a union rather than by picking a side:
+      //
+      //   - OUR classification survives, because it is a strict superset: it matches
+      //     the external-IdP aliases on the PROVIDER field as well as the method
+      //     field, and infers external_idp from tokenEndpoint/issuerUrl. Theirs only
+      //     looked at item.authMethod, so a Microsoft Entra export whose method was
+      //     blank but which carried an issuerUrl was mis-imported as `social` and then
+      //     failed refresh with 401 Bad credentials;
+      //   - THEIR provider defaults are folded in (Google for social, BuilderId for
+      //     idc): ours left provider empty when the record carried none;
+      //   - their `if (!item.refreshToken)` guard is dropped as dead — the equivalent
+      //     api_key-aware guard already ran above, and by this point an api_key record
+      //     has `continue`d, so it could only ever re-test what was already tested;
+      //   - the payload keys are deduped, and their four new external-IdP fields
+      //     (idpClientId, loginHint, idpTokenEndpoint) are kept — those are exactly
+      //     what stops a copied Entra account from re-importing as social.
+      //
+      // `region` intentionally keeps OUR conditional (empty for external_idp rather
+      // than a hardcoded us-east-1): an external-IdP account's region is discovered
+      // server-side, and defaulting it pins the wrong data-plane host permanently.
       let provider = isExternalIdp ? 'AzureAD' : rawProvider;
       if (!provider && authMethod === 'social') provider = 'Google';
       if (!provider && authMethod === 'idc') provider = 'BuilderId';
@@ -4363,7 +5359,10 @@
         region: item.region || (isExternalIdp ? '' : 'us-east-1'),
         tokenEndpoint: item.tokenEndpoint || '',
         issuerUrl: item.issuerUrl || '',
-        scopes: item.scopes || ''
+        idpClientId: item.idpClientId || '',
+        scopes: item.scopes || '',
+        loginHint: item.loginHint || '',
+        idpTokenEndpoint: item.idpTokenEndpoint || ''
       };
       try {
         const res = await api('/auth/credentials', { method: 'POST', body: JSON.stringify(payload) });
@@ -4406,6 +5405,41 @@
       scopes: value('scopes')
     };
   }
+  // Normalize one credential object into the /auth/credentials payload shape.
+  // Accepts camelCase (existing exports), the {credentials:{...}} wrapper, and
+  // flat snake_case (cliproxyapi kiro export: access_token, auth_method,
+  // issuer_url, token_endpoint, ...).
+  function normalizeCredItem(a) {
+    const c = a.credentials || {};
+    const pick = (...keys) => {
+      for (const src of [c, a]) {
+        for (const k of keys) {
+          if (src[k] !== undefined && src[k] !== null && src[k] !== '') return src[k];
+        }
+      }
+      return undefined;
+    };
+    const authMethod = pick('authMethod', 'auth_method', 'type');
+    const isExternalIdp = String(authMethod || '').toLowerCase().replace('_', '') === 'externalidp';
+    const clientId = pick('clientId', 'client_id');
+    return {
+      refreshToken: pick('refreshToken', 'refresh_token'),
+      accessToken: pick('accessToken', 'access_token'),
+      // cliproxyapi external_idp puts the IdP client id in client_id; route it
+      // to idpClientId so token refresh has the right client (else 401).
+      clientId: isExternalIdp ? '' : clientId,
+      clientSecret: pick('clientSecret', 'client_secret'),
+      region: pick('region'),
+      authMethod: authMethod === 'kiro' ? '' : authMethod,
+      provider: pick('provider', 'idp'),
+      issuerUrl: pick('issuerUrl', 'issuer_url'),
+      idpClientId: pick('idpClientId', 'idp_client_id') || (isExternalIdp ? clientId : undefined),
+      scopes: pick('scopes'),
+      loginHint: pick('loginHint', 'login_hint'),
+      idpTokenEndpoint: pick('idpTokenEndpoint', 'idp_token_endpoint', 'token_endpoint'),
+      expiresAt: pick('expiresAt', 'expires_at'),
+    };
+  }
   function parseLineCredentials(text) {
     const items = [];
     let skipped = 0;
@@ -4443,6 +5477,79 @@
       toastPrimary(t('cookie.importSuccess') + ': ' + (d.account?.email || d.account?.id));
       autoRefreshNewAccount(d.account?.id);
     } else toastError(t('common.failed') + ': ' + (d.error || ''));
+  }
+  async function importApiKey() {
+    const key = $('apikeyInput').value.trim();
+    if (!key) return toastWarning(t('apikey.keyRequired'));
+    const payload = {
+      authMethod: 'api_key',
+      kiroApiKey: key,
+      nickname: $('apikeyNickname').value.trim() || '',
+      region: $('apikeyApiRegion').value.trim() || 'us-east-1',
+      authRegion: $('apikeyAuthRegion').value.trim() || 'us-east-1',
+      apiRegion: $('apikeyApiRegion').value.trim() || 'us-east-1',
+      enabled: true
+    };
+    const res = await api('/auth/credentials', { method: 'POST', body: JSON.stringify(payload) });
+    const d = await res.json();
+    if (d.success) {
+      closeModal(); loadAccounts(); loadStats();
+      toastPrimary(t('apikey.success') + ': ' + (d.account?.email || d.account?.id));
+      autoRefreshNewAccount(d.account?.id);
+    } else toastError(t('common.failed') + ': ' + (d.error || ''));
+  }
+  async function importApiKeysBatch() {
+    const raw = $('apikeyBatchList').value.trim();
+    if (!raw) { toastWarning(t('apikeyBatch.listRequired')); return; }
+    const region = $('apikeyBatchRegion').value.trim() || 'us-east-1';
+    const btn = $('importApikeyBatchBtn');
+    btn.disabled = true;
+    const dismiss = toast(t('apikeyBatch.processing'), 'info', { duration: 0 });
+    try {
+      const res = await api('/auth/apikeys-batch', {
+        method: 'POST',
+        body: JSON.stringify({ keys: raw, region, authRegion: region, apiRegion: region })
+      });
+      const d = await res.json();
+      dismiss();
+      if (!d.success) {
+        toast(t('common.failed') + ': ' + (d.error || ''), 'error');
+        return;
+      }
+      renderApiKeyBatchResults(d);
+      toast(t('apikeyBatch.summary', d.imported || 0, d.skipped || 0, d.total || 0),
+        (d.imported > 0) ? 'success' : 'warning');
+      loadAccounts(); loadStats();
+    } catch (e) {
+      dismiss();
+      toast(t('common.failed'), 'error');
+    } finally {
+      btn.disabled = false;
+    }
+  }
+  function renderApiKeyBatchResults(d) {
+    const box = $('apikeyBatchResults');
+    if (!box) return;
+    const rows = (d.results || []).map(r => {
+      let status, cls;
+      if (r.skipped) { status = '⊘ ' + t('apikeyBatch.skipped'); cls = 'warning-text'; }
+      else if (r.error && !r.imported) { status = '✗ ' + escapeHtml(r.error); cls = 'error-text'; }
+      else if (r.imported) {
+        const credit = r.infoOk
+          ? (formatCredit(r.usageCurrent) + ' / ' + formatCredit(r.usageLimit))
+          : t('apikeyBatch.infoUnavailable');
+        const email = r.email ? ' ' + escapeHtml(r.email) : '';
+        status = '✓ ' + escapeHtml(credit) + email;
+        cls = 'success-text';
+      } else { status = '✗'; cls = 'error-text'; }
+      return '<div class="test-log-line"><span class="font-mono text-xs">' + escapeHtml(r.maskedKey || '') +
+        '</span> <span class="' + cls + '">' + status + '</span></div>';
+    }).join('');
+    box.innerHTML = rows || '<p class="help-block">' + escapeHtml(t('apikeyBatch.noResults')) + '</p>';
+  }
+  function formatCredit(n) {
+    if (typeof n !== 'number' || !isFinite(n)) return '0';
+    return Number.isInteger(n) ? String(n) : n.toFixed(1);
   }
   async function importSsoToken() {
     const res = await api('/auth/sso-token', {
@@ -4483,17 +5590,25 @@
   }
   function pollBuilderIdAuth(interval) {
     builderIdPollTimer = setTimeout(async () => {
-      const res = await api('/auth/builderid/poll', { method: 'POST', body: JSON.stringify({ sessionId: builderIdSession }) });
-      const d = await res.json();
-      if (d.completed) {
-        closeModal(); loadAccounts(); loadStats();
-        toastPrimary(t('builderid.success') + ': ' + (d.account?.email || d.account?.id));
-        autoRefreshNewAccount(d.account?.id);
-      } else if (d.success && !d.completed) {
-        $('builderIdStatus').textContent = t('builderid.waiting');
-        pollBuilderIdAuth(d.interval || interval);
-      } else {
-        toastError(t('common.failed') + ': ' + (d.error || ''));
+      try {
+        const res = await api('/auth/builderid/poll', { method: 'POST', body: JSON.stringify({ sessionId: builderIdSession }) });
+        const d = await res.json();
+        if (d.completed) {
+          closeModal(); loadAccounts(); loadStats();
+          toastPrimary(t('builderid.success') + ': ' + (d.account?.email || d.account?.id));
+          autoRefreshNewAccount(d.account?.id);
+        } else if (d.success && !d.completed) {
+          $('builderIdStatus').textContent = t('builderid.waiting');
+          pollBuilderIdAuth(d.interval || interval);
+        } else {
+          toastError(t('common.failed') + ': ' + (d.error || ''));
+          cancelBuilderIdLogin();
+        }
+      } catch (e) {
+        // Server restarted / network dropped mid-poll: surface it and reset the
+        // modal instead of leaving the poll loop dead and the UI stuck on
+        // "waiting" with no way out.
+        toastError(t('login.connectError'));
         cancelBuilderIdLogin();
       }
     }, interval * 1000);
@@ -4838,36 +5953,42 @@
     showModal('add');
   }
   async function startIamSso() {
-    if (iamSession) {
-      const res = await api('/auth/iam-sso/complete', {
-        method: 'POST', body: JSON.stringify({
-          sessionId: iamSession, callbackUrl: $('iamCallback').value
-        })
-      });
-      const d = await res.json();
-      if (d.success) {
-        closeModal(); loadAccounts(); loadStats();
-        toastPrimary(t('builderid.success') + ': ' + (d.account?.email || d.account?.id));
-        autoRefreshNewAccount(d.account?.id);
-      } else toastError(t('common.failed') + ': ' + (d.error || ''));
-    } else {
-      const res = await api('/auth/iam-sso/start', {
-        method: 'POST', body: JSON.stringify({
-          startUrl: $('iamStartUrl').value, region: $('iamRegion').value
-        })
-      });
-      const d = await res.json();
-      if (d.authorizeUrl) {
-        iamSession = d.sessionId;
-        $('iamAuthUrl').textContent = d.authorizeUrl;
-        $('iamStep2').classList.remove('hidden');
-        $('iamBtn').textContent = t('iam.complete');
-        $('iamOpenBtn').addEventListener('click', () => window.open($('iamAuthUrl').textContent, '_blank'));
-        $('iamCopyBtn').addEventListener('click', async () => {
-          await copyText($('iamAuthUrl').textContent);
-          toast(t('common.copied'), 'primary');
+    // Wrap the whole flow: a dropped connection mid-request must surface an
+    // error and re-enable the button, not throw uncaught and leave it stuck.
+    try {
+      if (iamSession) {
+        const res = await api('/auth/iam-sso/complete', {
+          method: 'POST', body: JSON.stringify({
+            sessionId: iamSession, callbackUrl: $('iamCallback').value
+          })
         });
-      } else toastError(t('common.failed') + ': ' + (d.error || ''));
+        const d = await res.json();
+        if (d.success) {
+          closeModal(); loadAccounts(); loadStats();
+          toastPrimary(t('builderid.success') + ': ' + (d.account?.email || d.account?.id));
+          autoRefreshNewAccount(d.account?.id);
+        } else toastError(t('common.failed') + ': ' + (d.error || ''));
+      } else {
+        const res = await api('/auth/iam-sso/start', {
+          method: 'POST', body: JSON.stringify({
+            startUrl: $('iamStartUrl').value, region: $('iamRegion').value
+          })
+        });
+        const d = await res.json();
+        if (d.authorizeUrl) {
+          iamSession = d.sessionId;
+          $('iamAuthUrl').textContent = d.authorizeUrl;
+          $('iamStep2').classList.remove('hidden');
+          $('iamBtn').textContent = t('iam.complete');
+          $('iamOpenBtn').addEventListener('click', () => window.open($('iamAuthUrl').textContent, '_blank'));
+          $('iamCopyBtn').addEventListener('click', async () => {
+            await copyText($('iamAuthUrl').textContent);
+            toast(t('common.copied'), 'primary');
+          });
+        } else toastError(t('common.failed') + ': ' + (d.error || ''));
+      }
+    } catch (e) {
+      toastError(t('login.connectError'));
     }
   }
   function cancelMicrosoftServerSession(sessionId, selectionId) {
@@ -5128,6 +6249,14 @@
     if (exportSelectedIds.size === 0) { toastWarning(t('export.noSelection')); return; }
     const jsonPromise = getExportData().then(data => {
       if (!data) throw new Error('no-data');
+      // MERGE POLICY NOTE (fork ↔ hian699 v1.2.8): both sides built `filtered` here,
+      // redeclaring a `const` (hard SyntaxError). Ours — the shared helper — survives,
+      // because it is what keeps this path from drifting from the per-account Copy JSON
+      // button, and it additionally carries kiroApiKey plus the api_key regionOverride
+      // that an api_key account needs to be re-importable at all. The incoming side's
+      // genuine contribution was the external-IdP round-trip set (idpClientId,
+      // loginHint), which is folded INTO the helper instead of being kept as a rival
+      // inline literal, so both call sites gain it.
       const filtered = (data.accounts || []).map(credentialImportPayloadFromExportAccount);
       return JSON.stringify(filtered, null, 2);
     });
@@ -5146,6 +6275,127 @@
     const a = document.createElement('a');
     a.href = url;
     a.download = 'kiro-accounts-' + new Date().toISOString().slice(0, 10) + '.json';
+    a.click();
+    URL.revokeObjectURL(url);
+  }
+
+  // API key usage export modal (masked report, not re-importable)
+  function showApiKeyExportModal() {
+    if (!apiKeysCache.length) return toastWarning(t('apiKeys.export.empty'));
+    apiKeyExportSelectedIds = new Set(apiKeysCache.map(k => k.id));
+    renderApiKeyExportModal();
+    openDialog('exportModal');
+  }
+  function renderApiKeyExportModal() {
+    const body = $('exportBody');
+    const all = apiKeyExportSelectedIds.size === apiKeysCache.length;
+    body.innerHTML =
+      '<div class="flex items-center justify-between mb-3">' +
+      '<span class="text-sm muted-text">' + escapeHtml(t('export.selected', apiKeyExportSelectedIds.size)) + '</span>' +
+      '<button class="btn btn-sm btn-outline" id="apiKeyExportToggleAllBtn" type="button">' + escapeHtml(all ? t('export.deselectAll') : t('export.selectAll')) + '</button>' +
+      '</div>' +
+      '<div class="export-list">' +
+      apiKeysCache.map(k => {
+        const checked = apiKeyExportSelectedIds.has(k.id);
+        const label = k.name || k.keyMasked || k.id;
+        const meta = (k.keyMasked || '') + ' · ' + t('apiKeys.export.reqMeta', k.requestsCount || 0) + (k.enabled ? '' : ' · ' + t('apiKeys.export.disabled'));
+        return '<label class="export-row' + (checked ? ' selected' : '') + '">' +
+          '<input type="checkbox" ' + (checked ? 'checked' : '') + ' data-apikey-export-toggle="' + escapeAttr(k.id) + '" />' +
+          '<div class="export-row-text">' +
+          '<div class="export-row-email">' + escapeHtml(label) + '</div>' +
+          '<div class="export-row-meta">' + escapeHtml(meta) + '</div>' +
+          '</div>' +
+          '</label>';
+      }).join('') +
+      '</div>' +
+      '<div id="apiKeyExportJsonPreview" class="hidden mb-3"><textarea id="apiKeyExportJsonText" readonly class="font-mono"></textarea></div>' +
+      '<div class="modal-footer">' +
+      '<button class="btn btn-secondary" id="apiKeyExportCloseBtn" type="button">' + escapeHtml(t('common.cancel')) + '</button>' +
+      '<button class="btn btn-outline" id="apiKeyExportShowJsonBtn" type="button">' + escapeHtml(t('export.showJson')) + '</button>' +
+      '<button class="btn btn-outline" id="apiKeyExportCopyJsonBtn" type="button">' + escapeHtml(t('export.copyJson')) + '</button>' +
+      '<button class="btn btn-outline" id="apiKeyExportCsvBtn" type="button">' + escapeHtml(t('apiKeys.export.downloadCsv')) + '</button>' +
+      '<button class="btn btn-primary" id="apiKeyExportJsonBtn" type="button">' + escapeHtml(t('export.downloadJson')) + '</button>' +
+      '</div>';
+    $('apiKeyExportToggleAllBtn').addEventListener('click', () => {
+      if (apiKeyExportSelectedIds.size === apiKeysCache.length) apiKeyExportSelectedIds.clear();
+      else apiKeyExportSelectedIds = new Set(apiKeysCache.map(k => k.id));
+      renderApiKeyExportModal();
+    });
+    $('apiKeyExportCloseBtn').addEventListener('click', () => closeDialog('exportModal'));
+    $('apiKeyExportShowJsonBtn').addEventListener('click', apiKeyExportShowJson);
+    $('apiKeyExportCopyJsonBtn').addEventListener('click', apiKeyExportCopyJson);
+    $('apiKeyExportCsvBtn').addEventListener('click', apiKeyExportDownloadCsv);
+    $('apiKeyExportJsonBtn').addEventListener('click', apiKeyExportDownloadJson);
+    qsa('[data-apikey-export-toggle]', body).forEach(cb => cb.addEventListener('change', e => {
+      const id = e.target.dataset.apikeyExportToggle;
+      if (apiKeyExportSelectedIds.has(id)) apiKeyExportSelectedIds.delete(id);
+      else apiKeyExportSelectedIds.add(id);
+      renderApiKeyExportModal();
+    }));
+  }
+  async function getApiKeyExportData() {
+    if (apiKeyExportSelectedIds.size === 0) { toastWarning(t('export.noSelection')); return null; }
+    const res = await api('/api-keys/export', { method: 'POST', body: JSON.stringify({ ids: Array.from(apiKeyExportSelectedIds) }) });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      toastError(t('common.failed') + ': ' + (err.error || t('common.unknownError')));
+      return null;
+    }
+    return res.json();
+  }
+  async function apiKeyExportShowJson() {
+    const data = await getApiKeyExportData();
+    if (!data) return;
+    $('apiKeyExportJsonPreview').classList.remove('hidden');
+    $('apiKeyExportJsonText').value = JSON.stringify(data, null, 2);
+  }
+  async function apiKeyExportCopyJson() {
+    if (apiKeyExportSelectedIds.size === 0) { toastWarning(t('export.noSelection')); return; }
+    const jsonPromise = getApiKeyExportData().then(data => {
+      if (!data) throw new Error('no-data');
+      return JSON.stringify(data, null, 2);
+    });
+    try {
+      await copyText(jsonPromise);
+      toast(t('export.copied'), 'primary');
+    } catch (e) {
+      if (e && e.message !== 'no-data') toastError(t('common.failed'));
+    }
+  }
+  async function apiKeyExportDownloadJson() {
+    const data = await getApiKeyExportData();
+    if (!data) return;
+    const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = 'kiro-apikeys-' + new Date().toISOString().slice(0, 10) + '.json';
+    a.click();
+    URL.revokeObjectURL(url);
+  }
+  function csvCell(v) {
+    const s = String(v == null ? '' : v);
+    if (/[",\n]/.test(s)) return '"' + s.replace(/"/g, '""') + '"';
+    return s;
+  }
+  function buildApiKeyCsv(data) {
+    const cols = ['id', 'name', 'keyMasked', 'enabled', 'requestsCount', 'tokensUsed',
+      'creditsUsed', 'tokenLimit', 'creditLimit', 'tokenPercentUsed', 'creditPercentUsed',
+      'overToken', 'overCredit', 'expired', 'expiresAt', 'createdAt', 'lastUsedAt'];
+    const rows = [cols.join(',')];
+    (data.apiKeys || []).forEach(k => {
+      rows.push(cols.map(c => csvCell(k[c])).join(','));
+    });
+    return rows.join('\r\n');
+  }
+  async function apiKeyExportDownloadCsv() {
+    const data = await getApiKeyExportData();
+    if (!data) return;
+    const blob = new Blob([buildApiKeyCsv(data)], { type: 'text/csv;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = 'kiro-apikeys-' + new Date().toISOString().slice(0, 10) + '.csv';
     a.click();
     URL.revokeObjectURL(url);
   }
@@ -5269,6 +6519,399 @@
   }
   function closeUpdateModal() { closeDialog('updateModal'); }
 
+  // Console (realtime logs)
+  let consoleSource = null;
+  let consolePaused = false;
+  let consoleAutoscroll = true;
+  let consoleFilter = 'all';
+  let consoleQueue = [];
+  let consoleRafScheduled = false;
+  const CONSOLE_MAX_LINES = 2000;
+  const consoleLevelRank = { debug: 0, info: 1, warn: 2, error: 3 };
+  // Older server builds prefixed each line with "LEVEL  YYYY/MM/DD HH:MM:SS ";
+  // strip it so the web console doesn't render the level/timestamp twice.
+  const consolePrefixRe = /^(?:DEBUG|INFO|WARN|ERROR)\s+\d{4}\/\d{2}\/\d{2} \d{2}:\d{2}:\d{2}\s+/;
+
+  function consoleSetStatus(state) {
+    const el = $('consoleStatus');
+    const txt = $('consoleStatusText');
+    if (!el || !txt) return;
+    el.dataset.state = state;
+    txt.textContent = t('console.' + state);
+  }
+
+  function consoleBuildLine(entry) {
+    const level = entry.level || 'info';
+    const line = document.createElement('div');
+    line.className = 'console-line console-' + level;
+    line.dataset.level = level;
+    const ts = new Date(entry.ts || Date.now());
+    const hh = String(ts.getHours()).padStart(2, '0');
+    const mm = String(ts.getMinutes()).padStart(2, '0');
+    const ss = String(ts.getSeconds()).padStart(2, '0');
+
+    const tsEl = document.createElement('span');
+    tsEl.className = 'console-ts';
+    tsEl.textContent = hh + ':' + mm + ':' + ss;
+    const badgeEl = document.createElement('span');
+    badgeEl.className = 'console-badge';
+    badgeEl.textContent = level.toUpperCase();
+    const textEl = document.createElement('span');
+    textEl.className = 'console-text';
+    textEl.textContent = String(entry.text || '').replace(consolePrefixRe, '');
+
+    line.appendChild(tsEl);
+    line.appendChild(badgeEl);
+    line.appendChild(textEl);
+    if (consoleFilter !== 'all' && consoleLevelRank[level] < consoleLevelRank[consoleFilter]) {
+      line.classList.add('console-hidden');
+    }
+    return line;
+  }
+
+  // Coalesce bursts: queued entries are flushed to the DOM once per animation
+  // frame via a single DocumentFragment, so render cost stays bounded (~60fps)
+  // no matter how fast log lines arrive.
+  function consoleFlushQueue() {
+    consoleRafScheduled = false;
+    const out = $('consoleOutput');
+    if (!out) { consoleQueue.length = 0; return; }
+    if (!consoleQueue.length) return;
+
+    const batch = consoleQueue;
+    consoleQueue = [];
+    const frag = document.createDocumentFragment();
+    for (let i = 0; i < batch.length; i++) frag.appendChild(consoleBuildLine(batch[i]));
+    out.appendChild(frag);
+    while (out.childElementCount > CONSOLE_MAX_LINES) out.removeChild(out.firstChild);
+    if (consoleAutoscroll) out.scrollTop = out.scrollHeight;
+  }
+
+  function consoleAppend(entry) {
+    consoleQueue.push(entry);
+    if (consoleQueue.length > CONSOLE_MAX_LINES) {
+      consoleQueue.splice(0, consoleQueue.length - CONSOLE_MAX_LINES);
+    }
+    if (!consoleRafScheduled) {
+      consoleRafScheduled = true;
+      requestAnimationFrame(consoleFlushQueue);
+    }
+  }
+
+  function consoleApplyFilter() {
+    qsa('.console-line', $('consoleOutput')).forEach(line => {
+      const hide = consoleFilter !== 'all' && consoleLevelRank[line.dataset.level] < consoleLevelRank[consoleFilter];
+      line.classList.toggle('console-hidden', hide);
+    });
+  }
+
+  function openConsole() {
+    if (consoleSource) return;
+    const out = $('consoleOutput');
+    if (out) out.innerHTML = '';
+    consoleQueue.length = 0;
+    consoleSetStatus('connecting');
+    // Sync the active level selector.
+    api('/logs/level').then(r => r.ok ? r.json() : null).then(d => {
+      if (d && d.level) $('consoleLevel').value = d.level;
+      refreshCustomSelects($('tabConsole'));
+    }).catch(() => { });
+    // EventSource authenticates via the HttpOnly admin_session cookie (sent
+    // automatically for same-origin requests; EventSource cannot set headers).
+    const src = new EventSource('/admin/api/logs/stream');
+    consoleSource = src;
+    src.onopen = () => consoleSetStatus('connected');
+    src.onmessage = ev => {
+      if (consolePaused) return;
+      let entry;
+      try { entry = JSON.parse(ev.data); } catch (e) { return; }
+      consoleAppend(entry);
+    };
+    src.onerror = () => {
+      consoleSetStatus('connecting');
+      // EventSource auto-reconnects; status flips back on the next onopen.
+    };
+  }
+
+  function closeConsole() {
+    if (consoleSource) {
+      consoleSource.close();
+      consoleSource = null;
+    }
+  }
+
+  function bindConsoleEvents() {
+    const levelSel = $('consoleLevel');
+    if (levelSel) levelSel.addEventListener('change', async () => {
+      try {
+        const res = await api('/logs/level', { method: 'POST', body: JSON.stringify({ level: levelSel.value }) });
+        if (res.ok) toastPrimary(t('console.levelChanged', levelSel.value));
+        else toastError(t('common.failed'));
+      } catch (e) { toastError(t('common.failed')); }
+    });
+    const filterSel = $('consoleFilter');
+    if (filterSel) filterSel.addEventListener('change', () => {
+      consoleFilter = filterSel.value;
+      consoleApplyFilter();
+    });
+    const pauseBtn = $('consolePauseBtn');
+    if (pauseBtn) pauseBtn.addEventListener('click', () => {
+      consolePaused = !consolePaused;
+      pauseBtn.dataset.active = String(consolePaused);
+      pauseBtn.textContent = t(consolePaused ? 'console.resume' : 'console.pause');
+    });
+    const autoBtn = $('consoleAutoscrollBtn');
+    if (autoBtn) autoBtn.addEventListener('click', () => {
+      consoleAutoscroll = !consoleAutoscroll;
+      autoBtn.dataset.active = String(consoleAutoscroll);
+    });
+    const clearBtn = $('consoleClearBtn');
+    if (clearBtn) clearBtn.addEventListener('click', () => {
+      consoleQueue.length = 0;
+      const out = $('consoleOutput');
+      if (out) out.innerHTML = '';
+    });
+  }
+
+  // API Log + Usage check
+  function formatLogTime(unixSec) {
+    if (!unixSec) return '';
+    const d = new Date(unixSec * 1000);
+    const pad = n => String(n).padStart(2, '0');
+    return d.getFullYear() + '-' + pad(d.getMonth() + 1) + '-' + pad(d.getDate()) +
+      ' ' + pad(d.getHours()) + ':' + pad(d.getMinutes()) + ':' + pad(d.getSeconds());
+  }
+
+  function normalizeUnixSeconds(v) {
+    const n = Number(v);
+    if (!isFinite(n) || n <= 0) return 0;
+    return n > 1e12 ? Math.floor(n / 1000) : Math.floor(n);
+  }
+
+  // Convert a Unix seconds timestamp to a value for <input type="date"> (local yyyy-mm-dd).
+  function unixToLocalInput(unixSec) {
+    unixSec = normalizeUnixSeconds(unixSec);
+    if (!unixSec) return '';
+    const d = new Date(unixSec * 1000);
+    const pad = n => String(n).padStart(2, '0');
+    return d.getFullYear() + '-' + pad(d.getMonth() + 1) + '-' + pad(d.getDate());
+  }
+
+  // Convert a <input type="date"> value (yyyy-mm-dd) to Unix seconds at end of that
+  // day in local time. Empty input → 0 (never expires).
+  function localInputToUnix(val) {
+    if (!val) return 0;
+    const parts = val.split('-');
+    if (parts.length !== 3) return 0;
+    const d = new Date(+parts[0], +parts[1] - 1, +parts[2], 23, 59, 59);
+    const ms = d.getTime();
+    return isNaN(ms) ? 0 : Math.floor(ms / 1000);
+  }
+
+  // Small colored badge shown next to a key name: red when expired, amber when
+  // expiring within 3 days, nothing otherwise (or when never-expires).
+  function apiKeyExpiryBadge(expiresAt) {
+    expiresAt = normalizeUnixSeconds(expiresAt);
+    if (!expiresAt) return '';
+    const now = Math.floor(Date.now() / 1000);
+    if (expiresAt <= now) {
+      return '<span class="text-xs" style="background:rgba(239,68,68,0.15);color:#ef4444;padding:1px 6px;border-radius:4px;">' + escapeHtml(t('apiKeys.expired')) + '</span>';
+    }
+    if (expiresAt - now <= 3 * 86400) {
+      return '<span class="text-xs" style="background:rgba(245,158,11,0.15);color:#f59e0b;padding:1px 6px;border-radius:4px;">' + escapeHtml(t('apiKeys.expiringSoon')) + '</span>';
+    }
+    return '';
+  }
+
+  // Full "Expires: <date>" line for the key/usage cards. Empty when never expires.
+  function apiKeyExpiryLine(expiresAt) {
+    expiresAt = normalizeUnixSeconds(expiresAt);
+    const val = expiresAt ? formatLogTime(expiresAt) : t('apiKeys.neverExpires');
+    return '<div class="text-xs muted-text">' + escapeHtml(t('apiKeys.expiry')) + ': ' + escapeHtml(val) + '</div>';
+  }
+
+  let apiLogCache = [];
+  let apiLogFilter = 'all';
+  let apiLogSearch = '';
+  let apiLogAutoTimer = null;
+
+  async function loadApiLog() {
+    const body = $('apiLogBody');
+    if (!body) return;
+    const keyId = $('apiLogKeyFilter') ? $('apiLogKeyFilter').value : '';
+    let entries = [];
+    try {
+      const qs = keyId ? ('?apiKeyId=' + encodeURIComponent(keyId)) : '';
+      const res = await api('/request-logs' + qs);
+      const d = await res.json().catch(() => ({}));
+      entries = Array.isArray(d.logs) ? d.logs : [];
+    } catch (e) {
+      entries = [];
+    }
+    apiLogCache = entries;
+    renderApiLog(entries);
+  }
+
+  // Applies status filter + free-text search client-side (the /request-logs feed is unfiltered).
+  function filterApiLog(entries) {
+    let out = entries;
+    if (apiLogFilter === 'success') out = out.filter(e => e.status !== 'error');
+    else if (apiLogFilter === 'error') out = out.filter(e => e.status === 'error');
+    if (apiLogSearch) {
+      const kw = apiLogSearch.toLowerCase();
+      out = out.filter(e =>
+        (e.model || '').toLowerCase().includes(kw) ||
+        (e.endpoint || '').toLowerCase().includes(kw) ||
+        (e.apiKeyName || '').toLowerCase().includes(kw) ||
+        (e.apiKeyMasked || '').toLowerCase().includes(kw) ||
+        (e.accountEmail || '').toLowerCase().includes(kw) ||
+        (e.error || '').toLowerCase().includes(kw));
+    }
+    return out;
+  }
+
+  function renderApiLogMetrics(entries) {
+    const box = $('metricsSummary');
+    if (!box) return;
+    const total = entries.length;
+    let errorCount = 0, durSum = 0, durCount = 0;
+    for (const e of entries) {
+      if (e.status === 'error') errorCount++;
+      if (e.durationMs) { durSum += e.durationMs; durCount++; }
+    }
+    const avg = durCount ? Math.round(durSum / durCount) : 0;
+    box.innerHTML =
+      '<span>' + escapeHtml(t('metrics.logCount')) + ': <strong>' + escapeHtml(String(total)) + '</strong></span>' +
+      '<span>' + escapeHtml(t('metrics.avgLatency')) + ': <strong>' + escapeHtml(String(avg)) + 'ms</strong></span>' +
+      '<span>' + escapeHtml(t('metrics.quotaErrors')) + ': <strong>' + escapeHtml(String(errorCount)) + '</strong></span>';
+  }
+
+  function renderApiLog(allEntries) {
+    const body = $('apiLogBody');
+    const empty = $('apiLogEmpty');
+    const summary = $('apiLogSummary');
+    if (!body) return;
+    const entries = filterApiLog(allEntries);
+    renderApiLogMetrics(entries);
+    if (!entries.length) {
+      body.innerHTML = '';
+      if (empty) empty.classList.remove('hidden');
+      if (summary) summary.innerHTML = '';
+      return;
+    }
+    if (empty) empty.classList.add('hidden');
+
+    let sumInput = 0, sumOutput = 0, sumCredits = 0, errorCount = 0;
+    const rows = entries.map(e => {
+      sumInput += e.inputTokens || 0;
+      sumOutput += e.outputTokens || 0;
+      sumCredits += e.credits || 0;
+      const isError = e.status === 'error';
+      if (isError) errorCount++;
+      const keyLabel = e.apiKeyMasked
+        ? (e.apiKeyName ? escapeHtml(e.apiKeyName) + ' ' : '') + '<span class="font-mono text-xs">' + escapeHtml(e.apiKeyMasked) + '</span>'
+        : '<span class="muted-text">' + escapeHtml(t('apilog.noKey')) + '</span>';
+      const accountLabel = (e.accountEmail || e.accountId)
+        ? '<span class="text-xs">' + escapeHtml(getDisplayEmail(e.accountEmail, e.accountId)) + '</span>'
+        : '<span class="muted-text">-</span>';
+      const statusBadge = isError
+        ? '<span class="text-xs" style="background:rgba(239,68,68,0.15);color:#ef4444;padding:1px 6px;border-radius:4px;">' + escapeHtml(t('apilog.statusError')) + '</span>'
+        : '<span class="text-xs" style="background:rgba(34,197,94,0.15);color:#22c55e;padding:1px 6px;border-radius:4px;">' + escapeHtml(t('apilog.statusOk')) + '</span>';
+      const dash = '<span class="muted-text">-</span>';
+      const detailCell = isError
+        ? '<span class="text-xs" style="color:#ef4444;">' + (e.statusCode ? escapeHtml('HTTP ' + e.statusCode + ' ') : '') + escapeHtml(e.error || '') + '</span>'
+        : dash;
+      const durationCell = e.durationMs ? escapeHtml(formatNumber(e.durationMs)) + 'ms' : dash;
+      const numOrDash = v => (isError && !v) ? dash : escapeHtml(formatNumber(v || 0));
+      return '<tr>' +
+        '<td class="text-xs font-mono">' + escapeHtml(formatLogTime(e.time)) + '</td>' +
+        '<td>' + statusBadge + '</td>' +
+        '<td class="text-xs">' + escapeHtml(e.endpoint || '') + '</td>' +
+        '<td>' + keyLabel + '</td>' +
+        '<td class="text-xs">' + escapeHtml(e.model || '') + '</td>' +
+        '<td>' + (isError ? dash : accountLabel) + '</td>' +
+        '<td class="num text-xs"><span style="color:#22c55e;">&#9660; ' + numOrDash(e.inputTokens) + '</span> / <span style="color:#f59e0b;">&#9650; ' + numOrDash(e.outputTokens) + '</span></td>' +
+        '<td class="num">' + numOrDash(e.totalTokens) + '</td>' +
+        '<td class="num">' + numOrDash(e.credits) + '</td>' +
+        '<td class="num text-xs">' + durationCell + '</td>' +
+        '<td>' + detailCell + '</td>' +
+        '</tr>';
+    }).join('');
+    body.innerHTML = rows;
+
+    if (summary) {
+      const errChip = errorCount
+        ? '<span class="apilog-chip" style="color:#ef4444;">' + escapeHtml(t('apilog.totalErrors', errorCount)) + '</span>'
+        : '';
+      summary.innerHTML =
+        '<span class="apilog-chip">' + escapeHtml(t('apilog.totalRequests', entries.length)) + '</span>' +
+        errChip +
+        '<span class="apilog-chip">' + escapeHtml(t('apilog.totalTokens', formatNumber(sumInput + sumOutput))) + '</span>' +
+        '<span class="apilog-chip">' + escapeHtml(t('apilog.totalCredits', formatNumber(sumCredits))) + '</span>';
+    }
+  }
+
+  async function clearApiLog() {
+    if (!confirm(t('logs.clearConfirm'))) return;
+    try {
+      await api('/request-logs', { method: 'DELETE' });
+    } catch (e) { /* ignore */ }
+    apiLogCache = [];
+    renderApiLog([]);
+    toast(t('logs.cleared'), 'success');
+  }
+
+  function exportApiLog(format) {
+    const entries = filterApiLog(apiLogCache);
+    if (!entries.length) { toast(t('logs.exportFailed'), 'error'); return; }
+    let blob;
+    if (format === 'csv') {
+      const cols = ['time', 'status', 'endpoint', 'apiKeyName', 'apiKeyMasked', 'model', 'accountEmail', 'inputTokens', 'outputTokens', 'totalTokens', 'credits', 'durationMs', 'statusCode', 'error'];
+      const esc = v => {
+        const s = String(v == null ? '' : v);
+        return /[",\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
+      };
+      const lines = [cols.join(',')];
+      for (const e of entries) lines.push(cols.map(c => esc(e[c])).join(','));
+      blob = new Blob([lines.join('\n')], { type: 'text/csv' });
+    } else {
+      blob = new Blob([JSON.stringify(entries, null, 2)], { type: 'application/json' });
+    }
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = 'kiro-go-request-logs.' + (format === 'csv' ? 'csv' : 'json');
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+    toast(t('logs.exported'), 'success');
+  }
+
+  function toggleApiLogAutoRefresh() {
+    const on = $('logsAutoRefresh').checked;
+    if (apiLogAutoTimer) { clearInterval(apiLogAutoTimer); apiLogAutoTimer = null; }
+    if (on) {
+      apiLogAutoTimer = setInterval(() => {
+        if (!$('tabApilog').classList.contains('hidden')) loadApiLog();
+      }, 5000);
+    }
+  }
+
+  function populateApiLogKeyFilter() {
+    const sel = $('apiLogKeyFilter');
+    if (!sel) return;
+    const prev = sel.value;
+    const opts = ['<option value="">' + escapeHtml(t('apilog.allKeys')) + '</option>'];
+    (apiKeysCache || []).forEach(k => {
+      const label = k.name || k.keyMasked || k.id;
+      opts.push('<option value="' + escapeAttr(k.id) + '">' + escapeHtml(label) + '</option>');
+    });
+    sel.innerHTML = opts.join('');
+    sel.value = prev;
+    refreshCustomSelects($('tabApilog'));
+  }
+
   // Tabs
   function showToolPanel(panelId) {
     qsa('.tool-panel').forEach(panel => panel.classList.toggle('hidden', panel.id !== panelId));
@@ -5285,11 +6928,38 @@
     if (panel) panel.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
   }
 
+  // MERGE POLICY NOTE (fork ↔ hian699 v1.2.8): showToolPanel's closing brace was
+  // consumed by the merge, so the tab-polling helpers below were swallowed into its
+  // body and the IIFE never closed — reported by node only as `Unexpected token ')'`
+  // at the LAST line of the file, 780 lines away from the actual damage. Found by
+  // splitting the file at top-level `function` declarations and running node --check
+  // on each chunk, which localises the fault instead of guessing from the symptom.
+  let tabPollTimer = null;
+  const TAB_POLL_MS = 5000;
+  function stopTabPolling() {
+    if (tabPollTimer) { clearInterval(tabPollTimer); tabPollTimer = null; }
+  }
+  function startTabPolling(fn) {
+    stopTabPolling();
+    tabPollTimer = setInterval(fn, TAB_POLL_MS);
+  }
+  // refreshApiKeysIfIdle silently reloads the API-key list for the live-updating card
+  // stats, but skips while any modal is open so it can't clobber an in-progress edit.
+  function refreshApiKeysIfIdle() {
+    if (document.body.classList.contains('modal-open')) return;
+    loadApiKeys();
+  }
+
   function switchTab(tab) {
     qsa('.tab').forEach(el => el.classList.toggle('active', el.dataset.tab === tab));
     qsa('.tab-content').forEach(c => c.classList.add('hidden'));
     $('tab' + tab.charAt(0).toUpperCase() + tab.slice(1)).classList.remove('hidden');
     if (tab === 'logs') loadLogs();
+    if (tab === 'console') openConsole();
+    else closeConsole();
+    stopTabPolling();
+    if (tab === 'apilog') { populateApiLogKeyFilter(); loadApiLog(); startTabPolling(loadApiLog); }
+    else if (tab === 'settings') { startTabPolling(refreshApiKeysIfIdle); }
   }
 
   // Event wiring
@@ -5317,7 +6987,7 @@
     if (checkUpdateBtn) checkUpdateBtn.addEventListener('click', () => checkUpdate(true));
 
     document.body.addEventListener('click', e => {
-      if (!e.target.closest('.custom-select')) closeAllCustomSelects();
+      if (!e.target.closest('.custom-select') && !e.target.closest('.custom-select-content')) closeAllCustomSelects();
       const lb = e.target.closest('.lang-btn');
       if (lb) setLang(lb.dataset.lang);
       const lt = e.target.closest('.lang-toggle');
@@ -5354,6 +7024,22 @@
     }
     qsa('.tool-launch-btn').forEach(btn => btn.addEventListener('click', () => showToolPanel(btn.dataset.toolPanel)));
 
+    const apiLogRefresh = $('apiLogRefreshBtn');
+    if (apiLogRefresh) apiLogRefresh.addEventListener('click', loadApiLog);
+    const apiLogKeyFilter = $('apiLogKeyFilter');
+    if (apiLogKeyFilter) apiLogKeyFilter.addEventListener('change', loadApiLog);
+    const logsFilterSelect = $('logsFilterSelect');
+    if (logsFilterSelect) logsFilterSelect.addEventListener('change', () => { apiLogFilter = logsFilterSelect.value; renderApiLog(apiLogCache); });
+    const logsSearchInput = $('logsSearchInput');
+    if (logsSearchInput) logsSearchInput.addEventListener('input', () => { apiLogSearch = logsSearchInput.value.trim(); renderApiLog(apiLogCache); });
+    const logsExportJsonBtn = $('logsExportJsonBtn');
+    if (logsExportJsonBtn) logsExportJsonBtn.addEventListener('click', () => exportApiLog('json'));
+    const logsExportCsvBtn = $('logsExportCsvBtn');
+    if (logsExportCsvBtn) logsExportCsvBtn.addEventListener('click', () => exportApiLog('csv'));
+    const logsAutoRefresh = $('logsAutoRefresh');
+    if (logsAutoRefresh) logsAutoRefresh.addEventListener('change', toggleApiLogAutoRefresh);
+    const logsClearBtn = $('logsClearBtn');
+    if (logsClearBtn) logsClearBtn.addEventListener('click', clearApiLog);
     qsa('[data-copy]').forEach(btn => btn.addEventListener('click', async () => {
       const id = btn.dataset.copy;
       const target = $(id);
@@ -5373,10 +7059,27 @@
     bindDialogBackdropClose('apiViewModal', closeApiViewModal);
 
     // Logs tab
+    //
+    // MERGE POLICY NOTE (fork ↔ hian699 v1.2.8): this block and the apilog block
+    // above BOTH declared `const logsClearBtn` / `const logsSearchInput` in the same
+    // function scope — a hard SyntaxError that stopped the whole admin bundle from
+    // parsing. Both blocks are live and neither can be deleted: they wire two
+    // different tabs (`tabLogs` → loadLogs, `tabApilog` → loadApiLog, dispatched at
+    // showTab). So the fix here is naming only — the `$()` lookups are unchanged, so
+    // behaviour is identical to what each side intended.
+    //
+    // KNOWN DEFECT, deliberately NOT fixed here (recorded in the checkpoint):
+    // web/index.html carries DUPLICATE element ids across the two tab sections
+    // (logsClearBtn, logsFilterSelect, logsAutoRefresh, logsExportJsonBtn,
+    // logsExportCsvBtn each appear twice — measured). getElementById returns the
+    // FIRST match, so these two blocks compete for the same nodes and the second
+    // tab's controls are wired to the first tab's DOM. Renaming ids is a
+    // markup+JS change across two tab surfaces that needs real browser verification,
+    // so it belongs in its own round rather than being guessed at inside a merge.
     const logsRefreshBtn = $('logsRefreshBtn');
     if (logsRefreshBtn) logsRefreshBtn.addEventListener('click', () => loadLogs({ resetCursor: true }));
-    const logsClearBtn = $('logsClearBtn');
-    if (logsClearBtn) logsClearBtn.addEventListener('click', clearLogs);
+    const logsTabClearBtn = $('logsClearBtn');
+    if (logsTabClearBtn) logsTabClearBtn.addEventListener('click', clearLogs);
     const logsAuto = $('logsAutoRefresh');
     if (logsAuto) logsAuto.addEventListener('change', toggleLogsAutoRefresh);
     const logsFilterSel = $('logsFilterSelect');
@@ -5385,13 +7088,13 @@
       saveLogsPrefs();
       loadLogs({ resetCursor: true });
     });
-    const logsSearchInput = $('logsSearchInput');
-    if (logsSearchInput) logsSearchInput.addEventListener('input', e => {
+    const logsTabSearchInput = $('logsSearchInput');
+    if (logsTabSearchInput) logsTabSearchInput.addEventListener('input', e => {
       logsSearch = e.target.value.trim();
-      clearTimeout(logsSearchInput._timer);
+      clearTimeout(logsTabSearchInput._timer);
       // Any predicate change must restart pagination: resuming from a cursor
       // computed under a different filter would skip rows.
-      logsSearchInput._timer = setTimeout(() => loadLogs({ resetCursor: true }), 250);
+      logsTabSearchInput._timer = setTimeout(() => loadLogs({ resetCursor: true }), 250);
     });
 
     // Facet + range filters. Each one resets the cursor and persists.
@@ -5500,6 +7203,24 @@
     $('exportConfigBtn').addEventListener('click', exportConfig);
     $('proxyType').addEventListener('change', onProxyTypeChange);
     $('saveProxyBtn').addEventListener('click', saveProxyConfig);
+    const savePbu = $('savePublicBaseURLBtn');
+    if (savePbu) savePbu.addEventListener('click', savePublicBaseURL);
+    const saveLn = $('saveLimitNoticeBtn');
+    if (saveLn) saveLn.addEventListener('click', saveLimitNotice);
+    const saveFm = $('saveForceModelBtn');
+    if (saveFm) saveFm.addEventListener('click', saveForceModel);
+    const saveIm = $('saveIdentityModelBtn');
+    if (saveIm) saveIm.addEventListener('click', saveIdentityModel);
+    const idSel = $('identityModel');
+    if (idSel) idSel.addEventListener('change', updateIdentityModelWarning);
+    $('proxyImportBtn').addEventListener('click', importProxies);
+    $('proxyPoolList').addEventListener('click', e => {
+      const btn = e.target.closest('button[data-pool-action]');
+      if (!btn) return;
+      const url = btn.dataset.url;
+      if (btn.dataset.poolAction === 'remove') removeProxyFromPool(url);
+      else if (btn.dataset.poolAction === 'toggle') toggleProxyPool(url, btn.dataset.disabled === '1');
+    });
     $('resetStatsBtn').addEventListener('click', resetStats);
     bindApiKeyEvents();
   }
@@ -5956,6 +7677,7 @@
     if (importJsonBtn) importJsonBtn.addEventListener('click', importRecoveryJson);
     const refreshRecoveryBtn = $('refreshRecoveryBtn');
     if (refreshRecoveryBtn) refreshRecoveryBtn.addEventListener('click', () => renderRecoveryPreview({ items: [] }));
+    bindConsoleEvents();
   }
 
   // Init
@@ -5970,7 +7692,7 @@
     const yr = $('footerYear');
     if (yr) yr.textContent = new Date().getFullYear();
     wireEvents();
-    if (password) tryAutoLogin();
+    tryAutoLogin();
     setInterval(() => {
       if (!$('mainPage').classList.contains('hidden')) loadStats();
     }, 10000);

@@ -135,6 +135,8 @@ func (h *Handler) handleOpenAIResponses(w http.ResponseWriter, r *http.Request) 
 
 	thinkingCfg := config.GetThinkingConfig()
 	actualModel, thinking := ParseModelAndThinking(req.Model, thinkingCfg.Suffix)
+	// Apply global/per-key model override (ForceModel > per-key Model > client model).
+	actualModel = applyModelOverride(actualModel, apiKeyID, thinkingCfg.Suffix)
 	openaiReq.Model = actualModel
 
 	estimatedInputTokens := estimateOpenAIRequestInputTokens(openaiReq)
@@ -146,6 +148,12 @@ func (h *Handler) handleOpenAIResponses(w http.ResponseWriter, r *http.Request) 
 	// forwarded marks a request that already passed through one Kiro-Go pool, so a
 	// custom_api account cannot add another hop (loop guard, see forwardToUpstream).
 	forwarded := r.Header.Get(forwardHeader) != ""
+
+	// Valid-but-blocked key: render the limit-notice as a normal assistant reply.
+	if limitNoticeRequested(r.Context()) {
+		h.sendResponsesNotice(w, actualModel, req.Stream, config.GetLimitNoticeMessage(), respID, &req)
+		return
+	}
 
 	if req.Stream {
 		h.handleResponsesStream(w, kiroPayload, actualModel, thinking, estimatedInputTokens,
@@ -163,13 +171,14 @@ func (h *Handler) handleResponsesNonStream(
 	req *ResponsesRequest, storedInput json.RawMessage, storeResponse bool,
 	rawBody []byte, forwarded bool,
 ) {
+	startedAt := time.Now()
 	excluded := make(map[string]bool)
 	var lastErr error
 	// The trace recorder owns request-level timing from here on.
 	tr := newTraceRecorder("responses", model, false, apiKeyID)
 
 	for attempt := 0; attempt < maxAccountRetryAttempts; attempt++ {
-		account := h.pool.GetNextForModelWithApiKey(model, excluded, apiKeyID)
+		account := h.nextAccountForKey(apiKeyID, model, excluded)
 		if account == nil {
 			break
 		}
@@ -276,7 +285,7 @@ func (h *Handler) handleResponsesNonStream(
 		}
 		outputTokens = estimateOpenAIOutputTokens(finalContent, reasoningContent, toolUses)
 
-		h.recordSuccessForApiKey(apiKeyID, inputTokens, outputTokens, credits, model)
+		h.recordSuccessForApiKey(apiKeyID, inputTokens, outputTokens, credits, model, account, "openai", startedAt)
 		h.pool.RecordSuccess(account.ID)
 		h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
 		finishReason := "completed"
@@ -307,11 +316,14 @@ func (h *Handler) handleResponsesNonStream(
 	}
 
 	if lastErr == nil {
+		h.recordFailureForApiKey(apiKeyID, "openai", model, 503, "No available accounts", startedAt)
 		h.sendOpenAIError(w, 503, "server_error", "No available accounts")
 		return
 	}
-	h.emitTrace(tr, outcomeError, http.StatusInternalServerError)
-	h.sendOpenAIError(w, 500, "server_error", lastErr.Error())
+	status := statusForUpstreamError(lastErr)
+	applyRetryAfterHeader(w, lastErr)
+	h.recordFailureForApiKey(apiKeyID, "openai", model, status, lastErr.Error(), startedAt)
+	h.sendOpenAIError(w, status, errorTypeForOpenAIStatus(status), lastErr.Error())
 }
 
 func buildResponsesObject(
@@ -371,21 +383,29 @@ func buildResponsesObject(
 	}
 }
 
-func (h *Handler) handleResponsesStream(
-	w http.ResponseWriter, payload *KiroPayload, model string, thinking bool,
-	estimatedInputTokens int, apiKeyID, respID string,
-	req *ResponsesRequest, storedInput json.RawMessage, storeResponse bool,
-	rawBody []byte, forwarded bool,
-) {
-	_ = rawBody // streaming /v1/responses does not forward to custom_api upstreams (see loop below)
-	_ = forwarded
+// sendResponsesNotice returns the limit-notice text as a normal assistant reply in the
+// OpenAI /v1/responses shape. Used when a valid key is over-limit/disabled/expired so
+// coding clients show the message in the chat window instead of erroring out. No upstream
+// call, no billing.
+func (h *Handler) sendResponsesNotice(w http.ResponseWriter, model string, stream bool, msg, respID string, req *ResponsesRequest) {
+	outTok := noticeOutputTokens(msg)
+	if !stream {
+		respObj := buildResponsesObject(respID, model, msg, nil, 1, outTok, req)
+		respObj.Instructions = req.Instructions
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		_ = json.NewEncoder(w).Encode(respObj)
+		return
+	}
+
 	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
-
 	flusher, ok := w.(http.Flusher)
 	if !ok {
-		h.sendOpenAIError(w, 500, "server_error", "Streaming not supported")
+		respObj := buildResponsesObject(respID, model, msg, nil, 1, outTok, req)
+		respObj.Instructions = req.Instructions
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		_ = json.NewEncoder(w).Encode(respObj)
 		return
 	}
 
@@ -410,6 +430,89 @@ func (h *Handler) handleResponsesStream(
 		PreviousResponseID: req.PreviousResponseID,
 		Metadata:           req.Metadata,
 	}
+	send("response.created", map[string]interface{}{"type": "response.created", "response": initial})
+	send("response.in_progress", map[string]interface{}{"type": "response.in_progress", "response": initial})
+
+	messageItemID := generateOutputItemID("msg")
+	send("response.output_item.added", map[string]interface{}{
+		"type":         "response.output_item.added",
+		"output_index": 0,
+		"item": map[string]interface{}{
+			"id": messageItemID, "type": "message", "role": "assistant",
+			"status": "in_progress", "content": []map[string]interface{}{},
+		},
+	})
+	send("response.content_part.added", map[string]interface{}{
+		"type": "response.content_part.added", "item_id": messageItemID,
+		"output_index": 0, "content_index": 0,
+		"part": map[string]interface{}{"type": "output_text", "text": ""},
+	})
+	send("response.output_text.delta", map[string]interface{}{
+		"type": "response.output_text.delta", "item_id": messageItemID,
+		"output_index": 0, "content_index": 0, "delta": msg,
+	})
+	send("response.content_part.done", map[string]interface{}{
+		"type": "response.content_part.done", "item_id": messageItemID,
+		"output_index": 0, "content_index": 0,
+		"part": map[string]interface{}{"type": "output_text", "text": msg},
+	})
+	send("response.output_item.done", map[string]interface{}{
+		"type":         "response.output_item.done",
+		"output_index": 0,
+		"item": map[string]interface{}{
+			"id": messageItemID, "type": "message", "role": "assistant", "status": "completed",
+			"content": []map[string]interface{}{{"type": "output_text", "text": msg}},
+		},
+	})
+
+	respObj := buildResponsesObject(respID, model, msg, nil, 1, outTok, req)
+	respObj.CreatedAt = createdAt
+	respObj.Instructions = req.Instructions
+	send("response.completed", map[string]interface{}{"type": "response.completed", "response": respObj})
+	fmt.Fprintf(w, "data: [DONE]\n\n")
+	flusher.Flush()
+}
+
+func (h *Handler) handleResponsesStream(
+	w http.ResponseWriter, payload *KiroPayload, model string, thinking bool,
+	estimatedInputTokens int, apiKeyID, respID string,
+	req *ResponsesRequest, storedInput json.RawMessage, storeResponse bool,
+	rawBody []byte, forwarded bool,
+) {
+	_ = rawBody // streaming /v1/responses does not forward to custom_api upstreams (the loop below skips those accounts)
+	_ = forwarded
+	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		h.sendOpenAIError(w, 500, "server_error", "Streaming not supported")
+		return
+	}
+
+	send := func(eventName string, payload interface{}) {
+		data, err := json.Marshal(payload)
+		if err != nil {
+			return
+		}
+		fmt.Fprintf(w, "event: %s\ndata: %s\n\n", eventName, string(data))
+		flusher.Flush()
+	}
+
+	startedAt := time.Now()
+	createdAt := startedAt.Unix()
+	initial := &ResponsesObject{
+		ID:                 respID,
+		Object:             "response",
+		CreatedAt:          createdAt,
+		Status:             "in_progress",
+		Model:              model,
+		Output:             []ResponseOutputItem{},
+		Usage:              ResponsesUsage{},
+		PreviousResponseID: req.PreviousResponseID,
+		Metadata:           req.Metadata,
+	}
 	send("response.created", map[string]interface{}{
 		"type":     "response.created",
 		"response": initial,
@@ -422,7 +525,7 @@ func (h *Handler) handleResponsesStream(
 	tr := newTraceRecorder("responses", model, true, apiKeyID)
 
 	for attempt := 0; attempt < maxAccountRetryAttempts; attempt++ {
-		account := h.pool.GetNextForModelWithApiKey(model, excluded, apiKeyID)
+		account := h.nextAccountForKey(apiKeyID, model, excluded)
 		if account == nil {
 			break
 		}
@@ -645,6 +748,7 @@ func (h *Handler) handleResponsesStream(
 			fmt.Fprintf(w, "data: [DONE]\n\n")
 			flusher.Flush()
 			h.emitTrace(tr, outcomeError, statusForUpstreamError(err))
+			h.recordFailureForApiKey(apiKeyID, "openai", model, 0, err.Error(), startedAt)
 			return
 		}
 		tr.endAttempt(att, nil)
@@ -694,7 +798,7 @@ func (h *Handler) handleResponsesStream(
 		}
 		outputTokens = estimateOpenAIOutputTokens(finalContent, reasoning, toolUses)
 
-		h.recordSuccessForApiKey(apiKeyID, inputTokens, outputTokens, credits, model)
+		h.recordSuccessForApiKey(apiKeyID, inputTokens, outputTokens, credits, model, account, "openai", startedAt)
 		h.pool.RecordSuccess(account.ID)
 		h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
 		finishReason := "completed"
@@ -735,6 +839,7 @@ func (h *Handler) handleResponsesStream(
 	// initial response.created event has already been sent, so the client is
 	// consuming a stream and needs an explicit end marker.
 	if lastErr == nil {
+		h.recordFailureForApiKey(apiKeyID, "openai", model, 503, "No available accounts", startedAt)
 		send("response.failed", map[string]interface{}{
 			"type": "response.failed",
 			"response": map[string]interface{}{
@@ -750,14 +855,15 @@ func (h *Handler) handleResponsesStream(
 		flusher.Flush()
 		return
 	}
-	h.emitTrace(tr, outcomeError, http.StatusInternalServerError)
+	status := statusForUpstreamError(lastErr)
+	h.recordFailureForApiKey(apiKeyID, "openai", model, status, lastErr.Error(), startedAt)
 	send("response.failed", map[string]interface{}{
 		"type": "response.failed",
 		"response": map[string]interface{}{
 			"id":     respID,
 			"status": "failed",
 			"error": map[string]string{
-				"type":    "server_error",
+				"type":    errorTypeForOpenAIStatus(status),
 				"message": lastErr.Error(),
 			},
 		},
