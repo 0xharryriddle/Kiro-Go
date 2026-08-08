@@ -538,8 +538,16 @@ the client actually received bytes so it cannot pass vacuously).
 site* → confirm the suite goes red → restore. Recorded in the skill in that form.
 
 **Verified:** 7 tests, **8/8 mutants killed** by distinct tests, post-battery diff shows
-only the intended edits; full suite **1381 passed**; `-race` clean. Defect count **81 →
-82**. Remaining trace gap: **D1b** (websearch pair, multi-account attribution).
+only the intended edits; full suite **1381 passed**; full-repo `-race` **1381 passed in 6
+packages** at HEAD `4be1377`. Defect count **81 → 82**. Remaining trace gap: **D1b**
+(websearch pair, multi-account attribution).
+
+**A stale async result nearly got reported as this round's evidence.** A background
+`go test ./... -race` launched during round 18e finished *after* 18g was committed and
+returned `1369 passed`. That number is the 18e baseline — it predates 18f's 5 tests and
+18g's 7 — and the run had executed against a tree that no longer exists. Re-run at the
+current HEAD before quoting any number a background job hands back, and print
+`git log --oneline -1` in the same command so the output carries the commit it measured.
 
 ### 2026-07-30 production recovery — external termination, then round 17 deploy
 

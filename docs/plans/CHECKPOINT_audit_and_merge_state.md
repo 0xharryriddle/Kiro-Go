@@ -2247,9 +2247,32 @@ a recorder is not coverage of the fix.
   double-row, attempt-not-closed, status-derived-from-error, untraced-fallback-dropped,
   nil-guard-dropped, outcome-success. Battery restored the tree and the post-run diff
   shows only the intended D1d edits.
-- `go build` / `go vet` / `gofmt` clean; full suite **1381 passed**; `-race` clean
-  (`proxy` + `pool`, 1174).
+- `go build` / `go vet` / `gofmt` clean; full suite **1381 passed**; full-repo `-race`
+  **1381 passed in 6 packages** at HEAD `4be1377` (not just `proxy`+`pool` — see 12g).
 
 ### 12f. Defect count
 
 **81 → 82.**
+
+### 12g. A stale async result nearly became this round's evidence
+
+A background `go test ./... -race` launched back in round 18e completed *after* 18g was
+already committed, and reported:
+
+```
+Go test: 1369 passed in 6 packages
+```
+
+That number is the **18e baseline**. It predates 18f's 5 tests and 18g's 7, and the run had
+executed against a tree that no longer exists. Quoting it as verification of 18g would have
+understated coverage by 12 tests and, worse, would have attributed a green race run to code
+it never compiled.
+
+It also exposed a real gap rather than only a bookkeeping risk: the race run I had actually
+done at this HEAD covered `./proxy/ ./pool/` only (1174 tests). Re-running full-repo at
+`4be1377` gives **1381 passed in 6 packages**, matching the non-race total — so the gap is
+now closed, but it was open while the docs claimed `-race` clean.
+
+**Procedure:** re-run at the current HEAD before quoting any figure a background job hands
+back, and put `git log --oneline -1` in the *same* command so the output carries the commit
+it measured. An async number with no commit attached is not evidence.
