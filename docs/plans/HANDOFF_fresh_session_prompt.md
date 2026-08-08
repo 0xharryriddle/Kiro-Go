@@ -444,6 +444,48 @@ untraced caller (`bedrockTestReply`, tests) falls back to the legacy row.
 **Verified:** 12 tests, 7/7 mutants killed by distinct tests; full suite 1369 + `-race`
 clean.
 
+### Round 18f — a failed `/v1/responses` stream was counted twice (defect 81)
+
+`proxy/handler.go` (+`recordFailureAttribution`), `proxy/responses_handler.go:752`.
+Full reasoning in `docs/plans/CHECKPOINT_audit_and_merge_state.md` §11.
+
+Streaming `/v1/responses` called `emitTrace(outcomeError)` **and**
+`recordFailureForApiKey` on the same mid-stream failure. Both bump `totalRequests` and
+`failedRequests` (`request_trace_recorder.go:362-365` and `handler.go`'s
+`recordFailure`), so **one** failed request advanced both counters by **two** — inflating
+the dashboard failure rate and breaking reconciliation against the log rows.
+
+`handler.go`'s own note already stated the rule ("that route would then log twice and
+double-count totalRequests"). Written down, and still violated. **Check the rule against
+the code, not just the comment.**
+
+Fix: split `recordFailureAttribution` (per-key attribution + flat log row, **no** counter
+bump) out of `recordFailureForApiKey` (unchanged: counts + attributes). Use the
+attribution-only variant wherever `emitTrace(outcomeError)` also runs; the counting
+variant everywhere else (Claude/OpenAI tails, websearch).
+
+**THE LESSON — a false green I shipped into the mutation battery and then caught.** My
+first protection was three tests calling the helpers **directly**. All green. But the
+mutant that matters — restoring the bug **at the call site** (`responses_handler.go:752`
+using the counting variant again) — **survived all 1374 tests**. Helper-level tests
+cannot see a wiring mistake at a call site.
+
+Fixed with `proxy/responses_stream_counter_test.go`, which drives the real
+`handleResponsesStream` via `setupMidStreamFailureHandler` and asserts the counter
+**delta is exactly 1**. It **asserts** rather than `t.Skipf`s when the failure path is
+not reached — the two sibling tests in `responses_stream_termination_test.go` skip, and a
+skipping test is as vacuous as a helper-level one.
+
+**Generalise it: when the fix is a call-site change, mutate the call site.** A helper
+mutant that dies proves the helper works, not that it is wired correctly.
+
+Also corrected here: `handler.go:2744-2753` described custom_api and Bedrock as having
+"no trace-recorder wiring" — stale as of round 18e (my own change). Now says what is
+true, and points at D1b for the websearch pair that genuinely still lacks it.
+
+**Verified:** 5 tests, 4/4 mutants killed by distinct tests; full suite 1374 + `-race`
+clean.
+
 ### 2026-07-30 production recovery — external termination, then round 17 deploy
 
 The old production container was found stopped with exit code 2 about 20 seconds

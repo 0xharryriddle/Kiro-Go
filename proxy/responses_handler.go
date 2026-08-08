@@ -750,7 +750,12 @@ func (h *Handler) handleResponsesStream(
 			fmt.Fprintf(w, "data: [DONE]\n\n")
 			flusher.Flush()
 			h.emitTrace(tr, outcomeError, statusForUpstreamError(err))
-			h.recordFailureForApiKey(apiKeyID, "openai", model, 0, err.Error(), startedAt)
+			// Attribution only: emitTrace(outcomeError) already bumped
+			// totalRequests/failedRequests just above (see
+			// recordFailureAttribution). Calling the counting variant here made
+			// ONE failed request increment both counters TWICE — the exact
+			// double-count handler.go's own note warns about.
+			h.recordFailureAttribution(apiKeyID, "openai", model, 0, err.Error(), startedAt)
 			return
 		}
 		tr.endAttempt(att, nil)

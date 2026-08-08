@@ -2048,3 +2048,94 @@ pins this (`Tokens == 370` for a 350/20 request with 200 read + 100 write).
 wrong behaviour: rows that cannot be joined, and destroyed failover evidence on a
 path the trace subsystem was explicitly built to cover. The *proposal claim* being
 false is recorded above as a plan error, not counted as a code defect.
+
+## 11. Round 18f — a failed /v1/responses request was counted TWICE (defect 81)
+
+Found while scoping D1b (the websearch legacy-row gap), not by looking for it. Worth
+recording because the repo had **already written down the rule this code broke**, and
+because my first attempt to protect the fix was a false green.
+
+### 11a. The defect
+
+`proxy/responses_handler.go:752-753` (streaming `/v1/responses`, mid-stream failure):
+
+```go
+h.emitTrace(tr, outcomeError, statusForUpstreamError(err))
+h.recordFailureForApiKey(apiKeyID, "openai", model, 0, err.Error(), startedAt)
+```
+
+Both increment the same two counters:
+- `emitTrace` with `outcome == outcomeError` → `totalRequests++`, `failedRequests++`
+  (`request_trace_recorder.go:362-365`);
+- `recordFailureForApiKey` → `recordFailure()` → the same two
+  (`handler.go:2632-2635`).
+
+So **one** failed request advanced `totalRequests` and `failedRequests` by **two**.
+Consequence: the dashboard's failure rate and total volume are both inflated for any
+`/v1/responses` stream that dies after first byte, and `totalRequests` stops
+reconciling against the log row count — the same class of irreconcilability the trace
+subsystem was built to remove.
+
+`handler.go`'s own note above `recordSuccessLog` states the rule verbatim: *"Do not
+reintroduce them on a route that already emits a trace: that route would then log
+twice and double-count totalRequests."* The rule was written; this path violated it.
+
+### 11b. Fix
+
+Split the helper rather than deleting a call:
+
+- `recordFailureForApiKey` — unchanged behaviour (counts + attributes). Still correct
+  for every path that does **not** emit a trace: the Claude/OpenAI tails and the
+  websearch sites.
+- `recordFailureAttribution` (new) — per-key usage + the flat request-log entry,
+  **no** counter bump. For paths where `emitTrace(outcomeError)` already counted.
+
+`responses_handler.go:752` now uses the attribution-only variant. No behaviour is lost:
+the trace row, the per-key failure attribution, and the flat log entry all still
+happen — exactly once each.
+
+### 11c. The false green, and how it was caught
+
+First protection attempt was three unit tests calling `recordFailureAttribution` /
+`emitTrace` / `recordFailureForApiKey` **directly**. All green, and the mutation battery
+looked convincing on two of three mutants — but the mutant that matters, **restoring the
+original bug at the call site** (`responses_handler.go:752` calling the counting variant
+again), **SURVIVED the entire 1374-test suite**.
+
+That is a false green for the exact fix the tests existed to protect: helper-level tests
+cannot see a wiring mistake at a call site.
+
+Fixed by adding `proxy/responses_stream_counter_test.go`, which drives the real
+`handleResponsesStream` through the existing `setupMidStreamFailureHandler` harness
+(deterministic: one valid AWS event-stream frame, then a truncated one) and asserts the
+counter **delta is exactly 1**. The call-site mutant is now killed by it.
+
+Note the harness deliberately **asserts** rather than `t.Skipf`s when the failure path is
+not reached — the two sibling tests in `responses_stream_termination_test.go` skip, and a
+skipping test would have been just as vacuous as the helper-level ones.
+
+**Class-level lesson (recorded in the skill):** when a fix is a *call-site* change, the
+mutation must be applied at the call site, not only inside the helper. A helper-level
+mutant that dies proves the helper works, not that it is wired correctly.
+
+### 11d. Verification
+
+- 5 new tests (3 helper-level + 2 through the real handler).
+- **4/4 mutants killed by distinct tests**: call-site double-count restored (the one
+  that previously survived), `emitTrace` dropped at the call site, attribution variant
+  counts again, counting variant stops counting. Both mutated files restored and
+  sha256-verified byte-identical.
+- `go build`/`go vet`/`gofmt` clean; full suite **1374 passed**; `-race` clean.
+
+### 11e. Also corrected: a comment my own D1 made stale
+
+`handler.go:2744-2753` described custom_api and native Bedrock as "the subsystems that
+have no trace-recorder wiring". Round 18e wired both, so the note was actively
+misleading for the next reader. Rewritten to say what is true now: both go through
+`recordPassthroughTrace`; the flat helpers survive for the untraced fallback and for the
+**websearch pair** (D1b, still open); and the double-count warning now cites this real
+incident plus the `recordFailureAttribution` remedy.
+
+### 11f. Defect count
+
+**80 → 81.**

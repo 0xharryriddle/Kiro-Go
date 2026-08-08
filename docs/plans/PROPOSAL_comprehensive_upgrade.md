@@ -642,6 +642,25 @@ Bedrock code.
   Verified: 12 tests, 7/7 mutants killed by distinct tests (double row, always-legacy,
   no `endAttempt`, row-per-failed-attempt, cache dropped, extractor swap, no legacy
   fallback), full suite 1369 + `-race` clean.
+- ~~**D1c. A failed `/v1/responses` stream was counted twice**~~ — **DONE, round 18f
+  (defect 81).** Not a proposal item; found while scoping D1b. `responses_handler.go:752-753`
+  called `emitTrace(outcomeError)` *and* `recordFailureForApiKey`, and both bump
+  `totalRequests`/`failedRequests` — so one failed request advanced both counters by two,
+  inflating the dashboard failure rate and breaking reconciliation against the log rows.
+  `handler.go`'s own note already stated the rule ("that route would then log twice and
+  double-count totalRequests"); this path violated it. Fixed by splitting out
+  `recordFailureAttribution` (attributes, does **not** count) for paths where `emitTrace`
+  already counted. See CHECKPOINT §11 — including the false green: helper-level tests left
+  the call-site mutant alive across all 1374 tests until a test drove the real handler.
+- **D1b. The websearch pair still writes legacy thin rows** — found while closing D1,
+  recorded rather than silently left. `websearch.go:700` and `websearch_loop.go:223`
+  still call `recordSuccessLog` directly, so those rows carry no `RequestID` and none of
+  the trace block. They are **not** `forwardParams` passthroughs — they are Kiro-path
+  multi-round searches, and `websearch_loop.go` bills *several accounts per request*
+  (round 9, `6911dcd`) — so D1's threading does not apply. The trace model already fits
+  though: `Attempts[]` exists precisely to put several upstream dispatches on one row,
+  so the shape is one recorder per client request with `beginAttempt`/`endAttempt` per
+  round. Smaller than D1 was, and the last two legacy-row writers in the tree.
 - **D2. Metrics coverage audit** — `/metrics` exists, is Prometheus-shaped, and is
   gated behind `MetricsEnabled` (default off, 404 when disabled, no auth — the
   standard scrape model, documented at `metrics_prometheus.go:158`). Audit *which*

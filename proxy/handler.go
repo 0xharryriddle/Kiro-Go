@@ -2706,6 +2706,24 @@ func durationMs(startedAt time.Time) int64 {
 // admin API Log view shows what went wrong (endpoint, model, status code, error detail).
 func (h *Handler) recordFailureForApiKey(apiKeyID, endpoint, model string, statusCode int, errMsg string, startedAt time.Time) {
 	h.recordFailure()
+	h.recordFailureAttribution(apiKeyID, endpoint, model, statusCode, errMsg, startedAt)
+}
+
+// recordFailureAttribution is recordFailureForApiKey WITHOUT the global counter
+// bump: per-key usage attribution and the flat request-log entry only.
+//
+// It exists because emitTrace already owns failure counting on traced routes —
+// `if outcome == outcomeError { totalRequests++; failedRequests++ }`
+// (request_trace_recorder.go:362-365) — so a route that called BOTH emitTrace and
+// recordFailureForApiKey counted one failed request TWICE in both counters. That
+// is precisely what the note above this block warns against ("that route would
+// then log twice and double-count totalRequests"); `/v1/responses` streaming was
+// doing it at responses_handler.go:752-753.
+//
+// Use this variant wherever emitTrace(outcomeError) is also called, and the
+// counting variant everywhere else, so a failed request is counted exactly once
+// on every path.
+func (h *Handler) recordFailureAttribution(apiKeyID, endpoint, model string, statusCode int, errMsg string, startedAt time.Time) {
 	if apiKeyID != "" && h.usage != nil {
 		h.usage.recordFailure(apiKeyID, model)
 	}
@@ -2728,11 +2746,30 @@ func (h *Handler) recordFailureForApiKey(apiKeyID, endpoint, model string, statu
 // terminal record per client request with every failover attempt embedded.
 //
 // recordSuccessLog / recordFailureWithDetails below are the flat single-record
-// helpers. They are still the logging path for the subsystems that have no
-// trace-recorder wiring — custom_api forwarding (custom_api_forward.go) and the
-// native Bedrock provider (bedrock.go) — so they must NOT be deleted. Do not
-// reintroduce them on a route that already emits a trace: that route would then
-// log twice and double-count totalRequests.
+// helpers, and they must NOT be deleted.
+//
+// UPDATED (round 18e / PROPOSAL D1). This note used to name custom_api and native
+// Bedrock as "the subsystems that have no trace-recorder wiring". Both are wired
+// now: their success recorders go through recordPassthroughTrace
+// (proxy/passthrough_trace.go), which emits the rich trace row when the dispatch
+// loop threaded a recorder through forwardParams.
+//
+// The flat helpers survive for two reasons:
+//   - recordPassthroughTrace falls back to recordSuccessLog when no recorder was
+//     threaded (bedrockTestReply, admin probes, and the many test literals that
+//     build forwardParams by hand);
+//   - the websearch pair still calls recordSuccessLog directly
+//     (websearch.go, websearch_loop.go). Those are not forwardParams
+//     passthroughs — websearch_loop bills SEVERAL accounts per request — so they
+//     need their own design. Tracked as D1b in
+//     docs/plans/PROPOSAL_comprehensive_upgrade.md.
+//
+// The warning still stands, and it is not hypothetical: do NOT pair a counting
+// failure helper with emitTrace on the same path. /v1/responses streaming did
+// exactly that (emitTrace(outcomeError) + recordFailureForApiKey) and counted one
+// failed request twice in totalRequests AND failedRequests. Use
+// recordFailureAttribution — the non-counting variant — wherever emitTrace already
+// runs.
 
 func requestLogAccountEmail(accountID string) string {
 	if strings.TrimSpace(accountID) == "" {
