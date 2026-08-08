@@ -1440,7 +1440,7 @@ upstream surfaces.
 pass/fail table, and exits non-zero if any fails:
 
 ```bash
-./scripts/verify.sh            # 10 checks, ~1 min
+./scripts/verify.sh            # 12 checks, ~1 min
 ./scripts/verify.sh --race     # add the race detector (minutes)
 ./scripts/verify.sh --list     # print the checks without running them
 ```
@@ -1503,7 +1503,7 @@ parse and `docker compose config` now pass.
 
 | Script | What proves it works |
 |---|---|
-| `scripts/verify.sh` | all 10 checks mutation-proven RED (table below) |
+| `scripts/verify.sh` | all 12 checks mutation-proven RED, plus a negative control on `html-ids` (table below) |
 | `scripts/dev.sh` | ran `--smoke` and `--seed --smoke`; real `data/config.json` SHA-256 **identical** before/after; of 98 non-empty secret values in the real config, **0** appear in the seeded copy; **0** seeded accounts enabled; account count preserved 41 → 41 |
 | `scripts/deploy.sh` | preflight run green end-to-end; extracted the binary from the image by tag, positive control present, version value `1.2.8` found |
 
@@ -1517,11 +1517,18 @@ and verified byte-identical by SHA-256:
 | gofmt | valid but misformatted Go | RED |
 | test | `t.Fatal` probe | RED |
 | js-parse | duplicate `const` in `web/toast.js` | RED |
+| html-structure | nest a `.tab-content` inside another (the real merge bug, reproduced) | RED |
+| html-structure | drop one `</div>` | RED |
+| html-ids | give two real elements the same id | RED |
 | locale-json | malformed `vi.json` | RED |
 | locale-symmetry | removed one key from `zh.json` | RED |
 | compose yaml | sequence item inside `healthcheck:` (the real merge bug, reproduced) | RED |
 | compose config | `ports:` as a scalar | RED |
 | whitespace | trailing whitespace in a tracked file | RED |
+
+Each positive mutation ran with its sibling check as a control (unaffected = PASS),
+and `html-ids` additionally carries a **negative** control — see §7i for why it
+needed one.
 
 ### 7d. A defect in my own probe, caught by its positive control
 
@@ -1597,16 +1604,102 @@ variables is **1**: `LOOPBACK_HOST`.
 Lesson worth keeping: a grep for one call shape is not an audit of a behaviour. Add a
 positive control (names known to be read) before trusting an absence.
 
+### 7h. The admin panel had two dead tabs — FIXED
+
+This started as the "9 duplicated element ids" item below and turned out to be the
+smaller half of a worse defect. Measured with an `HTMLParser` balance check:
+
+| File | Structural errors | Duplicate ids |
+|---|---|---|
+| ours (`e902ed3^1`) | **0** | **0** |
+| theirs (`e902ed3^2`) | **0** | **0** |
+| merged (`e902ed3`) | **3** | **9** |
+
+Both parents were clean; only the merge was broken. `<select id="logsFilterSelect">`
+opened at line 938 and was never closed — the Logs tab body was cut off mid-element
+and the API Log tab spliced in on top, leaving
+`<div id="tabApilog">` (940-983) and `<div id="tabConsole">` (1032-1067) **nested
+inside** the hidden `<div id="tabLogs">` (933-1068).
+
+**Consequence:** `.tab-content` is `display:none`, and the tab switcher
+(`app.js:6955-6956`) hides every `.tab-content` then un-hides only the target. A
+hidden parent hides its children whatever their own class says, so the **API Log and
+Console tabs could never render at all**. `go build`, `go vet`, `go test` and
+`node --check` were all green on that tree.
+
+The duplicated ids were the second-order damage: both tabs carried their own copy of
+the `logs*` control ids, and `$()` returns the first match, so `app.js` bound *both*
+handler sets to the Logs tab's elements — e.g. `logsClearBtn` fired `clearApiLog`
+(7042) **and** `clearLogs` (7082) on one click.
+
+**Fix**, reconstructed from the parent sections rather than hand-edited (verified
+`lost=0`: every line of the broken region existed in the parent union before
+replacing it):
+
+1. Rebuilt the region as four siblings — `tabLogs`, the trace drawer, `tabApilog`,
+   `tabConsole`. Result: 0 structural errors, 0 unclosed tags, no overlap between any
+   two tab regions.
+2. Renamed the API-Log tab's 7 colliding ids to `apiLog*` and repointed its `app.js`
+   bindings, so each feature owns its own controls.
+3. `saveProxyBtn` appeared twice in Settings (both parents shipped one; the merge kept
+   both). The advanced/fallback copy was inert — renamed to `saveProxyFallbackBtn` and
+   wired to the same `saveProxyConfig` handler.
+4. Dropped ours' duplicate rpm/tpm form fields. This was **not** cosmetic: ours'
+   labels claimed hard rejection ("Windowed rate limit… returns HTTP 429") while
+   `app.js:3927-3931` documents that these inputs carry the *throttle* ints
+   `rpmLimit`/`tpmLimit`; the hard-reject variants are the separate
+   `rpmLimitHard`/`tpmLimitHard` keys (`config.go:442-443`) which **no UI sends**.
+   Ours' labels were therefore already lying about what the field did, and its i18n
+   keys were missing from `vi.json`. Theirs' labels ("throttles by delaying, not
+   rejecting" / "display-only") match the code and are translated in all three
+   locales.
+
+Verified after: 0 structural errors, 0 duplicate ids, every id `app.js` addresses
+statically resolves 1:1, and the full gate green. The 142 `$()` targets absent from
+the HTML are all authored by `app.js` itself in dynamic markup — checked against both
+parents, none was lost by the merge.
+
+### 7i. The gate could not see any of that — two checks added, both mutation-proven
+
+`scripts/verify.sh` had no HTML check of any kind, which is exactly why §7h survived
+a green gate. Added `html-structure` (balanced tags + no nested `.tab-content`) and
+`html-ids` (no duplicated id), covering every `web/*.html`. The gate is now **12
+checks**, and both new ones were proven against the real defect:
+
+| Mutation | Result | Control |
+|---|---|---|
+| nest a `.tab-content` inside another (the actual merge bug) | RED | `html-ids` unaffected |
+| drop one `</div>` | RED | — |
+| give two real elements the same id | RED | `html-structure` unaffected |
+
+**A false positive in my first implementation, and the control that now prevents its
+return.** The id check began as a regex over raw file text and flagged
+`web/index-legacy.html:2411/2415` — two branches of an `if/else` **inside
+`<script>`** that build the same id, where only one ever runs. Not a duplicate DOM id
+at all. Ids are now collected through `HTMLParser`, which hands script bodies to
+`handle_data` as CDATA. The mutation suite includes a **negative** control that
+injects exactly that shape and asserts the check stays **green**.
+
+This is the same error class as §7f: a regex matching one syntactic shape was
+mistaken for an audit of a behaviour. The general rule now recorded in
+`docs/tutorials/02-verification-gate.md`: **a check that can only go red is also
+broken** — pair every positive mutation with a negative control.
+
 ### 7g. Known-and-not-fixed
 
-- **9 duplicated element ids in `web/index.html`** — `apiKeyForm_rpmLimit`,
-  `apiKeyForm_tpmLimit`, `logsAutoRefresh`, `logsClearBtn`, `logsExportCsvBtn`,
-  `logsExportJsonBtn`, `logsFilterSelect`, `metricsSummary`, `saveProxyBtn`.
-  `getElementById` resolves to whichever appears first, so the later control is
-  unreachable. Parses clean; no check in the gate can see it. Re-measure:
-  `grep -oE 'id="[^"]+"' web/index.html | sort | uniq -d`.
+- **`rpmLimitHard` / `tpmLimitHard` have no UI at all.** They are real, enforced
+  config fields (`config.go:442-443`, rejecting with HTTP 429 via `rateLimiter.Admit`)
+  and they appear in the admin wire structs (`admin_apikeys.go:39,121,313`), but no
+  input anywhere sends them and `app.js:3929` records that neither side ever did. So
+  the hard limits are settable only by editing `config.json` directly. Pre-existing
+  design gap, unchanged by this round; noted because §7h's field cleanup is adjacent
+  to it and a later reader will otherwise assume the form covers both pairs.
 - **`vi.json` covers 705/1152 keys.** Not gated (it would have been red from day
-  one); reported as coverage. The 447-key gap is this fork's own features.
+  one); reported as coverage. The 447-key gap is this fork's own features. Dropping
+  ours' rpm/tpm labels in §7h orphaned three en/zh-only keys
+  (`apiKeys.limitRpm`, `apiKeys.limitTpm`, `apiKeys.rateLimitHint`) — now referenced
+  by nothing. Left in place: removing them touches en+zh symmetry and belongs in a
+  locale-pruning pass, not here.
 - **Nothing merged is deployed.** Container `kiro-go-kiro-go-1` is `Exited (0)`; the
   running image predates the merge. Rollback tags preserved and verified reachable:
   `rollback-8197e45d`, `rollback-2958ed77` (9 days), `rollback-71f4e867` (11 days).

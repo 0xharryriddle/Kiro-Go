@@ -19,7 +19,7 @@ facts without checking.
 >
 > **Three scripts now exist and are the entry point for routine work** (each
 > mutation- or run-proven, none writes `data/config.json`):
-> `scripts/verify.sh` (10-check gate), `scripts/dev.sh` (throwaway-config local run),
+> `scripts/verify.sh` (12-check gate), `scripts/dev.sh` (throwaway-config local run),
 > `scripts/deploy.sh` (build + verify image + rollback tag). Walkthroughs in
 > `docs/tutorials/`. Read `docs/tutorials/02-verification-gate.md` before trusting
 > `go test` alone — see the next paragraph for why.

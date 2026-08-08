@@ -14,7 +14,7 @@ the tutorial says how to re-measure it rather than asking you to trust the numbe
 The three scripts these document live in `scripts/`:
 
 ```
-scripts/verify.sh    the full local gate (10 checks)
+scripts/verify.sh    the full local gate (12 checks)
 scripts/dev.sh       run locally against a throwaway config
 scripts/deploy.sh    build, verify the image, swap, roll back
 ```
@@ -31,10 +31,16 @@ The `hian699` v1.2.8 merge left two artifacts broken while `go build ./...`,
 - `docker-compose.yml` was invalid YAML, so `docker compose config` failed and
   the whole deploy path was broken.
 
-Neither is Go code, so no Go tool could see either one. `.github/workflows/ci.yml`
-runs build, vet, gofmt and `go test -race` — **Go only** — so CI would also have
-passed both. That is why `scripts/verify.sh` exists and why it checks JS, locale
-JSON, locale symmetry and Compose validity alongside the Go steps.
+A third defect from the same merge hid even longer, because nothing checked HTML at
+all: `tabApilog` and `tabConsole` ended up **nested inside** the hidden `tabLogs`
+div, so both admin tabs could never render, and 9 element ids were duplicated so
+two different handlers bound the same node.
+
+None of the three is Go code, so no Go tool could see any of them.
+`.github/workflows/ci.yml` runs build, vet, gofmt and `go test -race` — **Go only** —
+so CI would also have passed all three. That is why `scripts/verify.sh` exists and
+why it checks JS parsing, HTML structure, id uniqueness, locale JSON, locale
+symmetry and Compose validity alongside the Go steps.
 
 Full current state of the gate, from a real run:
 
@@ -52,6 +58,8 @@ Go
 
 Web assets
   PASS  js-parse                           4 file(s) parse
+  PASS  html-structure                     4 file(s) ok
+  PASS  html-ids                           4 file(s) ok
   PASS  locale-json                        3 file(s) valid
   PASS  locale-symmetry                    en == zh (1152 leaf keys)
         vi coverage: 705/1152 keys (partial by design, not gated)
@@ -64,7 +72,7 @@ Tree hygiene
   PASS  whitespace                         git diff --check clean
 
 ─────────────────────────────
-  passed 10   failed 0   skipped 1
+  passed 12   failed 0   skipped 1
   gate green
 ```
 

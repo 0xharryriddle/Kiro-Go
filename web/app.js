@@ -6771,7 +6771,7 @@
   }
 
   function renderApiLogMetrics(entries) {
-    const box = $('metricsSummary');
+    const box = $('apiLogMetricsSummary');
     if (!box) return;
     const total = entries.length;
     let errorCount = 0, durSum = 0, durCount = 0;
@@ -6889,7 +6889,7 @@
   }
 
   function toggleApiLogAutoRefresh() {
-    const on = $('logsAutoRefresh').checked;
+    const on = $('apiLogAutoRefresh').checked;
     if (apiLogAutoTimer) { clearInterval(apiLogAutoTimer); apiLogAutoTimer = null; }
     if (on) {
       apiLogAutoTimer = setInterval(() => {
@@ -7028,18 +7028,18 @@
     if (apiLogRefresh) apiLogRefresh.addEventListener('click', loadApiLog);
     const apiLogKeyFilter = $('apiLogKeyFilter');
     if (apiLogKeyFilter) apiLogKeyFilter.addEventListener('change', loadApiLog);
-    const logsFilterSelect = $('logsFilterSelect');
-    if (logsFilterSelect) logsFilterSelect.addEventListener('change', () => { apiLogFilter = logsFilterSelect.value; renderApiLog(apiLogCache); });
-    const logsSearchInput = $('logsSearchInput');
-    if (logsSearchInput) logsSearchInput.addEventListener('input', () => { apiLogSearch = logsSearchInput.value.trim(); renderApiLog(apiLogCache); });
-    const logsExportJsonBtn = $('logsExportJsonBtn');
-    if (logsExportJsonBtn) logsExportJsonBtn.addEventListener('click', () => exportApiLog('json'));
-    const logsExportCsvBtn = $('logsExportCsvBtn');
-    if (logsExportCsvBtn) logsExportCsvBtn.addEventListener('click', () => exportApiLog('csv'));
-    const logsAutoRefresh = $('logsAutoRefresh');
-    if (logsAutoRefresh) logsAutoRefresh.addEventListener('change', toggleApiLogAutoRefresh);
-    const logsClearBtn = $('logsClearBtn');
-    if (logsClearBtn) logsClearBtn.addEventListener('click', clearApiLog);
+    const apiLogFilterSelect = $('apiLogFilterSelect');
+    if (apiLogFilterSelect) apiLogFilterSelect.addEventListener('change', () => { apiLogFilter = apiLogFilterSelect.value; renderApiLog(apiLogCache); });
+    const apiLogSearchInput = $('apiLogSearchInput');
+    if (apiLogSearchInput) apiLogSearchInput.addEventListener('input', () => { apiLogSearch = apiLogSearchInput.value.trim(); renderApiLog(apiLogCache); });
+    const apiLogExportJsonBtn = $('apiLogExportJsonBtn');
+    if (apiLogExportJsonBtn) apiLogExportJsonBtn.addEventListener('click', () => exportApiLog('json'));
+    const apiLogExportCsvBtn = $('apiLogExportCsvBtn');
+    if (apiLogExportCsvBtn) apiLogExportCsvBtn.addEventListener('click', () => exportApiLog('csv'));
+    const apiLogAutoRefresh = $('apiLogAutoRefresh');
+    if (apiLogAutoRefresh) apiLogAutoRefresh.addEventListener('change', toggleApiLogAutoRefresh);
+    const apiLogClearBtn = $('apiLogClearBtn');
+    if (apiLogClearBtn) apiLogClearBtn.addEventListener('click', clearApiLog);
     qsa('[data-copy]').forEach(btn => btn.addEventListener('click', async () => {
       const id = btn.dataset.copy;
       const target = $(id);
@@ -7203,6 +7203,11 @@
     $('exportConfigBtn').addEventListener('click', exportConfig);
     $('proxyType').addEventListener('change', onProxyTypeChange);
     $('saveProxyBtn').addEventListener('click', saveProxyConfig);
+    // The advanced/fallback proxy card carries its own save button. Before the
+    // id split it reused saveProxyBtn, so $() returned the FIRST button and this
+    // one was inert. Same handler: one form, two entry points.
+    const saveProxyFallbackBtn = $('saveProxyFallbackBtn');
+    if (saveProxyFallbackBtn) saveProxyFallbackBtn.addEventListener('click', saveProxyConfig);
     const savePbu = $('savePublicBaseURLBtn');
     if (savePbu) savePbu.addEventListener('click', savePublicBaseURL);
     const saveLn = $('saveLimitNoticeBtn');

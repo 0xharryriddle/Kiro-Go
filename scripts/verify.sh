@@ -78,6 +78,8 @@ Checks, in run order:
  go      test             go test ./... -count=1
  go      race             go test ./... -race -count=1        (only with --race)
  web     js-parse         node --check on every tracked web/**/*.js
+ web     html-structure   every web/*.html: balanced tags, no nested .tab-content
+ web     html-ids         every web/*.html: no duplicated id attribute
  web     locale-json      every web/locales/*.json parses
  web     locale-symmetry  en.json and zh.json leaf-key sets must match exactly
  compose yaml             docker-compose.yml parses as YAML
@@ -150,6 +152,117 @@ if [[ $RUN_WEB -eq 1 ]]; then
     done < <(find web -name '*.js' -not -path '*/node_modules/*' | sort)
     if [[ $js_bad -eq 0 ]]; then pass 'js-parse' "$js_n file(s) parse"
     else fail 'js-parse' "$js_bad of $js_n file(s) failed to parse" "$out"; fi
+  fi
+
+  # HTML structure + id uniqueness.
+  #
+  # These exist because the gate DEMONSTRABLY missed a real defect without them.
+  # The v1.2.8 merge left <div id="tabApilog"> and <div id="tabConsole"> nested
+  # INSIDE the hidden <div id="tabLogs">, so both admin tabs could never render —
+  # a hidden parent hides its children whatever their own class says. It also left
+  # 9 duplicated ids, so getElementById resolved to whichever came first and two
+  # different handlers bound the same node. Both merge parents were structurally
+  # clean; only the merged result was broken, and go build/vet/test plus
+  # `node --check` were all green on it. Nothing here parses HTML but this.
+  if ! have python3; then
+    skip 'html-structure/html-ids' 'python3 not on PATH'
+  else
+    HTML_PROBE="$TMPDIR_OWNED/html_probe.py"
+    cat >"$HTML_PROBE" <<'PY'
+import sys, glob, re, collections
+from html.parser import HTMLParser
+
+VOID = {'area','base','br','col','embed','hr','img','input','link','meta',
+        'param','source','track','wbr'}
+MODE = sys.argv[1]
+
+class Checker(HTMLParser):
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.stack = []      # [(tag, line, is_tab_content)]
+        self.errors = []
+        self.ids = collections.defaultdict(list)
+    def handle_starttag(self, tag, attrs):
+        d = dict(attrs)
+        # Collect ids HERE, from parsed elements only. A regex over raw text
+        # would also match id="..." inside <script> bodies, where two branches
+        # of an if/else legitimately build the same id and only one ever runs —
+        # measured: web/index-legacy.html:2411/2415. HTMLParser hands script
+        # content to handle_data as CDATA, so element ids are the only ones seen.
+        if d.get('id'):
+            self.ids[d['id']].append(self.getpos()[0])
+        if tag in VOID:
+            return
+        cls = d.get('class') or ''
+        is_tab = 'tab-content' in cls.split()
+        if is_tab:
+            for t, ln, was_tab in self.stack:
+                if was_tab:
+                    self.errors.append(
+                        'line %d: <%s class="tab-content"> nested inside the one '
+                        'opened at line %d — a hidden parent hides this tab forever'
+                        % (self.getpos()[0], tag, ln))
+                    break
+        self.stack.append((tag, self.getpos()[0], is_tab))
+    def handle_endtag(self, tag):
+        if tag in VOID:
+            return
+        for i in range(len(self.stack) - 1, -1, -1):
+            if self.stack[i][0] == tag:
+                unclosed = self.stack[i+1:]
+                if unclosed:
+                    self.errors.append(
+                        'line %d: </%s> closed while still open: %s'
+                        % (self.getpos()[0], tag,
+                           ', '.join('<%s>@%d' % (t, ln) for t, ln, _ in unclosed)))
+                del self.stack[i:]
+                return
+        self.errors.append('line %d: stray </%s>' % (self.getpos()[0], tag))
+
+bad = 0
+n = 0
+for path in sorted(glob.glob('web/*.html')):
+    n += 1
+    text = open(path, encoding='utf-8').read()
+    if MODE == 'structure':
+        c = Checker()
+        c.feed(text)
+        errs = list(c.errors)
+        if c.stack:
+            errs.append('unclosed at EOF: %s'
+                        % ', '.join('<%s>@%d' % (t, ln) for t, ln, _ in c.stack))
+        if errs:
+            bad += 1
+            print('%s:' % path)
+            for e in errs[:12]:
+                print('   ' + e)
+    else:
+        c = Checker()
+        c.feed(text)
+        dupes = {k: v for k, v in c.ids.items() if len(v) > 1}
+        if dupes:
+            bad += 1
+            print('%s: %d duplicated id(s)' % (path, len(dupes)))
+            for k, v in sorted(dupes.items()):
+                print('   %-24s lines %s' % (k, v))
+
+if bad:
+    sys.exit(1)
+print('%d file(s) ok' % n)
+PY
+    out="$TMPDIR_OWNED/html-structure.txt"
+    if python3 "$HTML_PROBE" structure >"$out" 2>&1; then
+      pass 'html-structure' "$(cat "$out")"
+    else
+      fail 'html-structure' 'unbalanced tags or a nested .tab-content' "$out"
+    fi
+
+    out="$TMPDIR_OWNED/html-ids.txt"
+    if python3 "$HTML_PROBE" ids >"$out" 2>&1; then
+      pass 'html-ids' "$(cat "$out")"
+    else
+      fail 'html-ids' 'duplicated id attributes (getElementById takes the first)' "$out"
+    fi
   fi
 
   if ! have python3; then

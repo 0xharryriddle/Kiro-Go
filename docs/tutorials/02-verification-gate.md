@@ -43,7 +43,7 @@ go test ./...    → 1328 passed
 (`ci.yml:47-85`). So CI would have passed this tree too. Local gates are the only
 thing that catches the non-Go half.
 
-## The ten checks
+## The twelve checks
 
 ```
  go      build            go build ./...
@@ -52,6 +52,8 @@ thing that catches the non-Go half.
  go      test             go test ./... -count=1
  go      race             go test ./... -race -count=1        (only with --race)
  web     js-parse         node --check on every web/**/*.js
+ web     html-structure   every web/*.html: balanced tags, no nested .tab-content
+ web     html-ids         every web/*.html: no duplicated id attribute
  web     locale-json      every web/locales/*.json parses
  web     locale-symmetry  en.json and zh.json leaf-key sets must match exactly
  compose yaml             docker-compose.yml parses as YAML
@@ -93,23 +95,40 @@ and confirming the file is byte-identical. Measured results:
 | gofmt | misformatted (but valid) Go | RED |
 | test | a `t.Fatal` probe test | RED |
 | js-parse | duplicate `const` in `web/toast.js` | RED |
+| html-structure | nest a `.tab-content` inside another (the real merge bug) | RED |
+| html-structure | drop one `</div>` | RED |
+| html-ids | give two real elements the same id | RED |
 | locale-json | malformed `vi.json` | RED |
 | locale-symmetry | remove one key from `zh.json` | RED |
 | compose yaml | sequence item inside `healthcheck:` | RED |
 | compose config | `ports:` as a scalar instead of a list | RED |
 | whitespace | trailing whitespace in a tracked file | RED |
 
-The `compose yaml` mutation is the *actual* bug the merge shipped, reproduced
-deliberately — the most useful kind of test case, because it is known to have
-occurred rather than imagined.
+Two of those mutations are *actual* bugs this repo shipped, reproduced
+deliberately — the `compose yaml` one and the nested `.tab-content` one. Those are
+the most useful test cases available, because they are known to have occurred
+rather than imagined.
 
-Two rules that came out of doing this:
+`html-ids` also carries a **negative** control, because its first implementation
+had a false positive. A regex over the raw file flagged
+`web/index-legacy.html:2411/2415`, where two branches of an `if/else` **inside
+`<script>`** build the same id and only one ever runs — not a duplicate DOM id at
+all. Ids are now collected through `HTMLParser`, which hands script bodies to
+`handle_data` as CDATA, so only real elements are seen. The control injects
+exactly that shape and asserts the check stays **green**; without it the fix could
+silently regress.
+
+Three rules that came out of doing this:
 
 1. **Baseline green first.** If the suite is already red, a "mutation failed"
    result proves nothing.
 2. **Restore under hash comparison.** Trusting that a write-back restored the
    original is exactly the assumption that loses work. Compare SHA-256 and abort
    if it differs.
+3. **A check that can only go red is also broken.** Pair every positive mutation
+   with a negative control — a shape that *looks* like the defect but is legal, and
+   must stay green. `html-ids` needed exactly this: it started out flagging ids
+   built inside `<script>` branches, which are not duplicate DOM ids.
 
 If you add a check, mutation-prove it in the same pass. An unproven check is a
 liability: it grows trust without earning it.
@@ -154,20 +173,28 @@ function to within a few lines when the reported error was 780 lines away.
 
 Being explicit so nobody reads a green gate as more than it is:
 
-- **No browser execution.** `node --check` proves `app.js` *parses*, not that the
-  panel works. A wrong element id or a handler bound to the wrong node passes.
-  There is a known instance: `web/index.html` carries **9** duplicated element
-  ids, so `getElementById` silently resolves to whichever comes first in the
-  document and the later control is unreachable:
+- **No browser execution, and no HTML parsing at all.** `node --check` proves
+  `app.js` *parses*; nothing here parses `index.html`. That blind spot hid a real
+  defect: the v1.2.8 merge left `tabApilog` and `tabConsole` **nested inside** the
+  hidden `tabLogs` div, so those two admin tabs could never render — a hidden
+  parent hides its children whatever their own class says. Both merge parents were
+  structurally clean; only the merged result was broken, and every Go check plus
+  `node --check` stayed green. It also left 9 duplicated element ids, so
+  `getElementById` resolved to whichever came first and two different handlers
+  bound the same node.
 
-  ```
-  apiKeyForm_rpmLimit   apiKeyForm_tpmLimit   logsAutoRefresh
-  logsClearBtn          logsExportCsvBtn      logsExportJsonBtn
-  logsFilterSelect      metricsSummary        saveProxyBtn
+  Both are fixed. Re-measure structure and ids with:
+
+  ```bash
+  grep -oE 'id="[^"]+"' web/index.html | sort | uniq -d    # expect no output
+  python3 - <<'EOF'
+  from html.parser import HTMLParser
+  # any balanced-tag checker; the point is that the gate does not do this for you
+  EOF
   ```
 
-  Re-measure with `grep -oE 'id="[^"]+"' web/index.html | sort | uniq -d`. This
-  parses fine and is still wrong; no check in this gate can see it.
+  A gate check for HTML structure and id uniqueness is the obvious next addition
+  and does not exist yet.
 - **No live upstream calls.** Tests use hermetic fixtures. Kiro/Bedrock contract
   drift is invisible here.
 - **No `docker compose up`.** `config` validates the manifest; it does not prove

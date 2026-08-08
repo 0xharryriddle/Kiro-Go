@@ -279,7 +279,7 @@ Three scripts cover the everyday loop. Each takes `--help`, and none of them wri
 
 ```bash
 ./scripts/dev.sh --smoke       # run locally against a THROWAWAY config, probe endpoints
-./scripts/verify.sh            # the full local gate (10 checks); --race adds the detector
+./scripts/verify.sh            # the full local gate (12 checks); --race adds the detector
 ./scripts/deploy.sh            # build + verify the image (preflight only; --deploy swaps)
 ```
 

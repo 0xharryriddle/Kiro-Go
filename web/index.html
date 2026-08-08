@@ -739,7 +739,7 @@
                 </div>
               </div>
             </div>
-            <button class="btn btn-primary btn-sm" id="saveProxyBtn" data-i18n="settings.saveProxy"></button>
+            <button class="btn btn-primary btn-sm" id="saveProxyFallbackBtn" data-i18n="settings.saveProxy"></button>
           </details>
         </div>
 
@@ -936,16 +936,6 @@
             <span class="card-title" data-i18n="logs.title"></span>
             <div class="logs-actions">
               <select id="logsFilterSelect" class="w-40!" data-i18n-aria-label="logs.filter">
-      <!-- API Log tab -->
-      <div id="tabApilog" class="tab-content hidden">
-        <section class="card" aria-labelledby="apiLogTitle">
-          <div class="card-header logs-header">
-            <span class="card-title" id="apiLogTitle" data-i18n="apilog.title"></span>
-            <div class="logs-actions">
-              <select id="apiLogKeyFilter" data-i18n-aria-label="apilog.filterKey">
-                <option value="" data-i18n="apilog.allKeys"></option>
-              </select>
-              <select id="logsFilterSelect" data-i18n-aria-label="logs.filter">
                 <option value="all" data-i18n="logs.filterAll"></option>
                 <option value="success" data-i18n="logs.filterSuccess"></option>
                 <option value="error" data-i18n="logs.filterError"></option>
@@ -991,18 +981,34 @@
         <div class="trace-drawer-body" id="traceDrawerBody"></div>
       </div>
       <div id="traceDrawerBackdrop" class="trace-drawer-backdrop hidden"></div>
-              <button class="btn btn-outline btn-sm" id="logsExportJsonBtn" type="button"><i class="fa-solid fa-file-code" aria-hidden="true"></i><span class="btn-text" data-i18n="logs.exportJson"></span></button>
-              <button class="btn btn-outline btn-sm" id="logsExportCsvBtn" type="button"><i class="fa-solid fa-file-csv" aria-hidden="true"></i><span class="btn-text" data-i18n="logs.exportCsv"></span></button>
+
+      <!-- API Log tab -->
+      <div id="tabApilog" class="tab-content hidden">
+        <section class="card" aria-labelledby="apiLogTitle">
+          <div class="card-header logs-header">
+            <span class="card-title" id="apiLogTitle" data-i18n="apilog.title"></span>
+            <div class="logs-actions">
+              <select id="apiLogKeyFilter" data-i18n-aria-label="apilog.filterKey">
+                <option value="" data-i18n="apilog.allKeys"></option>
+              </select>
+              <select id="apiLogFilterSelect" data-i18n-aria-label="logs.filter">
+                <option value="all" data-i18n="logs.filterAll"></option>
+                <option value="success" data-i18n="logs.filterSuccess"></option>
+                <option value="error" data-i18n="logs.filterError"></option>
+              </select>
+              <input id="apiLogSearchInput" class="logs-search" type="search" data-i18n-placeholder="logs.search" />
+              <button class="btn btn-outline btn-sm" id="apiLogExportJsonBtn" type="button"><i class="fa-solid fa-file-code" aria-hidden="true"></i><span class="btn-text" data-i18n="logs.exportJson"></span></button>
+              <button class="btn btn-outline btn-sm" id="apiLogExportCsvBtn" type="button"><i class="fa-solid fa-file-csv" aria-hidden="true"></i><span class="btn-text" data-i18n="logs.exportCsv"></span></button>
               <button class="btn btn-outline btn-sm" id="apiLogRefreshBtn" type="button"><i
                   class="fa-solid fa-arrows-rotate" aria-hidden="true"></i><span class="btn-text"
                   data-i18n="apilog.refresh"></span></button>
-              <label class="logs-auto-toggle"><input type="checkbox" id="logsAutoRefresh" /> <span data-i18n="logs.autoRefresh"></span></label>
-              <button class="btn btn-danger btn-sm" id="logsClearBtn" type="button"><i class="fa-solid fa-trash" aria-hidden="true"></i><span class="btn-text" data-i18n="logs.clear"></span></button>
+              <label class="logs-auto-toggle"><input type="checkbox" id="apiLogAutoRefresh" /> <span data-i18n="logs.autoRefresh"></span></label>
+              <button class="btn btn-danger btn-sm" id="apiLogClearBtn" type="button"><i class="fa-solid fa-trash" aria-hidden="true"></i><span class="btn-text" data-i18n="logs.clear"></span></button>
             </div>
           </div>
           <p class="help-block" data-i18n="apilog.hint"></p>
           <div class="apilog-summary" id="apiLogSummary"></div>
-          <div class="metrics-summary" id="metricsSummary"></div>
+          <div class="metrics-summary" id="apiLogMetricsSummary"></div>
           <div class="table-scroll">
             <table class="data-table" id="apiLogTable">
               <thead>
@@ -1194,14 +1200,6 @@
           <small data-i18n="apiKeys.limitHint"></small>
         </div>
         <div class="form-group">
-          <label data-i18n="apiKeys.limitRpm"></label>
-          <input type="number" id="apiKeyForm_rpmLimit" min="0" step="1" value="0" />
-          <small data-i18n="apiKeys.rateLimitHint"></small>
-        </div>
-        <div class="form-group">
-          <label data-i18n="apiKeys.limitTpm"></label>
-          <input type="number" id="apiKeyForm_tpmLimit" min="0" step="1" value="0" />
-          <small data-i18n="apiKeys.rateLimitHint"></small>
           <label data-i18n="apiKeys.expiresAt"></label>
           <input type="date" id="apiKeyForm_expiresAt" />
           <small data-i18n="apiKeys.expiresAtHint"></small>

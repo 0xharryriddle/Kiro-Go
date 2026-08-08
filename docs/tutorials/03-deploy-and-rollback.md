@@ -31,7 +31,7 @@ output:
 
 ```
 == gate (scripts/verify.sh)
-  ok     passed 10 failed 0 skipped 1
+  ok     passed 12 failed 0 skipped 1
 
 == current state
   warn  no running container (first deploy, or it is stopped)
