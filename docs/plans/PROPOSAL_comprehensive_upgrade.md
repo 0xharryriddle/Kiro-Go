@@ -404,7 +404,15 @@ The original finding, for the record: `Dockerfile` had **no `USER`** (process ra
 as root, root-owned writes into the mounted config) and **no `HEALTHCHECK`**, so
 anyone running the image directly got no health signalling.
 
-### N-8. `proxy/handler.go` is an 8,198-line file routing 91 endpoints (MEASURED)
+### N-8. `proxy/handler.go` was a 9,458-line file routing 91 endpoints (MEASURED)
+
+> **Figure corrected, and the correction is the point.** This heading said **8,198**
+> lines, measured when the item was written. By the time F1 executed it was **9,458** —
+> the file grew ~1,260 lines while the item sat open. Re-measure before planning against
+> any size in this document.
+>
+> **Status: file split DONE (round 18i), `handler.go` now 1,534 lines.** The
+> table-driven routing half is still open — see Track F1 and the risk note there.
 
 Not a bug — a maintainability ceiling, and it is now actively slowing this audit
 programme. Every round pays a re-reading tax on it, and the 91-arm `ServeHTTP`
@@ -724,7 +732,34 @@ Bedrock code.
 
 ### Track F — Maintainability
 
-- **F1. Split `handler.go` + table-driven routing** (N-8).
+- **F1. Split `handler.go` + table-driven routing** (N-8) — **file split DONE
+  (round 18i, tranches 1-2: `f6ec8f5`, `f96d699`); table-driven routing STILL OPEN.**
+
+  `handler.go` **9,458 → 1,534 lines**, moved by surface into 14 sibling files:
+  `handler_claude.go` (1150), `handler_openai.go` (890), `handler_models.go` (513),
+  `handler_accounting.go` (331), `handler_logstore.go` (153), `handler_token.go` (190),
+  `handler_admin_accounts.go` (1344), `handler_admin_import.go` (1149),
+  `handler_admin_settings.go` (664), `handler_admin_sso_kiro.go` (658),
+  `handler_admin_sso_microsoft.go` (490), `handler_admin_logs.go` (338),
+  `handler_health.go` (90), `handler_web.go` (37). Named `handler_admin_*` because
+  twenty `admin_*.go` files already exist in the package.
+
+  **Verified as a pure move, not merely as passing tests.** Stripping the package
+  clause and import block from the pre-split file and from every resulting file gives
+  identical line multisets on both sides — 8,794 lines for tranche 1, 5,845 for
+  tranche 2 — with zero lines lost and zero invented. Imports were recomputed per
+  file by `goimports`, which is where hand-done splits break.
+
+  Left in `handler.go` deliberately: `ServeHTTP` + the 91-arm switch, `handleAdminAPI`
+  and the admin auth gate, `NewHandler`/`Shutdown` and the background goroutines, the
+  `Handler`/`RequestLog`/`AuditLog` types, and the anonymous `const` blocks. That is
+  the routing and lifecycle core — the right residue for a file called `handler.go`.
+
+  **The routing half is a different risk class and was deliberately not bundled.** A
+  file split cannot change behaviour; replacing a specificity-ordered switch with a
+  table changes route *precedence*, so it needs an equivalence harness that walks the
+  real route set and proves identical dispatch for every path before the switch is
+  touched. See §N-8 for the shadowing hazard that makes this worth doing carefully.
 - **F2. Shared retry coordinator** — roadmap P2; 6+ duplicated retry loops that have
   already diverged in trace handling and error mapping.
 - **F3. Continue the audit rounds** on still-unreviewed large files:

@@ -2449,3 +2449,106 @@ mid-stream failure), and both web-search surfaces — now emits exactly one rich
 request through `emitTrace`. Defect #1 of the trace design doc (`RequestID` never assigned
 ⇒ unjoinable rows) and defect #2 (failover chain collapsed to one row, losing the cause of
 the reroute) are closed everywhere, not just on the paths the original build covered.
+
+## 14. Round 18i — F1 file split: `handler.go` 9,458 → 1,534 lines
+
+Commits `f6ec8f5` (tranche 1) and `f96d699` (tranche 2). PROPOSAL F1 / N-8.
+
+### 14a. Why this is two halves, and only one shipped
+
+N-8 asks for two things: split the file, and replace the 91-arm `ServeHTTP` switch with a
+route table. They are **different risk classes** and bundling them would have made the
+result unverifiable:
+
+- A file split inside one package **cannot change behaviour**. Move the bytes, let the
+  compiler resolve the same identifiers, and equivalence is structural.
+- Replacing the switch **changes route precedence**. The arms are ordered by specificity
+  and the file already carries a warning comment about a route being silently shadowed by
+  a more general arm above it. That needs an equivalence harness that walks the real route
+  set and proves identical dispatch per path, *before* the switch is touched.
+
+Only the split shipped. The routing half stays open with that requirement written down.
+
+### 14b. Inventory first — and the name-based grouping I threw away
+
+Measured before cutting: 9,458 lines, 241 top-level blocks, 214 functions, 4 functions over
+200 lines (`handleClaudeStream` 557, `handleOpenAIStream` 493, `handleAdminAPI` 293,
+`apiExportAccounts` 213).
+
+A first pass bucketed decls by name pattern and dumped **121 of 242 into "other"** —
+useless for planning. Replaced with brace-balance extents plus subject grouping, which is
+what produced a usable 14-file plan.
+
+Two traps found by measuring rather than assuming:
+
+1. **The author's own section banner lies.** `// ==== 静态文件服务 ====` (static file
+   serving) sits at line 8783, but only **2** of the 25 decls after it are static serving.
+   The rest are admin APIs — proxy config, proxy pool, log level, thinking config, and
+   `apiExportAccounts` (215 lines). Grouping by banner would have produced a
+   `handler_static.go` full of admin endpoints. Group by subject, verify the banner.
+2. **Duplicate bare names exist**: `const (` ×3 (anonymous blocks) and `Error` ×2 (methods
+   on `importValidationError` and `importPersistError`). A plan keyed on bare names would
+   have silently moved the wrong one, so the tool refuses any non-unique match and accepts
+   receiver-qualified names (`importPersistError.Error`) instead.
+
+Also checked and clear: no `//go:embed`, no build tags, no `func init()` — nothing pinned a
+decl to a particular file.
+
+### 14c. Verified as a MOVE, not merely as passing tests
+
+The split ran through a script that reports its own invariants — which is a self-report,
+so it proves nothing on its own. The independent check: strip the `package` clause and
+import block from the pre-split file and from every resulting file, then compare line
+**multisets**.
+
+| tranche | pre-split code lines | resulting | identical | lost | invented |
+|---|---|---|---|---|---|
+| 1 (6 files + residue) | 8,794 | 8,794 | yes | 0 | 0 |
+| 2 (8 files + residue) | 5,845 | 5,845 | yes | 0 | 0 |
+
+Imports were recomputed per file by `goimports` (found at `$(go env GOPATH)/bin`, not on
+`PATH`) rather than by hand — hand-maintaining 14 import blocks is precisely where this
+kind of refactor breaks.
+
+**A verification bug worth recording.** The first attempt at the tranche-1 proof read the
+baseline via `git show HEAD:proxy/handler.go` through a tool wrapper and got **0 lines**
+back — the known output-dropping quirk. It then compared 0 against 8,794 and reported
+`multiset identical: False` with "8,794 lines added". The *verification* had failed, not
+the split. Redirecting `git show` to a file on disk and re-reading it fixed the check and
+confirmed the baseline sha256 matched the pre-split hash. When a check reports a
+catastrophic difference, confirm the check can see its inputs before believing it.
+
+### 14d. Result
+
+`handler.go` **9,458 → 1,534**, into 14 files: `handler_claude.go` 1150,
+`handler_openai.go` 890, `handler_models.go` 513, `handler_accounting.go` 331,
+`handler_logstore.go` 153, `handler_token.go` 190, `handler_admin_accounts.go` 1344,
+`handler_admin_import.go` 1149, `handler_admin_settings.go` 664,
+`handler_admin_sso_kiro.go` 658, `handler_admin_sso_microsoft.go` 490,
+`handler_admin_logs.go` 338, `handler_health.go` 90, `handler_web.go` 37.
+
+Named `handler_admin_*`, not `admin_*`: twenty `admin_*.go` files already exist in the
+package, and the prefix keeps the split's output distinguishable from them.
+
+Residue in `handler.go` is deliberate and coherent — `ServeHTTP` + the 91-arm switch,
+`handleAdminAPI` and the admin auth gate, `NewHandler`/`Shutdown` plus the four background
+goroutines, the `Handler`/`RequestLog`/`AuditLog` types, and the anonymous `const` blocks.
+Routing and lifecycle, which is what a file called `handler.go` should hold.
+
+### 14e. Verification
+
+- `go build` / `go vet` / `gofmt` clean after each tranche.
+- Full suite **1386 passed** and full-repo `-race` **1386 passed in 6 packages** — byte-for
+  byte the same counts as the pre-split run at `01d97a9`. A pure move should not change a
+  single test outcome, and it did not.
+- `scripts/verify.sh` **12/12 green**.
+- Line-multiset equivalence per tranche (§14c), which is the assertion that actually
+  distinguishes a move from a rewrite.
+
+### 14f. Stale figures corrected in this document's own planning text
+
+N-8's heading claimed **8,198** lines and the handoff said **8.2k**. Measured at execution:
+**9,458** — the file grew ~1,260 lines while the item sat open. Both corrected, with the
+drift called out rather than silently overwritten, because the same staleness pattern has
+now produced wrong plans three times this programme (the SIX-vs-EIGHT retry loops in §13d,
+the `NextResetDate` sizing in §9, and this).

@@ -305,7 +305,9 @@ with D2 rather than being bundled in unproven.
 **Next items from the proposal, in priority order:** ~~B1 in-flight quota
 accounting~~ **— DONE in round 18c, see the section below;** then B2 sizing the
 overage backoff from `NextResetDate` (finishes round 16 honestly), F1 splitting the
-8.2k-line `handler.go` (now safe to attempt, since CI guards it), B3 latency-aware
+`handler.go` (**split DONE round 18i**: was 9,458 lines — not the 8.2k this document
+used to claim — now 1,534 across 14 files; table-driven routing still open), B3
+latency-aware
 routing (1.42x measured median spread, controlled for prompt size — and now
 unblocked, since it wanted B1's counter).
 
