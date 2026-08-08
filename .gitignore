@@ -10,6 +10,14 @@
 **/data/
 *.log
 
+# Local deployment secrets. docker-compose.yml reads ADMIN_PASSWORD from here to
+# satisfy the main.go:104 startup guard (default password + non-loopback host =
+# refuse to boot). The value is an env override only — config.SetPassword stores
+# it in passwordOverride, so it is never written into data/config.json.
+.env
+.env.*
+!.env.example
+
 # Editor / OS
 .idea/
 .vscode/

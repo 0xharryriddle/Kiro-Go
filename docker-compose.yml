@@ -49,6 +49,25 @@ services:
       # even when the cache file has not been created yet.
       - ${KIRO_AWS_SSO_CACHE_DIR:-${HOME}/.aws/sso/cache}:/host-aws-sso-cache:ro
     environment:
+      # Admin panel password, supplied from the GITIGNORED ./.env (see .env.example).
+      #
+      # REQUIRED for this stack to boot. main.go:104 refuses to start when the stored
+      # password is still the default `changeme` AND the bind host is non-loopback —
+      # and HOST below is 0.0.0.0, so the guard always applies here. The "or bind to
+      # 127.0.0.1" escape in that error message is NOT usable in Docker: a container
+      # loopback listener cannot be reached through the published port mapping, so the
+      # env override is the only viable fix.
+      #
+      # Not persisted: config.SetPassword stores this in `passwordOverride`, which
+      # Save() deliberately never writes to data/config.json (L9), so the secret stays
+      # out of the config file and out of `/admin/api/config/export`.
+      #
+      # Deliberately defaulted to empty rather than `${ADMIN_PASSWORD:?}`: the fail-loud
+      # form breaks `docker compose config`, which scripts/verify.sh runs as a gate, in
+      # any checkout without a .env. Enforcement belongs in the app's guard (one place),
+      # not duplicated in the manifest — an unset value simply produces main.go's
+      # explicit refusal instead of a confusing compose interpolation error.
+      - ADMIN_PASSWORD=${ADMIN_PASSWORD:-}
       - CONFIG_PATH=/app/data/config.json
       - KIRO_IDE_CACHE=/host-aws-sso-cache/kiro-auth-token.json
       # Force the app's in-container listen port to match the published
