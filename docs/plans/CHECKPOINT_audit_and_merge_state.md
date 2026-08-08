@@ -1708,3 +1708,123 @@ broken** — pair every positive mutation with a negative control.
   `auth_state.txt`, `lc_check.txt`, `lc_fix.txt`, `stage_auth.txt`) and is **not**
   gitignored, so `git add -A` would sweep them in. Left in place rather than deleted
   (shared repo, and they are not mine to remove); stage explicit paths instead.
+
+## 8. Round 18c — B1 in-flight quota reservation (PROPOSAL B1 / roadmap P0-1)
+
+Closed the largest *measured* inefficiency in the proxy. Not a new capability: the
+signal already existed on the hot path and was being discarded.
+
+### 8a. The defect
+
+`isQuotaBlocked` -> `isOverUsageLimit(acc)` compares `acc.UsageCurrent` against
+`acc.UsageLimit`. `UsageCurrent` is written **only** by an upstream refresh
+(`RefreshAccountInfo` -> `config.UpdateAccountInfo`), and background refresh runs on
+a ~30-minute cycle. So the number every routing decision was made on could be half
+an hour old, and no amount of traffic moved it.
+
+Live evidence (already in this checkpoint's round-18 corpus): **112 HTTP 402
+`MONTHLY_REQUEST_COUNT` errors in 8 minutes** on `thuquan-pham@tainguyenvibe.com.vi`
+= **134 dispatches into an account the proxy had already been told was capped.**
+Each one costs a request slot, a retry, and client latency to be told the same thing.
+
+Meanwhile `UpdateStats` — which runs after *every* successful request — already
+received the upstream's own per-request `credits` figure and filed it into
+`Account.TotalCredits`, a **lifetime** counter used only for reporting. The
+period-scoped gate never saw it.
+
+### 8b. Why a delta on top of upstream, not a replacement
+
+Measured against the 41 real accounts in `data/config.json` before writing any code:
+
+| account | `usageCurrent` | `totalCredits` | delta |
+|---|---|---|---|
+| xuanan-nguyen@… | 3876 | 3874.98 | **1.0** |
+| ducdung-vu@… | 3870 | 3870.88 | **0.9** |
+| tongkhoogn95267@… | 1281 | 1279.42 | 1.6 |
+| user.brandon.garcia@… | 4882 | 1957.60 | **2925** |
+| noor.holmes@… | 2486 | *(none)* | **all of it** |
+
+The top rows agree to ~1 unit, which is what **proves the two share a unit**:
+agentic requests, ~1-2 per request. They are **not** tokens — `credits/1k_tokens` is
+0.005-0.026 across the fleet, so treating `credits` as tokens would have
+under-counted by ~100x and the gate would never have fired.
+
+The bottom rows diverge hard the other way because the same Kiro account is also
+driven by the Kiro IDE and other clients. Local credits are therefore a **lower
+bound** on period usage, never the whole truth — so upstream stays authoritative and
+the delta only adds what we know happened since it was captured.
+
+### 8c. Reset by observation, not by hook
+
+`Reload` compares each account's `UsageCurrent` against the value the delta is
+relative to (`lastSeenUsage`) and zeroes the delta when it moves — a fresh upstream
+figure already contains the credits we tracked, so keeping them would double-count
+and park a healthy account.
+
+This is deliberately **not** a reset hook on the refresh sites. Several places write
+`UsageCurrent` (background refresh, the admin refresh endpoint, the api-key batch
+importer, per-account probes), they live in a different package, and a new one added
+later that forgot to call a hook would double-count for a full period. A value
+comparison cannot be forgotten.
+
+Baseline adoption on first sighting does **not** clear the delta: an account can
+appear in a `Reload` (first one after restart, or on re-enable) while requests are
+already in flight, and clearing would throw away real observed usage.
+
+### 8d. Blast direction, and the one gate deliberately left alone
+
+The delta can only ever make an account look **more** used, never less, so the worst
+case is parking an account slightly early — cost: one failover to a healthy sibling.
+The failure it removes is the opposite and much worse.
+
+Five of the six `isQuotaBlocked` call sites moved to the in-flight-aware
+`p.quotaBlocked`. The sixth — the membership filter in `Reload` (`account.go:295`) —
+was **left on the upstream-only rule on purpose**: that one drops an account from the
+pool entirely, and an estimate should be able to make routing *skip* an account, never
+*evict* it. The two paths that matter most were the sticky-affinity selector (a bound
+api key would otherwise re-pick the same capped account for the whole refresh window)
+and `eligibleForRoute`, the quota-*aware* selector's own gate — leaving that one stale
+would have meant the feature whose entire purpose is quota routing still picking
+capped accounts.
+
+`Diagnostics` moved too, so the operator surface agrees with routing; reporting an
+account available while every routing path skips it sends an operator hunting a
+phantom fault.
+
+### 8e. Verification
+
+- `pool/inflight_quota.go` (new, 6.9K), `pool/inflight_quota_test.go` (12 tests),
+  `pool/account.go` (2 struct fields, `UpdateStats` hook, `Reload` sync, 5 gates).
+- **5/5 mutants killed, each by a distinct test** — gate ignores delta, reset hook
+  disabled, sign guard removed, prune removed, overage precedence dropped. Every
+  mechanism is independently constrained; restore verified byte-identical (sha256)
+  after each mutation.
+- 7 of the 12 are controls that stay green under the gate mutation (headroom,
+  no-limit-data, overage, allowOverUsage, prune, refresh-reset, race) — without them
+  a gate that blocked *everything* would have looked like a working feature.
+- `go build ./...`, `go vet ./...`, `gofmt -l` clean. Full suite **1340 passed**;
+  `go test ./... -race -count=1` **1340 passed, 0 races**. `pool` run at `-count=3`
+  (318) to check for order-dependence.
+
+### 8f. A flake I introduced and then fixed
+
+The diagnostics test passed in isolation and failed in the full suite with
+`TempDir RemoveAll cleanup: directory not empty`. Not an assertion failure: it is the
+trap the `AccountPool` struct comment already documents — `UpdateStats` persists
+config in a **detached goroutine** tracked by `pendingWrites`, so a late `Save()`
+re-created `config.json` inside the `t.TempDir` the harness was deleting. Every test
+I wrote called `UpdateStats`; only the race test happened to drain. Fixed with
+`newTestPoolDrained`, which registers `WaitForPendingWrites` as a cleanup **after**
+`config.Init`'s so LIFO runs the drain before the directory is removed.
+
+Recorded rather than quietly fixed because it is a reusable lesson about this
+package: **any pool test that calls `UpdateStats` must drain `pendingWrites`.**
+
+### 8g. Defect count — a judgment call, stated
+
+Count moves **78 -> 79**. §4 precedent (A3, A4) says "hardening and missing controls
+are not defects", and B1 sits on the line: nothing was *unimplemented*, but the
+router demonstrably made wrong decisions from stale state and burned 134 real
+dispatches doing it. That is observable misbehaviour with live evidence, not an
+absence, so it is counted. Flagged explicitly so a later reader can disagree with the
+classification without having to re-derive the reasoning.

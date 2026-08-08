@@ -507,8 +507,43 @@ Bedrock code.
 
 ### Track B — Routing & efficiency (roadmap-aligned, evidence already gathered)
 
-- **B1. In-flight quota reservation** — roadmap P0-1. The single largest measured
-  waste: 30-minute stale quota produced 112 cap errors in 8 minutes.
+- ~~**B1. In-flight quota reservation**~~ — **DONE, round 18c.** roadmap P0-1. The
+  single largest measured waste: 30-minute stale quota produced 112 cap errors in
+  8 minutes. `pool/inflight_quota.go` + 5 gate call sites in `pool/account.go`.
+
+  The signal already existed and was being thrown away: `UpdateStats` receives the
+  upstream's own per-request `credits` figure after every request and filed it only
+  into `Account.TotalCredits`, a LIFETIME counter used for reporting, while the
+  quota gate compared the PERIOD-scoped `UsageCurrent` — a field only an upstream
+  refresh writes, on a ~30-minute cycle. So no amount of traffic could move the
+  number the router decided on.
+
+  **Why a delta on top, not a replacement.** Measured across 41 real accounts in
+  `data/config.json`: proxy-only accounts agree to ~1 unit (xuanan-nguyen
+  usageCurrent 3876 vs totalCredits 3874.98; ducdung-vu 3870 vs 3870.88) — which is
+  what proves `credits` and `UsageCurrent` share a unit (agentic requests, ~1-2/req,
+  NOT tokens: credits/1k_tok is 0.005-0.026, so treating them as tokens would
+  under-count ~100x). But others diverge hard the other way (user.brandon.garcia
+  4882 vs 1957; noor.holmes 2486 with no local counter at all) because the same Kiro
+  account is also driven by the Kiro IDE. Local credits are therefore a LOWER BOUND
+  on period usage: upstream stays authoritative, we only add what we know happened
+  since it was captured.
+
+  **Reset by observation, not by hook.** `Reload` compares each account's
+  `UsageCurrent` against the value the delta is relative to and zeroes the delta when
+  it moves. Several sites write that field (background refresh, admin refresh, the
+  api-key batch importer) and they live in another package — a reset *hook* a future
+  site forgets to call would double-count for a whole period; a value comparison
+  cannot be forgotten.
+
+  **Blast direction.** The delta can only make an account look MORE used, so the
+  worst case is parking one slightly early (costs one failover). Deliberately NOT
+  applied to the `Reload` membership filter: that one drops an account from the pool
+  outright, so it stays on the authoritative upstream figure — our estimate can make
+  routing skip an account, never evict it.
+
+  Verified: 12 tests, 5/5 mutants killed by distinct tests (gate, reset hook, sign
+  guard, prune, overage precedence), full suite + `-race` clean.
 - **B2. Cap-aware backoff sizing** — finish round 16's other half: size the overage
   backoff from `NextResetDate` instead of a flat 1h.
 - **B3. Filter → score → pick routing** — roadmap P1-2. 1.42x within-band TTFB
@@ -516,7 +551,8 @@ Bedrock code.
 - **B4. Prefix-affinity routing** — roadmap P1-3. 95.2% prefix repetition. Sell as
   latency, not cost (R1 refuted the cost story).
 - **B5. Admission control** — global + per-account in-flight ceilings, 429 with
-  `Retry-After`. Falls out of B1's counter nearly free.
+  `Retry-After`. Now genuinely cheap: B1 shipped the per-account counter
+  (`AccountPool.InFlightUsage`) this was waiting on.
 
 ### Track C — Protocol surface completeness
 
@@ -667,8 +703,11 @@ Ordered by (impact × evidence) ÷ risk, with cheap-and-safe pulled forward:
    memory-DoS surface on all four customer entry points.
 4. ~~**A4 admin brute-force**~~ — **DONE, round 17d.** Closed an unlimited-guess
    hole on both admin gates, including the one guarding credential export.
-5. **B1 in-flight quota** — largest measured efficiency win; unlocks B3. **Next up.**
-6. **B2 cap backoff sizing** — finishes round 16 honestly.
+5. ~~**B1 in-flight quota**~~ — **DONE, round 18c.** Closed the largest measured
+   efficiency waste: the router decided on a quota figure up to ~30 minutes stale,
+   which sent 134 dispatches into an account already answering 402. Unblocks B3 and
+   B5 (both wanted this counter).
+6. **B2 cap backoff sizing** — finishes round 16 honestly. **Next up.**
 7. **F1 handler split** — unblocks every later round; safe once CI guards it.
 8. **A5 ctx propagation**, then B3/B4, then Track C/D/E by need.
 

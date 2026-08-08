@@ -204,6 +204,12 @@ type AccountPool struct {
 	circuitState    map[string]*circuitBreaker // accountID → circuit breaker state
 	healthStats     map[string]*accountHealth  // accountID → EWMA latency + error/success counts
 	apiKeyAffinity  map[string]apiKeyBinding   // apiKeyID → preferred account (sticky routing)
+	// usageDelta/lastSeenUsage implement in-flight quota accounting; see
+	// inflight_quota.go for why the router cannot trust Account.UsageCurrent
+	// alone (it is only written by an upstream refresh, so it is up to ~30
+	// minutes stale, and the fleet burned 112 cap errors in 8 minutes on it).
+	usageDelta    map[string]float64 // accountID → period usage observed locally since the last upstream refresh
+	lastSeenUsage map[string]float64 // accountID → the UsageCurrent value the delta above is relative to
 	// pendingWrites tracks the detached config-persistence goroutines started by
 	// UpdateStats. Stats are written off the request path deliberately (a config
 	// Save must not add latency to a proxied response), which leaves a write in
@@ -268,6 +274,14 @@ func (p *AccountPool) Reload() {
 
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	// Re-baseline in-flight quota accounting BEFORE the quota filter below
+	// consumes it: a fresh upstream UsageCurrent already contains the credits we
+	// had been tracking locally, so continuing to add our delta on top would
+	// double-count and park a healthy account. Driven off `configured` rather
+	// than `enabled` so a merely-disabled account keeps its delta instead of
+	// having it pruned and re-adopted at zero when it is re-enabled.
+	// See inflight_quota.go.
+	p.syncUsageBaselines(configured)
 	var accounts []config.Account
 	// Rebuild per-account model allow-lists from config (single source of truth),
 	// normalized lower-case for case-insensitive routing checks. An empty/absent
@@ -532,7 +546,10 @@ func (p *AccountPool) GetNextForModelExcluding(model string, excluded map[string
 		// and a pool whose tokens all aged out would go dark instead of
 		// self-healing. Locked in by
 		// TestGetNext/GetNextForModelKeepsExpiringTokenAvailableForRequestRefresh.
-		if isQuotaBlocked(*acc, allowOverUsage) {
+		// In-flight aware (inflight_quota.go): the upstream-only rule routes on
+		// a UsageCurrent that a refresh writes at most every ~30 minutes, which
+		// is how 134 dispatches reached an account already returning 402.
+		if p.quotaBlocked(*acc, allowOverUsage) {
 			continue
 		}
 		candidates = append(candidates, candidate{
@@ -682,7 +699,11 @@ func (p *AccountPool) GetNextForModelWithApiKey(model string, excluded map[strin
 				// still valid within refresh-skew and the handler refreshes it; gating on
 				// it would rebind the session to a different account every refresh window.
 				hasModel := model == "" || p.accountHasModel(acc.ID, model)
-				quotaBlocked := isQuotaBlocked(*acc, allowOverUsage)
+				// In-flight aware, as in GetNextForModelExcluding. Sticky
+				// affinity makes this the more important of the two: a bound
+				// api key would otherwise keep re-picking the SAME capped
+				// account for the whole refresh window instead of rebinding.
+				quotaBlocked := p.quotaBlocked(*acc, allowOverUsage)
 				p.mu.RUnlock()
 				cooldownActive := hasCooldown && time.Now().Before(cooldown)
 				if !isExcluded && !cooldownActive && !p.isCircuitOpen(acc.ID, time.Now()) && hasModel && !quotaBlocked {
@@ -1303,6 +1324,13 @@ func (p *AccountPool) UpdateStats(id string, tokens int, credits float64) {
 				p.accounts[i].TotalTokens += tokens
 				p.accounts[i].TotalCredits += credits
 				p.accounts[i].LastUsed = time.Now().Unix()
+				// In-flight quota accounting (inflight_quota.go). TotalCredits
+				// above is a LIFETIME counter used for reporting; the quota gate
+				// compares against the PERIOD-scoped UsageCurrent, which only an
+				// upstream refresh writes. Recording the same figure as a delta
+				// is what lets the router see consumption between refreshes
+				// instead of routing on a value up to ~30 minutes stale.
+				p.noteUsageDelta(id, credits)
 
 				requestCount = p.accounts[i].RequestCount
 				errorCount = p.accounts[i].ErrorCount
@@ -1471,7 +1499,10 @@ func (p *AccountPool) diagnosticsForLocked(accounts []config.Account, model stri
 			available = false
 			reason = "cooldown"
 			cooldownUntil = cooldown.Unix()
-		} else if isQuotaBlocked(acc, allowOverUsage) {
+			// Must agree with the routing gates below, in-flight delta
+			// included: reporting an account as available while every routing
+			// path skips it sends an operator hunting a phantom fault.
+		} else if p.quotaBlocked(acc, allowOverUsage) {
 			available = false
 			reason = "quota_exhausted"
 		} else if !inPool[acc.ID] {
@@ -1549,7 +1580,10 @@ func (p *AccountPool) eligibleForRoute(acc *config.Account, excluded map[string]
 	if cooldown, ok := p.cooldowns[acc.ID]; ok && now.Before(cooldown) {
 		return false
 	}
-	if isQuotaBlocked(*acc, allowOverUsage) {
+	// In-flight aware (inflight_quota.go). This is the quota-AWARE selector's
+	// own gate, so leaving it on the stale upstream figure would have let the
+	// feature whose entire purpose is quota routing pick a capped account.
+	if p.quotaBlocked(*acc, allowOverUsage) {
 		return false
 	}
 	// The circuit breaker must gate this path too. The LRU path checks it
@@ -1688,7 +1722,11 @@ func (p *AccountPool) fallbackEarliestCooldown(model string, excluded map[string
 		if model != "" && !p.accountHasModel(acc.ID, model) {
 			continue
 		}
-		if isQuotaBlocked(*acc, allowOverUsage) {
+		// In-flight aware. This tightens a last-resort path, so it can return
+		// nil where it used to return a capped account — a deliberate trade:
+		// that dispatch ends in 402 anyway, and failing fast beats spending a
+		// request slot plus client latency to be told the same thing.
+		if p.quotaBlocked(*acc, allowOverUsage) {
 			continue
 		}
 		// The breaker must gate this path too. This fallback exists so a pool

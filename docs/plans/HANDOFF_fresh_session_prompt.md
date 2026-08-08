@@ -9,13 +9,19 @@ facts without checking.
 > **STATE CHANGED SINCE THAT HANDOFF — read this first (round 18).**
 >
 > **The `hian699` v1.2.8 merge is now COMMITTED.** `MERGE_HEAD` is gone.
-> - HEAD = `e902ed3` "merge: resolve hian699 v1.2.8 into harry (48 commits)",
->   parents `9f0b943` (ours) + `8a2dfc4` (theirs, from
+> - The merge commit is `e902ed3` "merge: resolve hian699 v1.2.8 into harry
+>   (48 commits)", parents `9f0b943` (ours) + `8a2dfc4` (theirs, from
 >   `https://github.com/hian699/Kiro-Go`), merge base `a2e3971`, version now `1.2.8`.
-> - **49 ahead / 0 behind `origin/harry`** — the merge and everything after it is
->   local only. `origin/harry` is still at `9f0b943`. Nothing has been pushed;
->   pushing needs the user's authorization.
-> - Gate green: 1328 tests, `-race` clean, build/vet/gofmt clean, 0 conflict markers.
+> - **HEAD has moved on since then** — several rounds landed on top of the merge.
+>   At the last update HEAD = `a399d79` (N-7 Docker non-root + HEALTHCHECK) and the
+>   branch was **52 ahead / 0 behind `origin/harry`**. Re-run
+>   `git log -1 --format='%h %s'` and
+>   `git rev-list --left-right --count origin/harry...HEAD` rather than trusting
+>   either SHA here.
+> - Everything from the merge onward is **local only**. `origin/harry` is still at
+>   `9f0b943`. Nothing has been pushed; pushing needs the user's authorization.
+> - Gate green at last run: **1340 tests, `-race` clean** (was 1328 at merge time),
+>   build/vet/gofmt clean, 0 conflict markers.
 >
 > **Three scripts now exist and are the entry point for routine work** (each
 > mutation- or run-proven, none writes `data/config.json`):
@@ -296,12 +302,55 @@ Not built, deliberately: the proposal also floated a webhook alert on repeated
 failures. The lockout is the security control; an alert is observability and belongs
 with D2 rather than being bundled in unproven.
 
-**Next items from the proposal, in priority order:** B1 in-flight quota accounting
-(largest *measured* efficiency win: quota state is up to 30 min stale, which produced
-112 cap errors in 8 minutes on one account), B2 sizing the overage backoff from
-`NextResetDate` (finishes round 16 honestly), F1 splitting the 8.2k-line
-`handler.go` (now safe to attempt, since CI guards it), B3 latency-aware routing
-(1.42x measured median spread, controlled for prompt size).
+**Next items from the proposal, in priority order:** ~~B1 in-flight quota
+accounting~~ **— DONE in round 18c, see the section below;** then B2 sizing the
+overage backoff from `NextResetDate` (finishes round 16 honestly), F1 splitting the
+8.2k-line `handler.go` (now safe to attempt, since CI guards it), B3 latency-aware
+routing (1.42x measured median spread, controlled for prompt size — and now
+unblocked, since it wanted B1's counter).
+
+### Round 18c — the router decided on quota state up to 30 minutes stale (B1)
+
+`pool/inflight_quota.go` (new) + 5 gate call sites in `pool/account.go`. Full
+reasoning in `docs/plans/CHECKPOINT_audit_and_merge_state.md` §8.
+
+**The defect.** The quota gate compared `acc.UsageCurrent` against `acc.UsageLimit`,
+and `UsageCurrent` is written *only* by an upstream refresh on a ~30-minute cycle. No
+amount of traffic moved it. Live evidence: 112 HTTP 402 cap errors in 8 minutes on
+one account = 134 dispatches into an account already known capped.
+
+**The signal already existed.** `UpdateStats` runs after every successful request and
+already received the upstream's own per-request `credits` figure — it was filed into
+`Account.TotalCredits` (a *lifetime* reporting counter) and never reached the
+*period-scoped* gate. The fix records it as a delta and adds it on top of the last
+upstream figure.
+
+**Three things to know before touching this:**
+
+1. **`credits` are agentic requests, not tokens** (~1-2 per request). Verified across
+   41 live accounts: `credits/1k_tokens` is 0.005-0.026, so treating them as tokens
+   under-counts ~100x and the gate never fires.
+2. **The delta is added, never substituted.** `UsageCurrent` also includes usage from
+   the Kiro IDE and other clients on the same account (one live account reads 2486
+   upstream with *no* local counter at all), so local credits are a lower bound.
+3. **Reset is by observation, not by hook.** `Reload` compares `UsageCurrent` against
+   `lastSeenUsage` and zeroes the delta when it moves. Do **not** convert this to a
+   reset hook on the refresh sites — there are several, they are in another package,
+   and one that forgets to call it double-counts for a whole period.
+
+**One gate deliberately left stale:** the membership filter in `Reload`
+(`account.go:295`) still uses upstream-only `isQuotaBlocked`. That path *evicts* an
+account from the pool; an estimate should be able to make routing skip an account,
+never drop it. If you "fix" that for consistency, you are changing the blast radius.
+
+**Verified:** 12 tests, 5/5 mutants killed by distinct tests (gate, reset hook, sign
+guard, prune, overage precedence), 7 controls green under the gate mutation, full
+suite + `-race` clean (1340).
+
+**Trap this package will spring on you:** any pool test calling `UpdateStats` must
+drain `pendingWrites` (config is persisted in a detached goroutine), or it passes
+alone and fails in the full suite with `TempDir RemoveAll cleanup: directory not
+empty`. Use `newTestPoolDrained`.
 
 ### 2026-07-30 production recovery — external termination, then round 17 deploy
 
